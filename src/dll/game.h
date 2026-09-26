@@ -300,3 +300,30 @@ void Game_GetProjectionTangents(float& tanX, float& tanY);
 // prepared frame, so OpenXR never receives stale Halo 3 projection metadata.
 bool Game_GetRenderHalfFovs(
     uint64_t preparedFrameSerial, float halfX[2], float halfY[2]);
+
+// ---- Weapon-order diagnostic tranche (read-only evidence) ----
+// Diagnostic-only helpers for the first-B-frame ordering question. They
+// perform bounded read-only native observations under each title's existing
+// guards and never mutate gameplay, tracking, rendering, or lifecycle state.
+// Shared Game_DiagnosticReadPrimaryWeapon detailOut bits:
+//   bit31 native fault (analyser ExceptionOrFault)
+//   bit30 lifecycle/generation guard rejection (analyser GuardRejected)
+//   bit2  FP producer/slot agreement (H3/ODST/Reach/H4; required by commits)
+//   bit1  ownership proven (H2/H4 mirror validation)
+//   bit0  secondary slot present (where the reader naturally knows it)
+// Records the calling thread as this title's proven-safe FP thread for the
+// current title generation and recording session. Diagnostic metadata only;
+// no gameplay meaning.
+void Game_DiagnosticNoteFpThread(GameTitle title) noexcept;
+// Conservative §17 gate for TLS-backed titles (H3/ODST/Reach/H4). Returns 0
+// when a Capture-time probe may run (stored FP thread for this
+// title/generation equals the calling thread); otherwise 1 = no safe FP
+// thread observed yet, 2 = thread mismatch, 3 = title/generation guard
+// rejection. CE/H2 use their own cross-thread-proven readers and do not
+// need this gate.
+uint8_t Game_DiagnosticCaptureProbePermission(GameTitle title) noexcept;
+// Ungated read-only semantic-primary observation. Returns false without
+// touching unitOut/weaponOut when the title cannot prove the identity
+// (lifecycle mismatch, seated/parent rejection, ownership failure, fault).
+bool Game_DiagnosticReadPrimaryWeapon(GameTitle title, uint32_t& unitOut,
+    uint32_t& weaponOut, uint32_t& detailOut) noexcept;

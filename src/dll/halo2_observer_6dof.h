@@ -106,3 +106,14 @@ void Halo2Observer6Dof_RequestRecenter() noexcept;
 
 // Atomic-only. Removes ownership when the VR runtime is gone.
 void Halo2Observer6Dof_ShutdownForVrFailure() noexcept;
+
+// ---- Weapon-order diagnostic tranche (read-only evidence) ----
+// Guarded datum/inventory primary observation for the first-B-frame ordering
+// question. Requires armed/level-live/no-teardown, matching title generation
+// and module, and rejects torn-teardown reads. Never mutates gameplay state.
+// detailOut bit31 = native fault (ExceptionOrFault);
+//           bit30 = lifecycle/generation guard rejection (GuardRejected);
+//           bit1  = primary datum ownership proven (set on true return);
+//           bit0  = secondary slot present (raw, not an absence claim).
+bool Halo2DiagnosticReadPrimaryWeapon(uint32_t& unitOut, uint32_t& weaponOut,
+    uint32_t& detailOut) noexcept;

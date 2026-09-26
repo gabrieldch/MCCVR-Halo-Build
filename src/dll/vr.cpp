@@ -4,9 +4,12 @@
 #include "../common/weapon_model_observation.h"
 #include "../common/weapon_reload_target.h"
 #include "weapon_accessory_renderer.h"
+#include "aim_pose_trace.h"
+#include "telemetry_recorder.h"
 #include "../common/title_runtime_state.h"
 #include <windows.h>
 #include "../common/virtual_stock_logic.h"
+#include "../common/virtual_stock_neutral_capture.h"
 #include <tlhelp32.h>
 #include <d3d11.h>
 #include <dxgi1_2.h>
@@ -40,9 +43,11 @@
 #include "../common/haloce_pause_logic.h"
 #include "../common/haloce_reticle_logic.h"
 #include "../common/vr_blit_shader.h"
+#include "haloce_controls.h"
 #include "haloce_first_person.h"
 #include "haloce_hud.h"
 #include "haloce_hud_layout.h"
+#include "halo2_observer_6dof.h"
 #include "d3d11_hook.h"
 #include "d3d_state.h"
 #include "smaa_resource.h"
@@ -122,6 +127,8 @@ namespace
     XrSpace g_localSpace = XR_NULL_HANDLE; // world-fixed, origin = headset pose at session start
     std::atomic<int64_t> g_contactSpaceChangeAtNs{0};
     std::atomic<uint64_t> g_contactSpaceEpoch{1};
+    virtual_stock::InverseNeckNeutralCaptureState
+        g_inverseNeckNeutralCapture{};
     VrContactTrackingSnapshot g_contactTrackingSnapshots[2]{};
     std::atomic<uint32_t> g_contactTrackingStates[2]{};
     std::atomic<uint32_t> g_contactTrackingIndex{2};
@@ -132,6 +139,9 @@ namespace
     XrSpace g_rightAimSpace = XR_NULL_HANDLE;
     XrAction g_leftAimAction = XR_NULL_HANDLE;
     XrSpace g_leftAimSpace = XR_NULL_HANDLE;
+    XrAction g_supportGripPoseAction = XR_NULL_HANDLE;
+    XrSpace g_leftGripPoseSpace = XR_NULL_HANDLE;
+    XrSpace g_rightGripPoseSpace = XR_NULL_HANDLE;
     XrAction g_hapticAction = XR_NULL_HANDLE;
     XrAction g_actMenu = XR_NULL_HANDLE;
     XrAction g_actLeftThumbrest = XR_NULL_HANDLE;
@@ -865,6 +875,17 @@ namespace
     // Optional stock geometry may only combine poses located for the same time.
     XrTime g_stockHeadPoseTime = 0;
     XrTime g_stockControllerPoseTime = 0;
+    // Virtual-stock coherence: true only after the current prepared frame has
+    // both a successful controller/action sample and a successful HMD locate.
+    // Cleared at new-frame admission (before a new sample can publish) and on
+        // prepared-frame reset/abort/session-loss/teardown, so stock aim never
+        // mixes a new hand sample with an older head sample. A single failed HMD
+        // locate leaves this false and aim falls back to controller->controller.
+        std::atomic<bool> g_stockAimFresh{false};
+    // Optional support grip-pose endpoint freshness. Separate from HMD stock
+    // freshness because the support endpoint experiment applies to ordinary
+    // legacy two-hand aiming too.
+    std::atomic<bool> g_supportGripPoseFresh{false};
     std::atomic<uint64_t> g_roomscaleHeadSampleMs{0};
     XrPosef g_rightAimPose{{0, 0, 0, 1}, {0, 0, 0}};
     bool g_rightAimPoseValid = false;
@@ -879,6 +900,10 @@ namespace
     uint64_t g_rightAimLinearVelocityAtMs = 0;
     XrPosef g_leftAimPose{{0, 0, 0, 1}, {0, 0, 0}};
     bool g_leftAimPoseValid = false;
+    XrVector3f g_supportGripPosePosition{0.0f, 0.0f, 0.0f};
+    bool g_supportGripPoseValid = false;
+    XrVector3f g_primaryGripPosePosition{0.0f, 0.0f, 0.0f};
+    bool g_primaryGripPoseValid = false;
     XrVector3f g_leftAimLinearVelocity{};
     bool g_leftAimLinearVelocityValid = false;
     uint64_t g_leftAimLinearVelocityAtMs = 0;
@@ -7373,6 +7398,10 @@ float4 ps_scope_linearize(VSOut i):SV_Target { return paint(i.uv,true); }
     {
         g_preparedShouldRender.store(false, std::memory_order_release);
         g_preparedViewSerialPublished.store(0, std::memory_order_release);
+        // A retired/aborted prepared frame cannot remain a valid
+        // controller/head pairing afterwards.
+        g_stockAimFresh.store(false, std::memory_order_release);
+        g_supportGripPoseFresh.store(false, std::memory_order_release);
 #if HALOMCCVR_HALO2_STEREO6DOF
         g_halo2PreparedCadenceSerial.store(0, std::memory_order_release);
 #endif
@@ -7404,6 +7433,10 @@ float4 ps_scope_linearize(VSOut i):SV_Target { return paint(i.uv,true); }
     void EnterFrameWaitFatalDrain(const char* reason)
     {
         g_waitPipelineFaulted.store(true, std::memory_order_release);
+        // Not every fatal-drain caller resets the prepared frame first; clear
+        // the pairing here too so no stale coherence survives session loss.
+        g_stockAimFresh.store(false, std::memory_order_release);
+        g_supportGripPoseFresh.store(false, std::memory_order_release);
         g_waitThreadStop.store(true, std::memory_order_release);
         if (g_waitConsumedEvent)
             SetEvent(g_waitConsumedEvent);
@@ -7700,7 +7733,12 @@ float4 ps_scope_linearize(VSOut i):SV_Target { return paint(i.uv,true); }
     // Store the head pose for the game camera hook to read. Called once near
     // the end of Present with the NEXT frame's predicted display time, so Halo
     // renders the upcoming image from its matching pose instead of a stale one.
-    bool CaptureHeadPose(XrTime time)
+    // stockControllersFresh must be the just-sampled controller/action result
+    // for this same prepared frame: success publishes stock coherence under
+    // the same lock as the new HMD pose; failure leaves the admission-time
+    // invalidation (false) in place so virtual stock falls back to legacy.
+    bool CaptureHeadPose(XrTime time, bool stockControllersFresh,
+        virtual_stock::InverseNeckNeutralCaptureInput neutralInput)
     {
         XrSpaceLocation loc{XR_TYPE_SPACE_LOCATION};
         if (XR_FAILED(xrLocateSpace(g_viewSpace, g_localSpace, time, &loc)))
@@ -7711,6 +7749,11 @@ float4 ps_scope_linearize(VSOut i):SV_Target { return paint(i.uv,true); }
         { g_roomscaleHeadSampleMs.store(0, std::memory_order_release); return false; }
         if (!NormalizeTrackedPose(loc.pose))
         { g_roomscaleHeadSampleMs.store(0, std::memory_order_release); return false; }
+        constexpr XrSpaceLocationFlags physicalTracking =
+            XR_SPACE_LOCATION_ORIENTATION_TRACKED_BIT |
+            XR_SPACE_LOCATION_POSITION_TRACKED_BIT;
+        const bool physicallyTracked =
+            (loc.locationFlags & physicalTracking) == physicalTracking;
         EnterCriticalSection(&g_headCs);
         // Filter exactly once per OpenXR frame. CamCopyHook can run several
         // times inside that frame, so smoothing there would compound and vary
@@ -7721,12 +7764,21 @@ float4 ps_scope_linearize(VSOut i):SV_Target { return paint(i.uv,true); }
             : loc.pose;
         g_headPoseValid = true;
         g_stockHeadPoseTime = time;
+        neutralInput.headSuitable = physicallyTracked &&
+            g_sessionState == XR_SESSION_STATE_FOCUSED;
+        neutralInput.headOrientation = {
+            g_headPose.orientation.x, g_headPose.orientation.y,
+            g_headPose.orientation.z, g_headPose.orientation.w};
+        virtual_stock::AdvanceInverseNeckNeutralCapture(
+            g_inverseNeckNeutralCapture, neutralInput);
+        // Publish stock coherence together with the head pose: an async
+        // getter can never observe the new head while freshness still reads
+        // false for this same prepared frame.
+        g_stockAimFresh.store(stockControllersFresh, std::memory_order_release);
         LeaveCriticalSection(&g_headCs);
 
-        constexpr XrSpaceLocationFlags physicalTracking =
-            XR_SPACE_LOCATION_ORIENTATION_TRACKED_BIT | XR_SPACE_LOCATION_POSITION_TRACKED_BIT;
         g_roomscaleHeadSampleMs.store(
-            (loc.locationFlags & physicalTracking) == physicalTracking ? GetTickCount64() : 0,
+            physicallyTracked ? GetTickCount64() : 0,
             std::memory_order_release);
 
         // Runtime proof for headset logs: successful pose sampling must equal
@@ -8855,6 +8907,18 @@ float4 ps_scope_linearize(VSOut i):SV_Target { return paint(i.uv,true); }
         if (XR_FAILED(xrCreateAction(g_gameplayActions, &actionInfo, &g_leftAimAction)))
             g_leftAimAction = XR_NULL_HANDLE; // non-fatal: D-pad gesture falls back to right
 
+        XrPath gripPosePaths[2] = {g_leftHandPath, g_rightHandPath};
+        actionInfo.actionType = XR_ACTION_TYPE_POSE_INPUT;
+        strcpy_s(actionInfo.actionName, "two_hand_grip_pose");
+        strcpy_s(actionInfo.localizedActionName, "Two-Hand Support Grip Pose");
+        actionInfo.countSubactionPaths = 2;
+        actionInfo.subactionPaths = gripPosePaths;
+        if (XR_FAILED(xrCreateAction(g_gameplayActions, &actionInfo, &g_supportGripPoseAction)))
+        {
+            g_supportGripPoseAction = XR_NULL_HANDLE;
+            LOG("Two-hand support grip pose: optional pose action unavailable; aim-pose endpoint retained");
+        }
+
         auto makeAction = [&](XrAction& out, XrActionType type, const char* name,
                               const char* label) {
             XrActionCreateInfo ai{XR_TYPE_ACTION_CREATE_INFO};
@@ -9011,31 +9075,78 @@ float4 ps_scope_linearize(VSOut i):SV_Target { return paint(i.uv,true); }
             {g_hapticAction, "/user/hand/left/output/haptic"},
             {g_hapticAction, "/user/hand/right/output/haptic"},
         };
+        const Bind gripPoseBindings[] = {
+            {g_supportGripPoseAction, "/user/hand/left/input/grip/pose"},
+            {g_supportGripPoseAction, "/user/hand/right/input/grip/pose"},
+        };
+        const auto addGripPoseBindings = [&](std::vector<Bind>& bindings) {
+            if (g_supportGripPoseAction != XR_NULL_HANDLE)
+            {
+                bindings.push_back(gripPoseBindings[0]);
+                bindings.push_back(gripPoseBindings[1]);
+            }
+        };
+        const auto suggestWithGripFallback = [&](const char* profile,
+            const Bind* original, size_t originalCount) {
+            if (g_supportGripPoseAction != XR_NULL_HANDLE)
+            {
+                std::vector<Bind> withGrip(original, original + originalCount);
+                addGripPoseBindings(withGrip);
+                if (suggest(profile, withGrip.data(), withGrip.size()))
+                {
+                    LOG("Two-hand support grip pose: optional grip-pose bindings accepted for %s", profile);
+                    return true;
+                }
+                LOG("Two-hand support grip pose: optional grip-pose bindings rejected for %s; retrying complete original controls", profile);
+            }
+            return suggest(profile, original, originalCount);
+        };
         const auto suggestTouch = [&](const char* profile) {
+            std::vector<Bind> preservedBaseline(std::begin(touch), std::end(touch));
+            bool baselineSuggested = false;
             if (g_actLeftThumbrest != XR_NULL_HANDLE)
             {
-                std::vector<Bind> withThumbrest(std::begin(touch), std::end(touch));
+                std::vector<Bind> withThumbrest = preservedBaseline;
                 withThumbrest.push_back({g_actLeftThumbrest,
                     "/user/hand/left/input/thumbrest/touch"});
                 if (suggest(profile, withThumbrest.data(), withThumbrest.size()))
                 {
+                    preservedBaseline = std::move(withThumbrest);
+                    baselineSuggested = true;
                     LOG("D-pad thumb rest: optional left touch binding accepted for %s", profile);
+                }
+                else
+                {
+                    LOG("D-pad thumb rest: optional binding rejected for %s; preserving complete original controls", profile);
+                }
+            }
+            if (g_supportGripPoseAction == XR_NULL_HANDLE)
+                return baselineSuggested || suggest(
+                    profile, preservedBaseline.data(), preservedBaseline.size());
+            if (g_supportGripPoseAction != XR_NULL_HANDLE)
+            {
+                std::vector<Bind> withGrip = preservedBaseline;
+                addGripPoseBindings(withGrip);
+                if (suggest(profile, withGrip.data(), withGrip.size()))
+                {
+                    LOG("Two-hand support grip pose: optional grip-pose bindings accepted for %s", profile);
                     return true;
                 }
-                LOG("D-pad thumb rest: optional binding rejected for %s; retrying complete original controls", profile);
+                LOG("Two-hand support grip pose: optional grip-pose bindings rejected for %s; restoring preserved baseline", profile);
             }
             // Suggestions replace a profile's complete binding list. Retrying
-            // only the new action would discard poses, buttons and haptics.
-            return suggest(profile, touch, _countof(touch));
+            // only the new action would discard poses, buttons and haptics. The
+            // baseline includes the pre-existing thumb-rest negotiation result.
+            return suggest(profile, preservedBaseline.data(), preservedBaseline.size());
         };
         unsigned accepted = 0;
         if (g_touchProProfileEnabled)
             accepted += suggestTouch("/interaction_profiles/facebook/touch_controller_pro");
         accepted += suggestTouch("/interaction_profiles/oculus/touch_controller");
-        accepted += suggest("/interaction_profiles/valve/index_controller", index, _countof(index));
-        accepted += suggest("/interaction_profiles/microsoft/motion_controller", wmr, _countof(wmr));
-        accepted += suggest("/interaction_profiles/htc/vive_controller", vive, _countof(vive));
-        accepted += suggest("/interaction_profiles/khr/simple_controller", simple, _countof(simple));
+        accepted += suggestWithGripFallback("/interaction_profiles/valve/index_controller", index, _countof(index));
+        accepted += suggestWithGripFallback("/interaction_profiles/microsoft/motion_controller", wmr, _countof(wmr));
+        accepted += suggestWithGripFallback("/interaction_profiles/htc/vive_controller", vive, _countof(vive));
+        accepted += suggestWithGripFallback("/interaction_profiles/khr/simple_controller", simple, _countof(simple));
 
         XrSessionActionSetsAttachInfo attach{XR_TYPE_SESSION_ACTION_SETS_ATTACH_INFO};
         attach.countActionSets = 1;
@@ -9061,6 +9172,22 @@ float4 ps_scope_linearize(VSOut i):SV_Target { return paint(i.uv,true); }
             if (XR_FAILED(xrCreateActionSpace(g_session, &spaceInfo, &g_leftAimSpace)))
                 g_leftAimSpace = XR_NULL_HANDLE;
         }
+        if (g_supportGripPoseAction != XR_NULL_HANDLE)
+        {
+            spaceInfo.action = g_supportGripPoseAction;
+            spaceInfo.subactionPath = g_leftHandPath;
+            if (XR_FAILED(xrCreateActionSpace(g_session, &spaceInfo, &g_leftGripPoseSpace)))
+            {
+                g_leftGripPoseSpace = XR_NULL_HANDLE;
+                LOG("Two-hand support grip pose: optional left grip space unavailable");
+            }
+            spaceInfo.subactionPath = g_rightHandPath;
+            if (XR_FAILED(xrCreateActionSpace(g_session, &spaceInfo, &g_rightGripPoseSpace)))
+            {
+                g_rightGripPoseSpace = XR_NULL_HANDLE;
+                LOG("Two-hand support grip pose: optional right grip space unavailable");
+            }
+        }
         LOG("M3: right-controller aim action ready (%u interaction profiles accepted)", accepted);
         return true;
     }
@@ -9070,6 +9197,8 @@ float4 ps_scope_linearize(VSOut i):SV_Target { return paint(i.uv,true); }
     // multi-call aim getter). `active` mirrors it for the menu indicator.
     std::atomic<bool> g_twoHandLatched{false};
     std::atomic<bool> g_twoHandActive{false};
+    HybridDiagnosticOverrideState g_hybridDiagnosticOverride;
+    VirtualStockTestProfileState g_virtualStockTestProfile;
     weapon_interaction::State g_weaponInteraction;
     weapon_model::Observations g_weaponModels;
     weapon_interaction::ReloadTargets g_reloadTargets;
@@ -9102,9 +9231,10 @@ float4 ps_scope_linearize(VSOut i):SV_Target { return paint(i.uv,true); }
         const XrPosef& lpose, float handForwardM, float gripForwardM)
     {
         const XrVector3f lfwd = Rotate(lpose.orientation, {0,0,-1});
-        // Hand-target correction PLUS the rendered wrist-to-palm depth: the
-        // two-hand line and grab zone meet the visible PALM, not the wrist
-        // bone the hand target anchors (23:26 headset result).
+        // Explicit offset geometry for callers that need it. The two-hand
+        // aim solver passes zero offsets, so the aim line always uses raw
+        // tracked points. Grab acquisition instead uses SupportGrabPoint,
+        // which applies only the grip (palm) depth, never hand seating.
         const float k = std::clamp(handForwardM, -0.15f, 0.30f)
                       + std::clamp(gripForwardM, -0.05f, 0.25f);
         return {lpose.position.x + lfwd.x*k,
@@ -9114,8 +9244,9 @@ float4 ps_scope_linearize(VSOut i):SV_Target { return paint(i.uv,true); }
 
     XrVector3f LeftHandPoint(const XrPosef& lpose)
     {
-        // Grip acquisition uses the same physical point as the aiming line.
-        // Moving the rendered support hand cannot engage/disengage aim.
+        // Raw tracked support point: the anchor for two-hand aim geometry.
+        // Grip acquisition samples the palm-adjusted point separately, so F1
+        // palm depth changes where a grip counts without moving the aim.
         return lpose.position;
     }
 
@@ -9125,34 +9256,74 @@ float4 ps_scope_linearize(VSOut i):SV_Target { return paint(i.uv,true); }
         XrPosef right{{0, 0, 0, 1}, {0, 0, 0}};
         bool leftValid = false;
         XrPosef left{{0, 0, 0, 1}, {0, 0, 0}};
+        XrVector3f supportPosition{0.0f, 0.0f, 0.0f};
+        bool supportEndpointUsedGrip = false;
+        bool supportGripPoseEnabled = false;
+        VirtualStockTestProfile testProfileUsed =
+            VirtualStockTestProfile::Custom;
         bool twoHandEnabled = false;
         bool twoHandLatched = false;
+        bool twoHandToggle = true;
         float leftHandForwardM = 0.0f;
         float leftGripForwardM = 0.0f;
         float gunYawDeg = 0.0f;
         float gunPitchDeg = 0.0f;
         float gunRollDeg = 0.0f;
-        XrVector3f supportPosition{0, 0, 0};
-        bool virtualStockEnabled = false;
-        float virtualStockStrength = 1.0f;
-        float virtualStockRearHeightM = 0.0f;
-        int virtualStockRearReference = 0;
-        float virtualStockShoulderBackM = 0.005f;
-        float virtualStockShoulderSideM = 0.015f;
-        float virtualStockChestHeightM = -0.320f;
-        float virtualStockChestBackM = 0.000f;
-        float virtualStockChestSideM = 0.015f;
-        float virtualStockAdaptiveTopHeightM = -0.180f;
-        float virtualStockAdaptiveBottomHeightM = -0.450f;
-        float virtualStockAdaptiveTopHalfWidthM = 0.080f;
-        float virtualStockAdaptiveBottomHalfWidthM = 0.140f;
+        // Virtual-stock fields. CurrentAimPoseInputs() leaves these stock-
+        // unaware (disabled); only CurrentStockAimPoseInputs() sets them, so
+        // physical and independent paths can never inherit stock orientation.
+        bool virtualStockEnabled = kVirtualStockEnabledDefault;
+        float virtualStockStrength = kVirtualStockStrengthDefault;
+        float virtualStockRearHeightM = kVirtualStockRearHeightDefaultM;
+        int virtualStockRearReference = kVirtualStockRearReferenceDefault;
+        float virtualStockShoulderBackM = kVirtualStockShoulderBackDefaultM;
+        float virtualStockShoulderSideM = kVirtualStockShoulderSideDefaultM;
+        float virtualStockChestHeightM = kVirtualStockChestHeightDefaultM;
+        float virtualStockChestBackM = kVirtualStockChestBackDefaultM;
+        float virtualStockChestSideM = kVirtualStockChestSideDefaultM;
+        float virtualStockAdaptiveTopHeightM =
+            kVirtualStockAdaptiveTopHeightDefaultM;
+        float virtualStockAdaptiveBottomHeightM =
+            kVirtualStockAdaptiveBottomHeightDefaultM;
+        float virtualStockAdaptiveTopHalfWidthM =
+            kVirtualStockAdaptiveTopHalfWidthDefaultM;
+        float virtualStockAdaptiveBottomHalfWidthM =
+            kVirtualStockAdaptiveBottomHalfWidthDefaultM;
+        float virtualStockHybridOffhandInfluence =
+            kVirtualStockHybridOffhandInfluenceDefault;
+        int virtualStockHybridAdsReference =
+            kVirtualStockHybridAdsReferenceDefault;
+        float virtualStockHybridSeatFullM = kVirtualStockHybridSeatFullDefaultM;
+        float virtualStockHybridSeatReleaseM =
+            kVirtualStockHybridSeatReleaseDefaultM;
+        bool hybridHorizontalRearReleaseEnabled =
+            kVirtualStockHybridHorizontalRearReleaseEnabledDefault;
+        float hybridHorizontalRearReleaseFullM =
+            kVirtualStockHybridHorizontalRearReleaseFullDefaultM;
+        float hybridHorizontalRearReleaseReleaseM =
+            kVirtualStockHybridHorizontalRearReleaseReleaseDefaultM;
+        bool hybridInverseNeckEnabled =
+            kVirtualStockHybridInverseNeckEnabledDefault;
+        float hybridInverseNeckStrength =
+            kVirtualStockHybridInverseNeckStrengthDefault;
+        float hybridInverseNeckForwardM =
+            kVirtualStockHybridInverseNeckForwardDefaultM;
+        float hybridInverseNeckUpM = kVirtualStockHybridInverseNeckUpDefaultM;
+        float hybridInverseNeckLateralM =
+            kVirtualStockHybridInverseNeckLateralDefaultM;
+        HybridDiagnosticOverride hybridDiagnosticOverride =
+            HybridDiagnosticOverride::Normal;
         bool virtualStockLeftHanded = false;
         bool virtualStockProximityRelease = false;
         float virtualStockProximityFullM = 0.250f;
         float virtualStockProximityReleaseM = 0.450f;
         bool headValid = false;
-        XrVector3f headPosition{0, 0, 0};
-        XrQuaternionf headOrientation{0, 0, 0, 1};
+        XrVector3f headPosition{0.0f, 0.0f, 0.0f};
+        XrQuaternionf headOrientation{0.0f, 0.0f, 0.0f, 1.0f};
+        bool inverseNeckNeutralValid = false;
+        XrQuaternionf inverseNeckNeutralOrientation{0.0f, 0.0f, 0.0f, 1.0f};
+        uint64_t inverseNeckNeutralCaptureSerial = 0;
+        uint64_t inverseNeckNeutralCaptureContactSpaceEpoch = 0;
     };
 
     struct AimPoseResult
@@ -9176,9 +9347,11 @@ float4 ps_scope_linearize(VSOut i):SV_Target { return paint(i.uv,true); }
         inputs.right = right;
         inputs.leftValid = leftValid;
         inputs.left = left;
+        inputs.supportPosition = left.position;
         inputs.twoHandEnabled = g_config.two_handed_aim &&
             !SecondaryWeaponPresentationActive();
         inputs.twoHandLatched = g_twoHandLatched.load();
+        inputs.twoHandToggle = g_config.two_hand_toggle;
         // Visual hand seating must not change the two-controller aiming line.
         inputs.leftHandForwardM = 0.0f;
         inputs.leftGripForwardM = 0.0f;
@@ -9197,9 +9370,11 @@ float4 ps_scope_linearize(VSOut i):SV_Target { return paint(i.uv,true); }
         bool leftValid, const XrPosef& left) noexcept
     {
         return CurrentStockAimPoseInputs(rightValid, right, leftValid, left,
-            g_headPoseValid && g_stockHeadPoseTime != 0 &&
-                g_stockHeadPoseTime == g_stockControllerPoseTime,
-            g_headPose.position, g_headPose.orientation);
+            g_headPoseValid && g_stockAimFresh.load(std::memory_order_acquire),
+            g_headPose.position, g_headPose.orientation,
+            g_supportGripPoseValid &&
+                g_supportGripPoseFresh.load(std::memory_order_acquire),
+            g_supportGripPosePosition);
     }
 
     // Pure aim calculation shared by the lock-taking public getter and Reach's
@@ -9207,141 +9382,432 @@ float4 ps_scope_linearize(VSOut i):SV_Target { return paint(i.uv,true); }
     // performs no logging or state publication.
     AimPoseResult ComputeAimPose(const AimPoseInputs& inputs) noexcept
     {
-        if (inputs.virtualStockEnabled)
-            return ComputeStockAimPose(inputs);
-        AimPoseResult result{};
-        if (!inputs.rightValid)
-            return result;
-
-        result.updateTwoHandActivity = true;
-        result.pose = inputs.right;
-
-        auto finishAimPose = [&]() {
-            auto multiply = [](const XrQuaternionf& a,
-                               const XrQuaternionf& b) {
-                return XrQuaternionf{
-                    a.w*b.x + a.x*b.w + a.y*b.z - a.z*b.y,
-                    a.w*b.y - a.x*b.z + a.y*b.w + a.z*b.x,
-                    a.w*b.z + a.x*b.y - a.y*b.x + a.z*b.w,
-                    a.w*b.w - a.x*b.x - a.y*b.y - a.z*b.z};
-            };
-            constexpr float kDegToRad = 0.01745329252f;
-            const float yaw = inputs.gunYawDeg * kDegToRad;
-            const float pitch = inputs.gunPitchDeg * kDegToRad;
-            const float roll = inputs.gunRollDeg * kDegToRad;
-            const XrQuaternionf qYaw{
-                0.0f, sinf(yaw*0.5f), 0.0f, cosf(yaw*0.5f)};
-            const XrQuaternionf qPitch{
-                sinf(pitch*0.5f), 0.0f, 0.0f, cosf(pitch*0.5f)};
-            const XrQuaternionf qRoll{
-                0.0f, 0.0f, sinf(-roll*0.5f), cosf(roll*0.5f)};
-            const XrQuaternionf corrected = multiply(
-                result.pose.orientation,
-                multiply(multiply(qYaw, qPitch), qRoll));
-            const float length = sqrtf(
-                corrected.x*corrected.x + corrected.y*corrected.y +
-                corrected.z*corrected.z + corrected.w*corrected.w);
-            if (!std::isfinite(length) || length < 1e-5f)
-                return;
-            result.pose.orientation = {
-                corrected.x/length, corrected.y/length,
-                corrected.z/length, corrected.w/length};
-            result.valid = true;
-        };
-
-        if (!inputs.twoHandEnabled || !inputs.leftValid ||
-            !inputs.twoHandLatched)
-        {
-            finishAimPose();
-            return result;
-        }
-
-        // Match the activation point: measure the two-hand line to the HAND,
-        // not the wrist (same forward shift used by the latch).
-        const XrVector3f lp = LeftHandPointWithOffsets(
-            inputs.left, inputs.leftHandForwardM,
-            inputs.leftGripForwardM);
-        const XrQuaternionf rq = inputs.right.orientation;
-        const XrVector3f rp = inputs.right.position;
-        const XrVector3f rup = Rotate(rq, {0,1,0});
-        XrVector3f v{lp.x-rp.x, lp.y-rp.y, lp.z-rp.z};
-        const float len = sqrtf(v.x*v.x+v.y*v.y+v.z*v.z);
-        if (len < 1e-4f)
-        {
-            finishAimPose();
-            return result;
-        }
-
-        XrVector3f af{v.x/len, v.y/len, v.z/len};
-        const XrVector3f rawForward = Rotate(rq, {0,0,-1});
-        const float agreement =
-            af.x*rawForward.x + af.y*rawForward.y + af.z*rawForward.z;
-        if (!std::isfinite(agreement) || agreement < 0.35f)
-        {
-            result.rejectedExtreme = true;
-            result.rejectedAgreement = agreement;
-            finishAimPose();
-            return result;
-        }
-
-        auto cross=[](const XrVector3f& a, const XrVector3f& b) {
-            return XrVector3f{
-                a.y*b.z-a.z*b.y, a.z*b.x-a.x*b.z,
-                a.x*b.y-a.y*b.x};
-        };
-        XrVector3f xa = cross(af, rup);
-        const float xl = sqrtf(xa.x*xa.x+xa.y*xa.y+xa.z*xa.z);
-        if (xl < 1e-4f)
-        {
-            finishAimPose();
-            return result;
-        }
-        xa = {xa.x/xl, xa.y/xl, xa.z/xl};
-        const XrVector3f ya = cross(xa, af);
-        const XrVector3f za{-af.x, -af.y, -af.z};
-
-        const float m00=xa.x,m10=xa.y,m20=xa.z;
-        const float m01=ya.x,m11=ya.y,m21=ya.z;
-        const float m02=za.x,m12=za.y,m22=za.z;
-        const float tr=m00+m11+m22;
-        float qx,qy,qz,qw;
-        if (tr>0)
-        {
-            const float s=sqrtf(tr+1.0f)*2;
-            qw=0.25f*s; qx=(m21-m12)/s;
-            qy=(m02-m20)/s; qz=(m10-m01)/s;
-        }
-        else if (m00>m11 && m00>m22)
-        {
-            const float s=sqrtf(1.0f+m00-m11-m22)*2;
-            qw=(m21-m12)/s; qx=0.25f*s;
-            qy=(m01+m10)/s; qz=(m02+m20)/s;
-        }
-        else if (m11>m22)
-        {
-            const float s=sqrtf(1.0f+m11-m00-m22)*2;
-            qw=(m02-m20)/s; qx=(m01+m10)/s;
-            qy=0.25f*s; qz=(m12+m21)/s;
-        }
-        else
-        {
-            const float s=sqrtf(1.0f+m22-m00-m11)*2;
-            qw=(m10-m01)/s; qx=(m02+m20)/s;
-            qy=(m12+m21)/s; qz=0.25f*s;
-        }
-        const float ql=sqrtf(qx*qx+qy*qy+qz*qz+qw*qw);
-        if (ql < 1e-5f)
-        {
-            finishAimPose();
-            return result;
-        }
-        result.pose.orientation = {
-            qx/ql, qy/ql, qz/ql, qw/ql};
-        result.twoHandActive = true;
-        finishAimPose();
-        return result;
+        return ComputeAimPoseImpl<false>(inputs, nullptr);
     }
 
+    AimPoseResult ComputeAimPose(
+        const AimPoseInputs& inputs, AimPoseTrace* trace) noexcept
+    {
+        return trace ? ComputeAimPoseImpl<true>(inputs, trace)
+                     : ComputeAimPoseImpl<false>(inputs, nullptr);
+    }
+
+
+    TelemetryVec3 ToTelemetryVec3(const XrVector3f& value) noexcept
+    {
+        return {value.x, value.y, value.z};
+    }
+
+    TelemetryQuat ToTelemetryQuat(const XrQuaternionf& value) noexcept
+    {
+        return {value.x, value.y, value.z, value.w};
+    }
+
+    TelemetryPose ToTelemetryPose(const XrPosef& value) noexcept
+    {
+        return {ToTelemetryQuat(value.orientation),
+                ToTelemetryVec3(value.position)};
+    }
+
+    TelemetryEffectiveSettings ToTelemetrySettings(
+        const AimPoseInputs& inputs) noexcept
+    {
+        TelemetryEffectiveSettings settings{};
+        settings.twoHandEnabled = inputs.twoHandEnabled;
+        settings.twoHandLatched = inputs.twoHandLatched;
+        settings.twoHandToggle = inputs.twoHandToggle;
+        settings.virtualStockEnabled = inputs.virtualStockEnabled;
+        settings.virtualStockRearReference = inputs.virtualStockRearReference;
+        settings.virtualStockStrength = inputs.virtualStockStrength;
+        settings.hybridDiagnosticOverride = static_cast<uint8_t>(
+            NormalizeHybridDiagnosticOverride(
+                static_cast<uint8_t>(inputs.hybridDiagnosticOverride)));
+        settings.hybridOffhandInfluence =
+            inputs.virtualStockHybridOffhandInfluence;
+        settings.hybridAdsReference = inputs.virtualStockHybridAdsReference;
+        settings.hybridSeatFullM = inputs.virtualStockHybridSeatFullM;
+        settings.hybridSeatReleaseM = inputs.virtualStockHybridSeatReleaseM;
+        settings.horizontalReleaseEnabled =
+            inputs.hybridHorizontalRearReleaseEnabled;
+        settings.horizontalReleaseFullM =
+            inputs.hybridHorizontalRearReleaseFullM;
+        settings.horizontalReleaseReleaseM =
+            inputs.hybridHorizontalRearReleaseReleaseM;
+        settings.inverseNeckEnabled = inputs.hybridInverseNeckEnabled;
+        settings.inverseNeckStrength = inputs.hybridInverseNeckStrength;
+        settings.inverseNeckForwardM = inputs.hybridInverseNeckForwardM;
+        settings.inverseNeckUpM = inputs.hybridInverseNeckUpM;
+        settings.inverseNeckLateralM = inputs.hybridInverseNeckLateralM;
+        settings.rearHeightM = inputs.virtualStockRearHeightM;
+        settings.shoulderBackM = inputs.virtualStockShoulderBackM;
+        settings.shoulderSideM = inputs.virtualStockShoulderSideM;
+        settings.chestHeightM = inputs.virtualStockChestHeightM;
+        settings.chestBackM = inputs.virtualStockChestBackM;
+        settings.chestSideM = inputs.virtualStockChestSideM;
+        settings.proximityRelease = inputs.virtualStockProximityRelease;
+        settings.proximityFullM = inputs.virtualStockProximityFullM;
+        settings.proximityReleaseM = inputs.virtualStockProximityReleaseM;
+        settings.gunYawDeg = inputs.gunYawDeg;
+        settings.gunPitchDeg = inputs.gunPitchDeg;
+        settings.gunRollDeg = inputs.gunRollDeg;
+        settings.supportGripPoseEnabled = inputs.supportGripPoseEnabled;
+        settings.supportEndpointUsedGrip = inputs.supportEndpointUsedGrip;
+        settings.leftHanded = inputs.virtualStockLeftHanded;
+        return settings;
+    }
+
+    TelemetryAimResult ToTelemetryAimResult(
+        const AimPoseResult& result) noexcept
+    {
+        TelemetryAimResult telemetry{};
+        telemetry.valid = result.valid;
+        telemetry.twoHandActive = result.twoHandActive;
+        telemetry.rejectedExtreme = result.rejectedExtreme;
+        telemetry.rejectedAgreement = result.rejectedAgreement;
+        if (result.valid)
+        {
+            telemetry.pose = ToTelemetryPose(result.pose);
+            telemetry.forward = ToTelemetryVec3(
+                Rotate(result.pose.orientation, {0.0f, 0.0f, -1.0f}));
+        }
+        return telemetry;
+    }
+
+    TelemetryControlResult ToTelemetryControlResult(
+        VirtualStockTestProfile profile, const AimPoseInputs& inputs,
+        const AimPoseResult& result, const AimPoseTrace& trace) noexcept
+    {
+        TelemetryControlResult control{};
+        control.profileId = static_cast<uint8_t>(profile);
+        control.effectiveSettings = ToTelemetrySettings(inputs);
+        control.aim = ToTelemetryAimResult(result);
+        control.path = static_cast<uint8_t>(trace.path);
+        control.requestedTarget = static_cast<uint8_t>(trace.requestedTarget);
+        control.actualTarget = static_cast<uint8_t>(trace.actualTarget);
+        control.shoulderToHeadFallback = trace.shoulderToHeadFallback;
+        control.fixedTargetValid = trace.fixedTargetValid;
+        control.fixedTarget = {
+            trace.fixedTarget.x, trace.fixedTarget.y, trace.fixedTarget.z};
+        control.fixedRearDistanceValid = trace.fixedRearDistanceValid;
+        control.fixedRearToTargetDistanceM =
+            trace.fixedRearToTargetDistanceM;
+        control.fixedProximityEnabled = trace.fixedProximityEnabled;
+        control.fixedProximityCalculated = trace.fixedProximityCalculated;
+        control.fixedProximityInfluence = trace.fixedProximityInfluence;
+        control.fixedConfiguredStrength = trace.fixedConfiguredStrength;
+        control.fixedEffectiveStrength = trace.fixedEffectiveStrength;
+        control.fixedDirectionValid = trace.fixedDirectionValid;
+        control.exactAEndpointSelected = trace.exactAEndpointSelected;
+        control.orientationRebuildAttempted =
+            trace.orientationRebuildAttempted;
+        control.orientationRebuildSucceeded =
+            trace.orientationRebuildSucceeded;
+        return control;
+    }
+
+    void CapturePreparedFrameTelemetry(
+        const XrFrameState& frameState, bool upcomingPadFresh,
+        bool upcomingViewsValid, bool upcomingHeadValid) noexcept
+    {
+        if (!Telemetry_BeginFrame(g_preparedFrame.serial))
+            return;
+
+        LARGE_INTEGER captureBegin{};
+        QueryPerformanceCounter(&captureBegin);
+        TelemetryFrame frame{};
+        frame.preparedSerial = g_preparedFrame.serial;
+        frame.predictedDisplayTime = frameState.predictedDisplayTime;
+        frame.predictedDisplayPeriod = frameState.predictedDisplayPeriod;
+        frame.captureBeginQpc = captureBegin.QuadPart;
+        frame.contactSpaceEpoch =
+            g_contactSpaceEpoch.load(std::memory_order_acquire);
+        frame.contactSpaceChangeAtNs =
+            g_contactSpaceChangeAtNs.load(std::memory_order_acquire);
+        frame.activeTitle = static_cast<uint8_t>(
+            TitleAdapter_GetActiveTitle());
+        frame.sessionState = static_cast<int32_t>(g_sessionState);
+        frame.shouldRender = frameState.shouldRender == XR_TRUE;
+        frame.upcomingViewsValid = upcomingViewsValid;
+        frame.locatedViewCount = upcomingViewsValid
+            ? static_cast<uint32_t>(g_views.size()) : 0;
+        frame.focused = g_sessionState == XR_SESSION_STATE_FOCUSED;
+        frame.stereoEnabled =
+            g_stereoEnabled.load(std::memory_order_relaxed);
+        frame.menuOpen = Menu_IsOpen();
+
+        const bool primaryFresh = upcomingPadFresh && g_rightAimPoseValid;
+        const bool supportFresh = upcomingPadFresh && g_leftAimPoseValid;
+        const bool supportGripFresh = upcomingPadFresh &&
+            g_supportGripPoseValid &&
+            g_supportGripPoseFresh.load(std::memory_order_acquire);
+        const bool stockHeadValid = upcomingPadFresh && upcomingHeadValid &&
+            g_stockAimFresh.load(std::memory_order_acquire);
+        AimPoseInputs inputs = CurrentStockAimPoseInputs(
+            primaryFresh, g_rightAimPose,
+            supportFresh, g_leftAimPose,
+            stockHeadValid, g_headPose.position, g_headPose.orientation,
+            supportGripFresh, g_supportGripPosePosition);
+        const AimPoseResult canonical = ComputeAimPose(inputs, &frame.aimTrace);
+
+        frame.testProfileId = static_cast<uint8_t>(inputs.testProfileUsed);
+        frame.testProfileCustom =
+            inputs.testProfileUsed == VirtualStockTestProfile::Custom;
+        frame.effectiveSettings = ToTelemetrySettings(inputs);
+        frame.canonicalAim = ToTelemetryAimResult(canonical);
+
+        const auto solveControl = [&](VirtualStockTestProfile profile,
+                                      TelemetryControlResult& output) {
+            const AimPoseInputs controlInputs =
+                AimPoseInputsForProfile(inputs, profile);
+            AimPoseTrace controlTrace{};
+            const AimPoseResult controlAim =
+                ComputeAimPose(controlInputs, &controlTrace);
+            output = ToTelemetryControlResult(
+                profile, controlInputs, controlAim, controlTrace);
+        };
+        solveControl(kVsOffControlProfile, frame.cfVsOff);
+        solveControl(kFixedHeadControlProfile, frame.cfFixedHead);
+        solveControl(kFixedShoulderControlProfile, frame.cfFixedShoulder);
+
+        frame.semanticPrimaryValid = primaryFresh;
+        if (primaryFresh)
+        {
+            frame.semanticPrimaryAim = ToTelemetryPose(g_rightAimPose);
+            frame.semanticPrimaryForward = ToTelemetryVec3(
+                Rotate(g_rightAimPose.orientation, {0.0f, 0.0f, -1.0f}));
+        }
+        frame.semanticSupportValid = supportFresh;
+        if (supportFresh)
+            frame.semanticSupportAim = ToTelemetryPose(g_leftAimPose);
+        frame.supportEndpointValid = supportFresh;
+        frame.supportEndpointUsedGrip = inputs.supportEndpointUsedGrip;
+        if (frame.supportEndpointValid)
+            frame.supportEndpoint = ToTelemetryVec3(inputs.supportPosition);
+
+        frame.physicalLeftAimValid = upcomingPadFresh &&
+            g_physicalControllerValid[0];
+        if (frame.physicalLeftAimValid)
+            frame.physicalLeftAim = ToTelemetryPose(g_physicalControllerPose[0]);
+        frame.physicalRightAimValid = upcomingPadFresh &&
+            g_physicalControllerValid[1];
+        if (frame.physicalRightAimValid)
+            frame.physicalRightAim = ToTelemetryPose(g_physicalControllerPose[1]);
+
+        frame.supportGripValid = supportGripFresh;
+        if (supportGripFresh)
+            frame.supportGripPosition =
+                ToTelemetryVec3(g_supportGripPosePosition);
+        frame.semanticPrimaryGripPositionValid = upcomingPadFresh &&
+            g_primaryGripPoseValid;
+        if (frame.semanticPrimaryGripPositionValid)
+        {
+            frame.semanticPrimaryGripPosition =
+                ToTelemetryVec3(g_primaryGripPosePosition);
+        }
+
+        frame.headSampleValid = upcomingHeadValid;
+        frame.stockHeadValid = stockHeadValid;
+        frame.headsetSmoothing =
+            std::clamp(g_config.headset_smoothing, 0.0f, 0.10f);
+        if (upcomingHeadValid)
+            frame.semanticHmd = ToTelemetryPose(g_headPose);
+
+        if (upcomingViewsValid && g_views.size() == 2)
+        {
+            for (int eye = 0; eye < 2; ++eye)
+            {
+                frame.views[eye].pose = ToTelemetryPose(g_views[eye].pose);
+                frame.views[eye].fovLeft = g_views[eye].fov.angleLeft;
+                frame.views[eye].fovRight = g_views[eye].fov.angleRight;
+                frame.views[eye].fovUp = g_views[eye].fov.angleUp;
+                frame.views[eye].fovDown = g_views[eye].fov.angleDown;
+            }
+        }
+
+        frame.semanticPrimaryVelocityValid = upcomingPadFresh &&
+            g_rightAimLinearVelocityValid;
+        if (frame.semanticPrimaryVelocityValid)
+        {
+            frame.semanticPrimaryVelocity =
+                ToTelemetryVec3(g_rightAimLinearVelocity);
+            frame.semanticPrimaryVelocityAtMs =
+                g_rightAimLinearVelocityAtMs;
+        }
+        frame.semanticSupportVelocityValid = upcomingPadFresh &&
+            g_leftAimLinearVelocityValid;
+        if (frame.semanticSupportVelocityValid)
+        {
+            frame.semanticSupportVelocity =
+                ToTelemetryVec3(g_leftAimLinearVelocity);
+            frame.semanticSupportVelocityAtMs =
+                g_leftAimLinearVelocityAtMs;
+        }
+
+        if (upcomingPadFresh && g_padState.valid)
+        {
+            frame.pad.valid = true;
+            frame.pad.moveX = g_padState.moveX;
+            frame.pad.moveY = g_padState.moveY;
+            frame.pad.turnX = g_padState.turnX;
+            frame.pad.turnY = g_padState.turnY;
+            frame.pad.trigL = g_padState.trigL;
+            frame.pad.trigR = g_padState.trigR;
+            frame.pad.gripL = g_padState.gripL;
+            frame.pad.gripR = g_padState.gripR;
+            frame.pad.a = g_padState.a;
+            frame.pad.b = g_padState.b;
+            frame.pad.x = g_padState.x;
+            frame.pad.y = g_padState.y;
+            frame.pad.clickL = g_padState.clickL;
+            frame.pad.clickR = g_padState.clickR;
+            frame.pad.menu = g_padState.menu;
+            frame.pad.thumbrestDpad = g_padState.thumbrestDpad;
+            frame.pad.dpadX = g_padState.dpadX;
+            frame.pad.dpadY = g_padState.dpadY;
+            frame.pad.exclusiveInput = g_padState.exclusiveInput;
+        }
+
+        Telemetry_PublishFrame(frame);
+    }
+
+    // ---- Weapon-order diagnostic tranche (read-only evidence) ----
+    // All probes below are gated on Telemetry_WeaponEventsAccepting(): when
+    // recording is off they cost one atomic load and change nothing. When on,
+    // they perform bounded read-only native observations (no alloc/log/lock/
+    // COM/scan/IO/mutation) and publish fixed records with a global sequence.
+    // Gameplay, latch, aim, presentation, and lifecycle state are untouched.
+    void PublishWeaponOrderMarker(WeaponOrderEventKind kind) noexcept
+    {
+        if (!Telemetry_WeaponEventsAccepting())
+            return;
+        const GameTitle title = TitleAdapter_GetActiveTitle();
+        Telemetry_PublishWeaponEvent(static_cast<uint8_t>(kind),
+            static_cast<uint8_t>(WeaponOrderEventStatus::NoObservation),
+            static_cast<uint8_t>(title),
+            TitleAdapter_GetGeneration(title), g_preparedFrame.serial,
+            UINT32_MAX, UINT32_MAX, 0, 0);
+    }
+
+    void PublishCaptureProbeResult(GameTitle title, uint64_t beginSeq,
+        bool readOk, uint32_t unit, uint32_t weapon, uint32_t detail) noexcept
+    {
+        WeaponOrderEventStatus status;
+        if (readOk)
+            status = WeaponOrderEventStatus::Success;
+        else if (detail & 0x80000000u)
+            status = WeaponOrderEventStatus::ExceptionOrFault;
+        else if (detail & 0x40000000u)
+            status = WeaponOrderEventStatus::GuardRejected;
+        else
+            status = WeaponOrderEventStatus::ReaderReturnedFalse;
+        Telemetry_PublishWeaponEvent(
+            static_cast<uint8_t>(WeaponOrderEventKind::CaptureProbeResult),
+            static_cast<uint8_t>(status), static_cast<uint8_t>(title),
+            TitleAdapter_GetGeneration(title), g_preparedFrame.serial,
+            readOk ? unit : UINT32_MAX, readOk ? weapon : UINT32_MAX,
+            beginSeq, detail & 0x3FFFFFFFu);
+    }
+
+    void ProbeCaptureWeaponCE(GameTitle title) noexcept
+    {
+        const uint64_t beginSeq = Telemetry_PublishWeaponEvent(
+            static_cast<uint8_t>(WeaponOrderEventKind::CaptureProbeBegin),
+            static_cast<uint8_t>(WeaponOrderEventStatus::NoObservation),
+            static_cast<uint8_t>(title),
+            TitleAdapter_GetGeneration(title), g_preparedFrame.serial,
+            UINT32_MAX, UINT32_MAX, 0, 0);
+        HaloCELocalPlayerState state{};
+        const bool readOk = HaloCEControls_GetLocalPlayerState(state);
+        uint32_t validity = 0;
+        if (readOk)
+        {
+            validity |= state.hasControlledUnit ? 1u : 0u;
+            validity |= state.onFoot ? 2u : 0u;
+            validity |= state.nativePreparesFirstPerson ? 4u : 0u;
+            validity |= !state.nativeInputBlocked ? 8u : 0u;
+            validity |= !state.nativeLookBlocked ? 16u : 0u;
+            validity |= !state.nativePaused ? 32u : 0u;
+            validity |= !state.nativeCinematicFlag ? 64u : 0u;
+            validity |= state.firstPersonVisible ? 128u : 0u;
+        }
+        PublishCaptureProbeResult(title, beginSeq, readOk, state.unit,
+            state.weapon, validity);
+    }
+
+    void ProbeCaptureWeaponH2(GameTitle title) noexcept
+    {
+        const uint64_t beginSeq = Telemetry_PublishWeaponEvent(
+            static_cast<uint8_t>(WeaponOrderEventKind::CaptureProbeBegin),
+            static_cast<uint8_t>(WeaponOrderEventStatus::NoObservation),
+            static_cast<uint8_t>(title),
+            TitleAdapter_GetGeneration(title), g_preparedFrame.serial,
+            UINT32_MAX, UINT32_MAX, 0, 0);
+        uint32_t unit = UINT32_MAX, weapon = UINT32_MAX, detail = 0;
+        const bool readOk =
+            Halo2DiagnosticReadPrimaryWeapon(unit, weapon, detail);
+        PublishCaptureProbeResult(title, beginSeq, readOk, unit, weapon,
+            detail);
+    }
+
+    void ProbeCaptureWeaponTitle(GameTitle title) noexcept
+    {
+        const uint8_t permission =
+            Game_DiagnosticCaptureProbePermission(title);
+        if (permission != 0)
+        {
+            const WeaponOrderEventStatus status =
+                permission == 1 ? WeaponOrderEventStatus::
+                    NotAttemptedNoSafeThread : permission == 2 ?
+                    WeaponOrderEventStatus::NotAttemptedThreadMismatch :
+                    WeaponOrderEventStatus::GuardRejected;
+            Telemetry_PublishWeaponEvent(
+                static_cast<uint8_t>(
+                    WeaponOrderEventKind::CaptureProbeResult),
+                static_cast<uint8_t>(status),
+                static_cast<uint8_t>(title),
+                TitleAdapter_GetGeneration(title), g_preparedFrame.serial,
+                UINT32_MAX, UINT32_MAX, 0, permission);
+            return;
+        }
+        const uint64_t beginSeq = Telemetry_PublishWeaponEvent(
+            static_cast<uint8_t>(WeaponOrderEventKind::CaptureProbeBegin),
+            static_cast<uint8_t>(WeaponOrderEventStatus::NoObservation),
+            static_cast<uint8_t>(title),
+            TitleAdapter_GetGeneration(title), g_preparedFrame.serial,
+            UINT32_MAX, UINT32_MAX, 0, 0);
+        uint32_t unit = UINT32_MAX, weapon = UINT32_MAX, detail = 0;
+        const bool readOk = Game_DiagnosticReadPrimaryWeapon(title, unit,
+            weapon, detail);
+        PublishCaptureProbeResult(title, beginSeq, readOk, unit, weapon,
+            detail);
+    }
+
+    // Emits CapturePreLatch plus the title's direct pre-latch weapon probe.
+    // Must be called immediately before UpdateTwoHandLatch() and nowhere else.
+    void ProbeCaptureWeaponPreLatch() noexcept
+    {
+        if (!Telemetry_WeaponEventsAccepting())
+            return;
+        const GameTitle title = TitleAdapter_GetActiveTitle();
+        PublishWeaponOrderMarker(WeaponOrderEventKind::CapturePreLatch);
+        switch (title)
+        {
+        case GameTitle::HaloCE:
+            ProbeCaptureWeaponCE(title);
+            break;
+        case GameTitle::Halo2:
+            ProbeCaptureWeaponH2(title);
+            break;
+        case GameTitle::Halo3:
+        case GameTitle::Halo3ODST:
+        case GameTitle::HaloReach:
+        case GameTitle::Halo4:
+            ProbeCaptureWeaponTitle(title);
+            break;
+        default:
+            break;
+        }
+    }
     void UpdateTwoHandLatch(bool rightValid, const XrPosef& rpose,
                             bool leftValid, const XrPosef& lpose, float gripL,
                             bool rolesChanged, bool weaponGesture = false)
@@ -9377,7 +9843,19 @@ float4 ps_scope_linearize(VSOut i):SV_Target { return paint(i.uv,true); }
             const float lateral = sqrtf(perp.x*perp.x+perp.y*perp.y+perp.z*perp.z);
             return along>0.08f && along<0.80f && lateral<0.09f;
         };
-        const bool inZone = inZoneAt(LeftHandPoint(lpose));
+        // Palm depth moves where a support grip counts: the grab zone meets
+        // the visible palm, not the wrist bone the hand target anchors.
+        // Aim rays, shots, and contact/melee geometry stay on the raw point.
+        const XrVector3f supportForward = Rotate(lpose.orientation, {0,0,-1});
+        const virtual_stock::Point3 grabPoint =
+            virtual_stock::SupportGrabPoint(
+                virtual_stock::Point3{
+                    lpose.position.x, lpose.position.y, lpose.position.z},
+                virtual_stock::Point3{
+                    supportForward.x, supportForward.y, supportForward.z},
+                g_config.left_grip_forward_m);
+        const XrVector3f grabSample{grabPoint.x, grabPoint.y, grabPoint.z};
+        const bool inZone = inZoneAt(grabSample);
 
         if (g_config.two_hand_toggle)
         {
@@ -9540,12 +10018,40 @@ float4 ps_scope_linearize(VSOut i):SV_Target { return paint(i.uv,true); }
         LeaveCriticalSection(&g_headCs);
     }
 
+    bool TryLocateSupportGripPosition(bool enabled, XrPath handPath,
+                                      XrSpace gripSpace, XrTime time,
+                                      XrVector3f& outPosition)
+    {
+        if (!enabled || g_supportGripPoseAction == XR_NULL_HANDLE ||
+            gripSpace == XR_NULL_HANDLE)
+            return false;
+        XrActionStateGetInfo gripGet{XR_TYPE_ACTION_STATE_GET_INFO};
+        gripGet.action = g_supportGripPoseAction;
+        gripGet.subactionPath = handPath;
+        XrActionStatePose gripState{XR_TYPE_ACTION_STATE_POSE};
+        XrSpaceLocation gripLocation{XR_TYPE_SPACE_LOCATION};
+        if (XR_FAILED(xrGetActionStatePose(g_session, &gripGet, &gripState)) ||
+            !gripState.isActive ||
+            XR_FAILED(xrLocateSpace(gripSpace, g_localSpace, time, &gripLocation)))
+            return false;
+        if ((gripLocation.locationFlags & XR_SPACE_LOCATION_POSITION_VALID_BIT) == 0)
+            return false;
+        const XrVector3f position = gripLocation.pose.position;
+        if (!std::isfinite(position.x) || !std::isfinite(position.y) ||
+            !std::isfinite(position.z))
+            return false;
+        outPosition = position;
+        return true;
+    }
+
     bool CaptureRightControllerPose(XrTime time)
     {
+        g_primaryGripPoseValid = false;
         if (g_gameplayActions == XR_NULL_HANDLE || g_rightAimAction == XR_NULL_HANDLE ||
             g_rightAimSpace == XR_NULL_HANDLE)
         {
             g_thumbrestDpadSampleMs.store(0, std::memory_order_release);
+            g_supportGripPoseFresh.store(false, std::memory_order_release);
             InvalidateWeaponInteractionSample();
             return false;
         }
@@ -9556,6 +10062,7 @@ float4 ps_scope_linearize(VSOut i):SV_Target { return paint(i.uv,true); }
         if (XR_FAILED(xrSyncActions(g_session, &sync)))
         {
             g_thumbrestDpadSampleMs.store(0, std::memory_order_release);
+            g_supportGripPoseFresh.store(false, std::memory_order_release);
             InvalidateWeaponInteractionSample();
             return false;
         }
@@ -9593,6 +10100,20 @@ float4 ps_scope_linearize(VSOut i):SV_Target { return paint(i.uv,true); }
                 leftValid = (leftLocation.locationFlags & required) == required &&
                             NormalizeTrackedPose(leftLocation.pose);
             }
+        }
+
+        XrVector3f physicalGripPosition[2]{};
+        bool physicalGripValid[2]{};
+        if (g_config.two_hand_support_grip_pose)
+        {
+            physicalGripValid[0] = TryLocateSupportGripPosition(
+                g_config.two_hand_support_grip_pose, g_leftHandPath,
+                g_leftGripPoseSpace, time,
+                physicalGripPosition[0]);
+            physicalGripValid[1] = TryLocateSupportGripPosition(
+                g_config.two_hand_support_grip_pose, g_rightHandPath,
+                g_rightGripPoseSpace, time,
+                physicalGripPosition[1]);
         }
 
         auto selectVelocity = [&](int hand, bool poseValid,
@@ -9675,6 +10196,8 @@ float4 ps_scope_linearize(VSOut i):SV_Target { return paint(i.uv,true); }
             std::swap(valid, leftValid);
             std::swap(selectedRightVelocity, selectedLeftVelocity);
             std::swap(selectedRightVelocityValid, selectedLeftVelocityValid);
+            std::swap(physicalGripPosition[0], physicalGripPosition[1]);
+            std::swap(physicalGripValid[0], physicalGripValid[1]);
         }
         g_capturedLeftHanded.store(leftHanded, std::memory_order_release);
         if (handChanged)
@@ -9682,6 +10205,7 @@ float4 ps_scope_linearize(VSOut i):SV_Target { return paint(i.uv,true); }
             // Prevent a toggle from appearing as a swing between controllers.
             valid = leftValid = false;
             selectedRightVelocityValid = selectedLeftVelocityValid = false;
+            physicalGripValid[0] = physicalGripValid[1] = false;
             g_meleeSpeedHistory[0] = {};
             g_meleeSpeedHistory[1] = {};
         }
@@ -9697,6 +10221,14 @@ float4 ps_scope_linearize(VSOut i):SV_Target { return paint(i.uv,true); }
         g_leftAimPoseValid = leftValid;
         if (leftValid)
             g_leftAimPose = leftLocation.pose;
+        g_supportGripPoseValid = leftValid && physicalGripValid[0];
+        if (g_supportGripPoseValid)
+            g_supportGripPosePosition = physicalGripPosition[0];
+        g_primaryGripPoseValid = valid && physicalGripValid[1];
+        if (g_primaryGripPoseValid)
+            g_primaryGripPosePosition = physicalGripPosition[1];
+        g_supportGripPoseFresh.store(g_supportGripPoseValid,
+            std::memory_order_release);
         g_leftAimLinearVelocityValid = selectedLeftVelocityValid;
         if (g_leftAimLinearVelocityValid)
             g_leftAimLinearVelocity = selectedLeftVelocity;
@@ -9942,6 +10474,8 @@ float4 ps_scope_linearize(VSOut i):SV_Target { return paint(i.uv,true); }
         g_scopeZoomStickY.store(pad.valid?pad.turnY:0.0f,
                                 std::memory_order_release);
         const bool supportWasLatched=g_twoHandLatched.load(std::memory_order_acquire);
+        // Diagnostic-only pre-latch weapon probe (no gameplay effect).
+        ProbeCaptureWeaponPreLatch();
         UpdateTwoHandLatch(valid, location.pose, leftValid, leftLocation.pose,
                            rawSupportGrip, handChanged, weapon_interaction::BlocksSupportGrab(weaponGesture));
         EnterCriticalSection(&g_headCs);
@@ -11369,6 +11903,11 @@ float4 ps_scope_linearize(VSOut i):SV_Target { return paint(i.uv,true); }
         g_preparedFrame.state = frameState;
         g_preparedFrame.begun = true;
         g_preparedFrame.serial = ++g_nextPreparedSerial;
+        // Invalidate stock coherence BEFORE a new controller/action sample can
+        // replace the previous frame's poses. It becomes true again only after
+        // this same prepared frame completes both action sync and HMD locate.
+        g_stockAimFresh.store(false, std::memory_order_release);
+        g_supportGripPoseFresh.store(false, std::memory_order_release);
         g_preparedFrame.predictedDisplayDelta = 0;
         g_preparedShouldRender.store(
             frameState.shouldRender == XR_TRUE, std::memory_order_release);
@@ -11456,8 +11995,32 @@ float4 ps_scope_linearize(VSOut i):SV_Target { return paint(i.uv,true); }
         g_preparedViewSerialPublished.store(
             upcomingViewsValid ? g_preparedFrame.serial : 0,
             std::memory_order_release);
-        const bool upcomingHeadValid =
-            CaptureHeadPose(frameState.predictedDisplayTime);
+        const ResolvedVirtualStockAimSettings resolvedStockSettings =
+            CurrentResolvedVirtualStockAimSettings();
+        const int64_t referenceChangeAt =
+            g_contactSpaceChangeAtNs.load(std::memory_order_acquire);
+        const uint64_t contactSpaceEpoch =
+            g_contactSpaceEpoch.load(std::memory_order_acquire);
+        const virtual_stock::InverseNeckNeutralCaptureInput neutralInput{
+            VirtualStockHeadTurnCorrectionFamilyActive(
+                resolvedStockSettings.settings),
+            Menu_IsOpen(), false,
+            referenceChangeAt != 0 &&
+                frameState.predictedDisplayTime < referenceChangeAt,
+            g_preparedFrame.serial, contactSpaceEpoch,
+            {}};
+        const bool upcomingHeadValid = CaptureHeadPose(
+            frameState.predictedDisplayTime, upcomingPadFresh, neutralInput);
+        if (!upcomingHeadValid)
+        {
+            EnterCriticalSection(&g_headCs);
+            virtual_stock::AdvanceInverseNeckNeutralCapture(
+                g_inverseNeckNeutralCapture, neutralInput);
+            LeaveCriticalSection(&g_headCs);
+        }
+        CapturePreparedFrameTelemetry(
+            frameState, upcomingPadFresh, upcomingViewsValid,
+            upcomingHeadValid);
         {
             halo_ce::Tracking ce{};
             const bool enabled=TitleAdapter_GetActiveTitle()==GameTitle::HaloCE&&
@@ -13971,6 +14534,31 @@ float4 ps_scope_linearize(VSOut i):SV_Target { return paint(i.uv,true); }
     }
 } // namespace
 
+HybridDiagnosticOverride VR_GetHybridDiagnosticOverride() noexcept
+{
+    return g_hybridDiagnosticOverride.Load();
+}
+
+void VR_SetHybridDiagnosticOverride(HybridDiagnosticOverride value) noexcept
+{
+    g_hybridDiagnosticOverride.Store(value);
+}
+
+VirtualStockTestProfile VR_GetVirtualStockTestProfile() noexcept
+{
+    return g_virtualStockTestProfile.Load();
+}
+
+void VR_SetVirtualStockTestProfile(VirtualStockTestProfile value) noexcept
+{
+    g_virtualStockTestProfile.Store(value);
+}
+
+VirtualStockAimSettings VR_GetEffectiveVirtualStockAimSettings() noexcept
+{
+    return CurrentEffectiveVirtualStockAimSettings();
+}
+
 void VR_InitInstance()
 {
     if (!g_headCsInit)
@@ -15191,6 +15779,8 @@ namespace
 
 void VR_BeforePresent(IDXGISwapChain* sc)
 {
+    // Diagnostic-only frame-boundary marker (no gameplay effect).
+    PublishWeaponOrderMarker(WeaponOrderEventKind::PresentBegin);
     // DLSS frame retirement belongs to Present, not to successful stereo
     // upload. This covers pause/loading, shouldRender=false and every early
     // return, including failed XR acquisition, without altering VR ownership.
@@ -15414,6 +16004,9 @@ void VR_AfterPresent(IDXGISwapChain* sc, int64_t presentStartQpc,
 
     if (g_state != State::Ready || !g_sessionRunning)
         return;
+    // Diagnostic-only marker immediately before next-frame preparation.
+    PublishWeaponOrderMarker(
+        WeaponOrderEventKind::AfterPresentBeforePrepare);
     PrepareNextFrame();
 }
 
@@ -18546,29 +19139,37 @@ bool VR_GetContactTrackingSnapshot(VrContactTrackingSnapshot& snapshot)
     return valid;
 }
 
-// The weapon-hand aim pose used by ALL aim consumers (bullet steering, the
-// reticle, and the visible-gun barrel). Position is always the right hand.
-// Orientation is the right controller's — UNLESS two-handed aim is engaged, in
-// which case -Z is swung onto the line from the right hand to the left (support)
-// hand, with roll kept from the right controller. Two-hand engages smoothly by
-// pose (support hand up near the barrel line) so there is no button to hold.
+// The shared/base weapon-hand aim pose used by ALL aim consumers (bullet
+// steering, the reticle, and the visible gun). Position is always the primary
+// hand. Orientation is the primary controller's — UNLESS two-handed aim is
+// engaged, in which case -Z is swung onto the two-hand line with roll kept
+// from the primary controller. With the F1 Virtual stock option enabled, that
+// line starts at the configured primary-to-head rear-reference blend and ends
+// at the selected support endpoint; otherwise it is the primary -> support line. Downstream
+// verified barrel-origin aiming (gun_barrel_aim) may substitute the muzzle
+// origin/direction afterwards and is unaffected by this base pose.
 bool VR_GetAimPose(float outQuat[4], float outPos[3])
 {
     if (!g_headCsInit)
         return false;
+    AimPoseInputs inputs{};
     EnterCriticalSection(&g_headCs);
     const bool okR = g_rightAimPoseValid;
     const XrPosef right = g_rightAimPose;
     const bool okL = g_leftAimPoseValid;
     const XrPosef left = g_leftAimPose;
-    const XrPosef head = g_headPose;
-    const bool stockHeadValid = g_headPoseValid && g_stockHeadPoseTime != 0 &&
-        g_stockHeadPoseTime == g_stockControllerPoseTime;
+    const bool okH = g_headPoseValid &&
+        g_stockAimFresh.load(std::memory_order_acquire);
+    const XrVector3f head = g_headPose.position;
+    const bool supportGripFresh = g_supportGripPoseValid &&
+        g_supportGripPoseFresh.load(std::memory_order_acquire);
+    const XrVector3f supportGrip = g_supportGripPosePosition;
+    inputs = CurrentStockAimPoseInputs(
+         okR, right, okL, left, okH, head, g_headPose.orientation,
+         supportGripFresh, supportGrip);
     LeaveCriticalSection(&g_headCs);
 
-    const AimPoseResult aim = ComputeAimPose(
-        CurrentStockAimPoseInputs(okR, right, okL, left, stockHeadValid,
-            head.position, head.orientation));
+    const AimPoseResult aim = ComputeAimPose(inputs);
     if (!aim.updateTwoHandActivity)
         return false;
 

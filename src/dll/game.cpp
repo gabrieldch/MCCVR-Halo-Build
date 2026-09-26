@@ -15,6 +15,7 @@
 #include "../common/hud_visibility.h"
 #include "../common/exclusive_input.h"
 #include "../common/weapon_hand_logic.h"
+#include "../common/weapon_order_diagnostic_logic.h"
 #include "../common/anatomical_palette_logic.h"
 #include "../common/halo4_runtime_weapon_bounds.h"
 #include "../common/legacy_runtime_weapon_bounds.h"
@@ -54,6 +55,7 @@
 #include "haloce_unit_control.h"
 #include "title_reentry_probe.h"
 #include "roomscale.h"
+#include "telemetry_recorder.h"
 #include "physical_crouch_camera.h"
 #include "../common/physical_crouch_native_read.h"
 #include "../common/physical_crouch_additional_witnesses.h"
@@ -1201,6 +1203,21 @@ namespace
     bool InstallReachMuzzle(uintptr_t base,size_t size,uint32_t generation);
     bool RemoveReachMuzzle();
     void ReportReachMuzzle();
+    // Weapon-order diagnostic tranche: read-only semantic-primary
+    // observations reusing the title readers below. Defined after those
+    // readers; called from the FP interpolate/palette hooks above them.
+    // expectedGeneration is the title adapter generation captured by
+    // Game_DiagnosticReadPrimaryWeapon; every reader rejects a mismatch or a
+    // mid-read generation change as a lifecycle guard rejection.
+    bool DiagnosticH3Primary(uint32_t expectedGeneration, uint32_t& unitOut,
+        uint32_t& weaponOut, uint32_t& detailOut) noexcept;
+    bool DiagnosticOdstPrimary(uint32_t expectedGeneration, uint32_t& unitOut,
+        uint32_t& weaponOut, uint32_t& detailOut) noexcept;
+    bool DiagnosticReachPrimary(uint32_t expectedGeneration, uint32_t& unitOut,
+        uint32_t& weaponOut, uint32_t& detailOut) noexcept;
+    bool DiagnosticHalo4WeaponOwner(uint32_t expectedGeneration,
+        uint32_t candidate, uint32_t& unitOut, uint32_t& weaponOut,
+        uint32_t& detailOut) noexcept;
     void LegacyApplyVisualHandOffsets(GameTitle title,uint16_t tag,const int32_t* boneMap,
         const FpInterpolationContext& context,BoneMatrix* destination);
     bool ReachApplyBarrelAim(int32_t unit,float* origin,float* direction,const float* velocity,uint8_t collision,uint32_t simulation);
@@ -5004,9 +5021,47 @@ namespace
         return nativeResult;
     }
 
+    // ---- Weapon-order diagnostic tranche (read-only evidence) ----
+    void PublishH3FpDiagnostic(WeaponOrderEventKind kind,
+        WeaponOrderEventStatus status, uint64_t preparedSerial, uint32_t unit,
+        uint32_t weapon, uint64_t aux0, uint64_t aux1) noexcept
+    {
+        if (!Telemetry_WeaponEventsAccepting())
+            return;
+        Telemetry_PublishWeaponEvent(static_cast<uint8_t>(kind),
+            static_cast<uint8_t>(status),
+            static_cast<uint8_t>(GameTitle::Halo3),
+            g_halo3RuntimeGeneration.load(std::memory_order_acquire),
+            preparedSerial, unit, weapon, aux0, aux1);
+    }
+
     bool __fastcall FpInterpolateHook(int view,int id,int slot,
                                       BoneMatrix** outBones,int* outCount)
     {
+        // Diagnostic-only FP entry + ungated before-read (no gameplay effect).
+        uint32_t diagnosticBeforeUnit = UINT32_MAX;
+        uint32_t diagnosticBeforeWeapon = UINT32_MAX;
+        uint32_t diagnosticBeforeDetail = 0;
+        const bool diagnosticArmed =
+            Telemetry_WeaponEventsAccepting() && slot == 0 && view == 0;
+        if (diagnosticArmed)
+        {
+            Game_DiagnosticNoteFpThread(GameTitle::Halo3);
+            PublishH3FpDiagnostic(WeaponOrderEventKind::FpEntry,
+                WeaponOrderEventStatus::NoObservation,
+                g_fpStereoSolveScope.armed ?
+                    g_fpStereoSolveScope.anatomicalTracking.serial : 0,
+                UINT32_MAX, UINT32_MAX, uint64_t(slot), uint64_t(view));
+            uint32_t probeUnit = UINT32_MAX, probeWeapon = UINT32_MAX;
+            uint32_t probeDetail = 0;
+            if (Game_DiagnosticReadPrimaryWeapon(GameTitle::Halo3,
+                    probeUnit, probeWeapon, probeDetail))
+            {
+                diagnosticBeforeUnit = probeUnit;
+                diagnosticBeforeWeapon = probeWeapon;
+                diagnosticBeforeDetail = probeDetail;
+            }
+        }
         uint32_t muzzleUnit=UINT32_MAX,muzzleWeapon=UINT32_MAX;
         const bool muzzleOwner=Halo3CaptureMuzzleOwner(view,slot,muzzleUnit,muzzleWeapon);
         const bool result=g_origFpInterpolate(view,id,slot,outBones,outCount);
@@ -5091,6 +5146,28 @@ namespace
                                              cameraControl,slot==1);
             }
         }
+        }
+        // Diagnostic-only stable commit, mirroring the existing ownership
+        // stable point ungated: the inventory identity AND the engine FP
+        // record agreement (bit2) must survive the interpolation unchanged.
+        // The Capture probe records bit2 raw without requiring it, so the
+        // pre-latch measurement stays the inventory view.
+        if (diagnosticArmed && result &&
+            diagnosticBeforeWeapon != UINT32_MAX &&
+            (diagnosticBeforeDetail & 0x4u) != 0)
+        {
+            uint32_t afterUnit = UINT32_MAX, afterWeapon = UINT32_MAX;
+            uint32_t afterDetail = 0;
+            if (Game_DiagnosticReadPrimaryWeapon(GameTitle::Halo3, afterUnit,
+                    afterWeapon, afterDetail) &&
+                (afterDetail & 0x4u) != 0 &&
+                afterUnit == diagnosticBeforeUnit &&
+                afterWeapon == diagnosticBeforeWeapon)
+                PublishH3FpDiagnostic(WeaponOrderEventKind::FpWeaponCommit,
+                    WeaponOrderEventStatus::Success,
+                    g_fpStereoSolveScope.armed ?
+                        g_fpStereoSolveScope.anatomicalTracking.serial : 0,
+                    afterUnit, afterWeapon, uint64_t(slot), afterDetail);
         }
         return result;
     }
@@ -12611,9 +12688,47 @@ namespace
         sc.key.store(key, std::memory_order_release);
     }
 
+    // ---- Weapon-order diagnostic tranche (read-only evidence) ----
+    void PublishOdstFpDiagnostic(WeaponOrderEventKind kind,
+        WeaponOrderEventStatus status, uint64_t preparedSerial, uint32_t unit,
+        uint32_t weapon, uint64_t aux0, uint64_t aux1) noexcept
+    {
+        if (!Telemetry_WeaponEventsAccepting())
+            return;
+        Telemetry_PublishWeaponEvent(static_cast<uint8_t>(kind),
+            static_cast<uint8_t>(status),
+            static_cast<uint8_t>(GameTitle::Halo3ODST),
+            g_odstRuntimeGeneration.load(std::memory_order_acquire),
+            preparedSerial, unit, weapon, aux0, aux1);
+    }
+
     bool OdstFpInterpolateWeaponBody(
         int view, int id, int slot, BoneMatrix** outBones, int* outCount)
     {
+        // Diagnostic-only FP entry + ungated before-read (no gameplay effect).
+        uint32_t diagnosticBeforeUnit = UINT32_MAX;
+        uint32_t diagnosticBeforeWeapon = UINT32_MAX;
+        uint32_t diagnosticBeforeDetail = 0;
+        const bool diagnosticArmed =
+            Telemetry_WeaponEventsAccepting() && slot == 0 && view == 0;
+        if (diagnosticArmed)
+        {
+            Game_DiagnosticNoteFpThread(GameTitle::Halo3ODST);
+            PublishOdstFpDiagnostic(WeaponOrderEventKind::FpEntry,
+                WeaponOrderEventStatus::NoObservation,
+                g_fpStereoSolveScope.armed ?
+                    g_fpStereoSolveScope.anatomicalTracking.serial : 0,
+                UINT32_MAX, UINT32_MAX, uint64_t(slot), uint64_t(view));
+            uint32_t probeUnit = UINT32_MAX, probeWeapon = UINT32_MAX;
+            uint32_t probeDetail = 0;
+            if (Game_DiagnosticReadPrimaryWeapon(GameTitle::Halo3ODST,
+                    probeUnit, probeWeapon, probeDetail))
+            {
+                diagnosticBeforeUnit = probeUnit;
+                diagnosticBeforeWeapon = probeWeapon;
+                diagnosticBeforeDetail = probeDetail;
+            }
+        }
         uint32_t muzzleUnit=UINT32_MAX,muzzleWeapon=UINT32_MAX;
         const bool muzzleOwner=OdstCaptureMuzzleOwner(view,slot,muzzleUnit,muzzleWeapon);
         bool result = false;
@@ -12686,6 +12801,26 @@ namespace
         }
         else if (slot == 0 || slot == 1)
             g_fpInterpolationContexts[slot] = {};
+        // Diagnostic-only stable commit, mirroring the existing ownership
+        // stable point ungated: inventory identity plus engine FP record
+        // agreement (bit2) must survive the interpolation unchanged.
+        if (diagnosticArmed && result &&
+            diagnosticBeforeWeapon != UINT32_MAX &&
+            (diagnosticBeforeDetail & 0x4u) != 0)
+        {
+            uint32_t afterUnit = UINT32_MAX, afterWeapon = UINT32_MAX;
+            uint32_t afterDetail = 0;
+            if (Game_DiagnosticReadPrimaryWeapon(GameTitle::Halo3ODST,
+                    afterUnit, afterWeapon, afterDetail) &&
+                (afterDetail & 0x4u) != 0 &&
+                afterUnit == diagnosticBeforeUnit &&
+                afterWeapon == diagnosticBeforeWeapon)
+                PublishOdstFpDiagnostic(WeaponOrderEventKind::FpWeaponCommit,
+                    WeaponOrderEventStatus::Success,
+                    g_fpStereoSolveScope.armed ?
+                        g_fpStereoSolveScope.anatomicalTracking.serial : 0,
+                    afterUnit, afterWeapon, uint64_t(slot), afterDetail);
+        }
         return result;
     }
 
@@ -24072,10 +24207,47 @@ namespace
         }
         context.transformed=true;
     }
+    // ---- Weapon-order diagnostic tranche (read-only evidence) ----
+    void PublishReachFpDiagnostic(WeaponOrderEventKind kind,
+        WeaponOrderEventStatus status, uint64_t preparedSerial, uint32_t unit,
+        uint32_t weapon, uint64_t aux0, uint64_t aux1) noexcept
+    {
+        if (!Telemetry_WeaponEventsAccepting())
+            return;
+        Telemetry_PublishWeaponEvent(static_cast<uint8_t>(kind),
+            static_cast<uint8_t>(status),
+            static_cast<uint8_t>(GameTitle::HaloReach),
+            g_reachCamera.generation.load(std::memory_order_acquire),
+            preparedSerial, unit, weapon, aux0, aux1);
+    }
+
     __declspec(noinline) bool __fastcall ReachFpInterpolate(
         int view, int id, int slot, BoneMatrix** outBones, int* outCount)
     {
         g_reachCamera.activeCallbacks.fetch_add(1,std::memory_order_acq_rel);
+        // Diagnostic-only FP entry + ungated before-read (no gameplay effect).
+        uint32_t diagnosticBeforeUnit = UINT32_MAX;
+        uint32_t diagnosticBeforeWeapon = UINT32_MAX;
+        uint32_t diagnosticBeforeDetail = 0;
+        const bool diagnosticArmed =
+            Telemetry_WeaponEventsAccepting() && slot == 0 && view == 0;
+        if (diagnosticArmed)
+        {
+            Game_DiagnosticNoteFpThread(GameTitle::HaloReach);
+            PublishReachFpDiagnostic(WeaponOrderEventKind::FpEntry,
+                WeaponOrderEventStatus::NoObservation,
+                g_reachFpPairScope.preparedSerial,
+                UINT32_MAX, UINT32_MAX, uint64_t(slot), uint64_t(view));
+            uint32_t probeUnit = UINT32_MAX, probeWeapon = UINT32_MAX;
+            uint32_t probeDetail = 0;
+            if (Game_DiagnosticReadPrimaryWeapon(GameTitle::HaloReach,
+                    probeUnit, probeWeapon, probeDetail))
+            {
+                diagnosticBeforeUnit = probeUnit;
+                diagnosticBeforeWeapon = probeWeapon;
+                diagnosticBeforeDetail = probeDetail;
+            }
+        }
         bool result=false;
         uint32_t muzzleUnit=UINT32_MAX,muzzleWeapon=UINT32_MAX;
         (void)ReachCaptureMuzzleOwner(view,slot,muzzleUnit,muzzleWeapon);
@@ -24089,6 +24261,25 @@ namespace
         __finally
         {
             g_reachCamera.activeCallbacks.fetch_sub(1,std::memory_order_acq_rel);
+        }
+        // Diagnostic-only stable commit, mirroring the existing ownership
+        // stable point ungated: inventory identity plus engine FP record
+        // agreement (bit2) must survive the interpolation unchanged.
+        if (diagnosticArmed && result &&
+            diagnosticBeforeWeapon != UINT32_MAX &&
+            (diagnosticBeforeDetail & 0x4u) != 0)
+        {
+            uint32_t afterUnit = UINT32_MAX, afterWeapon = UINT32_MAX;
+            uint32_t afterDetail = 0;
+            if (Game_DiagnosticReadPrimaryWeapon(GameTitle::HaloReach,
+                    afterUnit, afterWeapon, afterDetail) &&
+                (afterDetail & 0x4u) != 0 &&
+                afterUnit == diagnosticBeforeUnit &&
+                afterWeapon == diagnosticBeforeWeapon)
+                PublishReachFpDiagnostic(WeaponOrderEventKind::FpWeaponCommit,
+                    WeaponOrderEventStatus::Success,
+                    g_reachFpPairScope.preparedSerial,
+                    afterUnit, afterWeapon, uint64_t(slot), afterDetail);
         }
         return result;
     }
@@ -34073,6 +34264,23 @@ namespace
         g_halo4Camera.vrikCountOverflow.fetch_add(1,std::memory_order_relaxed);
     }
 
+    // Weapon-order diagnostic tranche: counterless fill-flag peek. Recording
+    // must not change the totals of the existing VRIK presentation counters,
+    // so the diagnostic path never calls Halo4RecordFillFlag.
+    int32_t Halo4DiagnosticPeekFillFlag(const BoneMatrix* input) noexcept
+    {
+        if (!input)
+            return -1;
+        int32_t flag=0;
+        const unsigned char* record=
+            reinterpret_cast<const unsigned char*>(input) -
+            kHalo4FirstPersonRecordBankOffset;
+        if (!Halo4SafeRead(record+kHalo4FirstPersonRecordFillFlagOffset,
+                           &flag,sizeof(flag)))
+            return -1;
+        return flag;
+    }
+
     // The producer-authored 0x1910 record flag partitions the ordered loop:
     // flag 1 covers both storm_fp hands and the held model, then flag 0 closes
     // the sequence with the native body/legs model. It is not anatomy by
@@ -35776,6 +35984,51 @@ namespace
                 g_halo4OrigModelSkinning(objectIndex,renderModelIndex,selected,nodeMap,
                     flagA,flagB,totalNodeMatrixCount,skinning);
                 return;
+            }
+            // Weapon-order diagnostic: first-person thread/frame marker AND
+            // stable weapon commit for the engine's FP weapon record.
+            // Deliberately independent of the optional hands presentation so
+            // a capture is never silently empty; read-only, no gameplay
+            // effect. The commit requires the same ungated validation the FP
+            // commit contract uses (owned semantic primary plus FP producer
+            // agreement); if it cannot be proven, no commit is invented and
+            // the analyser reports an uncommitted FP invocation instead.
+            if (Telemetry_WeaponEventsAccepting() &&
+                !g_halo4Camera.teardownRequested.load(std::memory_order_acquire) &&
+                g_halo4Camera.armed.load(std::memory_order_acquire) &&
+                reinterpret_cast<uintptr_t>(_ReturnAddress())==
+                    g_halo4Camera.base+kHalo4FirstPersonSkinningReturnRva &&
+                Halo4DiagnosticPeekFillFlag(inputObjectNodeMatrices)==
+                    kHalo4FirstPersonWeaponFillFlag)
+            {
+                Game_DiagnosticNoteFpThread(GameTitle::Halo4);
+                const uint64_t diagnosticSerial = Halo4FloatingPairMatchesCurrent() ?
+                    g_halo4FloatingPair.preparedSerial : 0;
+                Telemetry_PublishWeaponEvent(
+                    static_cast<uint8_t>(WeaponOrderEventKind::FpEntry),
+                    static_cast<uint8_t>(WeaponOrderEventStatus::NoObservation),
+                    static_cast<uint8_t>(GameTitle::Halo4),
+                    g_halo4Camera.generation.load(std::memory_order_acquire),
+                    diagnosticSerial,
+                    UINT32_MAX, UINT32_MAX, 0, 0);
+                uint32_t commitUnit = UINT32_MAX;
+                uint32_t commitWeapon = UINT32_MAX;
+                uint32_t commitDetail = 0;
+                if (DiagnosticHalo4WeaponOwner(
+                        TitleAdapter_GetGeneration(GameTitle::Halo4),
+                        uint32_t(objectIndex), commitUnit, commitWeapon,
+                        commitDetail) &&
+                    (commitDetail & 0x4u) != 0)
+                    Telemetry_PublishWeaponEvent(
+                        static_cast<uint8_t>(
+                            WeaponOrderEventKind::FpWeaponCommit),
+                        static_cast<uint8_t>(
+                            WeaponOrderEventStatus::Success),
+                        static_cast<uint8_t>(GameTitle::Halo4),
+                        g_halo4Camera.generation.load(
+                            std::memory_order_acquire),
+                        diagnosticSerial,
+                        commitUnit, commitWeapon, 0, commitDetail);
             }
             if (!g_halo4Camera.teardownRequested.load(std::memory_order_acquire) &&
                 g_halo4Camera.armed.load(std::memory_order_acquire) &&
@@ -45845,6 +46098,328 @@ void* Game_ReloadPolicyWeapon(GameTitle title, uint32_t weapon)
         return local!=UINT32_MAX && (local>>16) && owner==local ? const_cast<uint8_t*>(data) : nullptr;
     }
     __except(EXCEPTION_EXECUTE_HANDLER) { return nullptr; }
+}
+
+// ---- Weapon-order diagnostic tranche (read-only evidence) ----
+// No gameplay, tracking, aiming, rendering, input, or lifecycle effect.
+// detailOut bits shared by every diagnostic reader:
+//   bit0  secondary slot present (where the reader naturally knows it)
+//   bit1  ownership proven (H2/H4 mirror validation)
+//   bit2  FP-side agreement (engine FP record already shows this handle)
+//   bit30 lifecycle guard rejection (maps to GuardRejected)
+//   bit31 native fault (maps to ExceptionOrFault)
+// The Capture probe records the inventory/ownership view (bit2 raw), while
+// the FP commit check requires bit2 so it fires only at the existing stable
+// commit point where the FP record also agrees. CE is probed directly from
+// vr.cpp through HaloCEControls_GetLocalPlayerState; H2 forwards to the
+// observer core's guarded datum reader below.
+namespace
+{
+    constexpr uint32_t kDiagnosticFpAgreement = 4u;
+    constexpr uint32_t kDiagnosticGuard = 0x40000000u;
+
+    std::atomic<uint64_t> g_diagnosticFpThread[8]{};
+    // Recording session that the FP-thread observation belongs to. A numeric
+    // thread id reused by a later session is not authorization until that
+    // session observes its own FP entry.
+    std::atomic<uint64_t> g_diagnosticFpSession[8]{};
+    int DiagnosticTitleSlot(GameTitle title) noexcept
+    {
+        const int slot = static_cast<int>(title);
+        return (slot >= 0 && slot < 8) ? slot : -1;
+    }
+    // True when the title lifecycle moved after the diagnostic read began:
+    // used to classify a native fault that coincides with a reload/teardown
+    // as a guard rejection rather than an unexplained fault. Safe to call
+    // from an exception handler (atomic loads only).
+    bool DiagnosticLifecycleChanged(GameTitle title,
+        uint32_t expectedGeneration) noexcept
+    {
+        if (title != TitleAdapter_GetActiveTitle() ||
+            TitleAdapter_GetGeneration(title) != expectedGeneration)
+            return true;
+        switch (title)
+        {
+        case GameTitle::Halo3:
+            return g_halo3RuntimeGeneration.load(
+                std::memory_order_acquire) != expectedGeneration;
+        case GameTitle::Halo3ODST:
+            return g_odstRuntimeGeneration.load(
+                std::memory_order_acquire) != expectedGeneration;
+        case GameTitle::HaloReach:
+            return g_reachCamera.generation.load(
+                std::memory_order_acquire) != expectedGeneration;
+        case GameTitle::Halo4:
+            return g_halo4Camera.generation.load(
+                std::memory_order_acquire) != expectedGeneration;
+        default:
+            return false;
+        }
+    }
+    bool DiagnosticH3Primary(uint32_t expectedGeneration, uint32_t& unitOut,
+        uint32_t& weaponOut, uint32_t& detailOut) noexcept
+    {
+        if (!g_halo3PlayerUnitGetter || !g_halo3UnitInVehicle)
+            return false;
+        if (g_halo3RuntimeGeneration.load(std::memory_order_acquire) !=
+            expectedGeneration)
+        {
+            detailOut = kDiagnosticGuard;
+            return false;
+        }
+        const uint32_t owner = uint32_t(g_halo3PlayerUnitGetter(0));
+        if (owner == UINT32_MAX || !(owner >> 16)) return false;
+        if (g_halo3UnitInVehicle(int32_t(owner))) return false;
+        uint32_t weapons[2]{};
+        if (!Halo3ReadOwnedWeapons(owner, weapons, false)) return false;
+        if (weapons[0] == UINT32_MAX) return false;
+        detailOut = (weapons[1] != UINT32_MAX) ? 1u : 0u;
+        // FP-side slot agreement, mirroring the existing stable commit point
+        // without its optional-feature gates. The Capture probe records this
+        // raw; the FP commit requires it.
+        if (g_engineTlsIndex && *g_engineTlsIndex < 0x200)
+        {
+            auto** slots = reinterpret_cast<uint8_t**>(__readgsqword(0x58));
+            const auto* tls = slots ? slots[*g_engineTlsIndex] : nullptr;
+            const auto* users = tls ?
+                *reinterpret_cast<const uint8_t* const*>(tls + 0x568) :
+                nullptr;
+            if (users && *reinterpret_cast<const uint32_t*>(
+                    users + 0x3C) == weapons[0])
+                detailOut |= kDiagnosticFpAgreement;
+        }
+        if (g_halo3RuntimeGeneration.load(std::memory_order_acquire) !=
+            expectedGeneration)
+        {
+            detailOut = kDiagnosticGuard;
+            return false;
+        }
+        unitOut = owner;
+        weaponOut = weapons[0];
+        return true;
+    }
+    bool DiagnosticOdstPrimary(uint32_t expectedGeneration, uint32_t& unitOut,
+        uint32_t& weaponOut, uint32_t& detailOut) noexcept
+    {
+        if (!g_odstPlayerUnitGetter || !g_odstUnitInVehicle)
+            return false;
+        if (g_odstRuntimeGeneration.load(std::memory_order_acquire) !=
+            expectedGeneration)
+        {
+            detailOut = kDiagnosticGuard;
+            return false;
+        }
+        const uint32_t owner = uint32_t(g_odstPlayerUnitGetter(0));
+        if (owner == UINT32_MAX || !(owner >> 16)) return false;
+        if (g_odstUnitInVehicle(int32_t(owner))) return false;
+        uint32_t weapons[2]{};
+        if (!OdstReadMuzzleWeapons(owner, weapons)) return false;
+        if (weapons[0] == UINT32_MAX) return false;
+        detailOut = (weapons[1] != UINT32_MAX) ? 1u : 0u;
+        if (g_odstEngineTlsIndex && *g_odstEngineTlsIndex < 0x200)
+        {
+            auto** slots = reinterpret_cast<uint8_t**>(__readgsqword(0x58));
+            const auto* tls = slots ? slots[*g_odstEngineTlsIndex] : nullptr;
+            const auto* users = tls ?
+                *reinterpret_cast<const uint8_t* const*>(tls + 0x598) :
+                nullptr;
+            if (users && *reinterpret_cast<const uint32_t*>(
+                    users + 0x3C) == weapons[0])
+                detailOut |= kDiagnosticFpAgreement;
+        }
+        if (g_odstRuntimeGeneration.load(std::memory_order_acquire) !=
+            expectedGeneration)
+        {
+            detailOut = kDiagnosticGuard;
+            return false;
+        }
+        unitOut = owner;
+        weaponOut = weapons[0];
+        return true;
+    }
+    bool DiagnosticReachPrimary(uint32_t expectedGeneration, uint32_t& unitOut,
+        uint32_t& weaponOut, uint32_t& detailOut) noexcept
+    {
+        if (!g_reachCamera.playerUnitByOutputUser ||
+            !g_reachCamera.unitInVehicle)
+            return false;
+        if (g_reachCamera.generation.load(std::memory_order_acquire) !=
+            expectedGeneration)
+        {
+            detailOut = kDiagnosticGuard;
+            return false;
+        }
+        const uint32_t owner =
+            uint32_t(g_reachCamera.playerUnitByOutputUser(0));
+        if (owner == UINT32_MAX || !(owner >> 16)) return false;
+        if (g_reachCamera.unitInVehicle(int32_t(owner))) return false;
+        if (!ReachMuzzleTargetStorage(owner)) return false;
+        uint32_t weapons[2]{};
+        if (!ReachReadMuzzleWeapons(owner, weapons)) return false;
+        if (weapons[0] == UINT32_MAX) return false;
+        detailOut = (weapons[1] != UINT32_MAX) ? 1u : 0u;
+        if (g_reachCamera.base)
+        {
+            auto** slots = reinterpret_cast<uint8_t**>(__readgsqword(0x58));
+            const uint32_t index = *reinterpret_cast<const uint32_t*>(
+                g_reachCamera.base + kReachEngineTlsIndexRva);
+            const auto* tls =
+                slots && index < 0x200 ? slots[index] : nullptr;
+            const auto* users = tls ?
+                *reinterpret_cast<const uint8_t* const*>(tls + 0x6A0) :
+                nullptr;
+            if (users && *reinterpret_cast<const uint32_t*>(
+                    users + 0x3C) == weapons[0])
+                detailOut |= kDiagnosticFpAgreement;
+        }
+        if (g_reachCamera.generation.load(std::memory_order_acquire) !=
+            expectedGeneration)
+        {
+            detailOut = kDiagnosticGuard;
+            return false;
+        }
+        unitOut = owner;
+        weaponOut = weapons[0];
+        return true;
+    }
+    // candidate == UINT32_MAX selects the primary slot (Capture path); any
+    // other value must resolve to primary slot 0 through the equipped-weapon
+    // mapping (FP skinning path, where the observed record is the candidate).
+    bool DiagnosticHalo4WeaponOwner(uint32_t expectedGeneration,
+        uint32_t candidate, uint32_t& unitOut, uint32_t& weaponOut,
+        uint32_t& detailOut) noexcept
+    {
+        if (g_halo4Camera.generation.load(std::memory_order_acquire) !=
+            expectedGeneration)
+        {
+            detailOut = kDiagnosticGuard;
+            return false;
+        }
+        Halo4VehicleInputState seat{};
+        if (!Halo4ReadVehicleInput(seat) || seat.seated ||
+            seat.unit == UINT32_MAX || !(seat.unit >> 16))
+            return false;
+        if (!Halo4MuzzleTargetStorage(seat.unit)) return false;
+        uint32_t weapons[2]{};
+        if (!Halo4ReadMuzzleWeapons(seat.unit, weapons)) return false;
+        if (weapons[0] == UINT32_MAX) return false;
+        if (candidate != UINT32_MAX &&
+            ResolveEquippedWeaponSlot(candidate, weapons[0], weapons[1],
+                true, weapons[1] != UINT32_MAX) != 0)
+            return false;
+        unitOut = seat.unit;
+        weaponOut = weapons[0];
+        detailOut = ((weapons[1] != UINT32_MAX) ? 1u : 0u) | 2u;
+        // Primary-slot FP producer agreement, mirroring the gated muzzle
+        // capture without its option/bindings gate. Recorded raw here; the FP
+        // commit requires the bit so the Capture probe measures the
+        // inventory/ownership view rather than the FP assembly view.
+        const auto* tls = Halo4MuzzleTls();
+        const auto* fp = tls ?
+            Halo4VehicleRead<const uint8_t*>(tls, 0x6A0) : nullptr;
+        if (fp && (Halo4VehicleRead<uint32_t>(fp, 0) & 2) &&
+            Halo4VehicleRead<uint32_t>(fp, 4) == seat.unit &&
+            Halo4VehicleRead<uint32_t>(fp, 0x6C) == weapons[0])
+            detailOut |= kDiagnosticFpAgreement;
+        if (g_halo4Camera.generation.load(std::memory_order_acquire) !=
+            expectedGeneration)
+        {
+            detailOut = kDiagnosticGuard;
+            return false;
+        }
+        return true;
+    }
+}
+
+void Game_DiagnosticNoteFpThread(GameTitle title) noexcept
+{
+    const int slot = DiagnosticTitleSlot(title);
+    if (slot < 0)
+        return;
+    const uint32_t generation = TitleAdapter_GetGeneration(title);
+    if (!generation)
+    {
+        g_diagnosticFpThread[slot].store(0, std::memory_order_release);
+        g_diagnosticFpSession[slot].store(0, std::memory_order_release);
+        return;
+    }
+    g_diagnosticFpThread[slot].store(
+        (uint64_t(generation) << 32) | GetCurrentThreadId(),
+        std::memory_order_release);
+    g_diagnosticFpSession[slot].store(
+        Telemetry_CurrentSessionToken(), std::memory_order_release);
+}
+
+uint8_t Game_DiagnosticCaptureProbePermission(GameTitle title) noexcept
+{
+    if (title != GameTitle::Halo3 && title != GameTitle::Halo3ODST &&
+        title != GameTitle::HaloReach && title != GameTitle::Halo4)
+        return weapon_order_diagnostic::kProbePermissionGuardRejected;
+    const int slot = DiagnosticTitleSlot(title);
+    if (slot < 0)
+        return weapon_order_diagnostic::kProbePermissionGuardRejected;
+    const uint64_t stored =
+        g_diagnosticFpThread[slot].load(std::memory_order_acquire);
+    const uint64_t session =
+        g_diagnosticFpSession[slot].load(std::memory_order_acquire);
+    const bool titleMatches = title == TitleAdapter_GetActiveTitle();
+    const uint32_t generation = TitleAdapter_GetGeneration(title);
+    const bool generationMatches = generation != 0 &&
+        uint32_t(stored >> 32) == generation;
+    return weapon_order_diagnostic::CaptureProbePermission(titleMatches,
+        generationMatches, stored, session,
+        Telemetry_CurrentSessionToken(), GetCurrentThreadId());
+}
+
+bool Game_DiagnosticReadPrimaryWeapon(GameTitle title, uint32_t& unitOut,
+    uint32_t& weaponOut, uint32_t& detailOut) noexcept
+{
+    unitOut = UINT32_MAX;
+    weaponOut = UINT32_MAX;
+    detailOut = 0;
+    if (title != TitleAdapter_GetActiveTitle())
+    {
+        detailOut = 0x40000000u; // lifecycle guard rejection
+        return false;
+    }
+    const uint32_t generation = TitleAdapter_GetGeneration(title);
+    if (!generation)
+    {
+        detailOut = 0x40000000u;
+        return false;
+    }
+    __try
+    {
+        switch (title)
+        {
+        case GameTitle::Halo3:
+            return DiagnosticH3Primary(generation, unitOut, weaponOut,
+                detailOut);
+        case GameTitle::Halo3ODST:
+            return DiagnosticOdstPrimary(generation, unitOut, weaponOut,
+                detailOut);
+        case GameTitle::HaloReach:
+            return DiagnosticReachPrimary(generation, unitOut, weaponOut,
+                detailOut);
+        case GameTitle::Halo4:
+            return DiagnosticHalo4WeaponOwner(generation, UINT32_MAX, unitOut,
+                weaponOut, detailOut);
+        case GameTitle::Halo2:
+            return Halo2DiagnosticReadPrimaryWeapon(unitOut, weaponOut,
+                detailOut);
+        default:
+            return false;
+        }
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        // A fault that coincides with a title/generation change is a
+        // lifecycle guard rejection, not an unexplained native fault. The
+        // generation recheck is atomic-only and safe inside the handler.
+        detailOut = DiagnosticLifecycleChanged(title, generation)
+            ? 0x40000000u : 0x80000000u;
+        return false;
+    }
 }
 
 bool Game_RoomscaleCameraAllowed(GameTitle title)

@@ -1,5 +1,6 @@
 #include "haloce_first_person.h"
 #include "haloce_contact.h"
+#include "telemetry_recorder.h"
 #include "vr.h"
 #include "../common/haloce_contact_logic.h"
 #include "../common/weapon_model_catalog.h"
@@ -646,6 +647,27 @@ __declspec(noinline) void __fastcall PaletteHook(uint32_t graph,NodeMatrix* matr
     { applied.fetch_add(1,std::memory_order_relaxed); }
     else refused.fetch_add(1,std::memory_order_relaxed);
 }
+// Weapon-order diagnostic tranche: pure CE stable-commit decision. A commit
+// is recorded only when the validated on-foot first-person identity survives
+// the original prepare unchanged. No engine state, no gameplay meaning.
+bool DiagnosticCeOwned(const HaloCELocalPlayerState& state) noexcept
+{
+    return state.generation != 0 &&
+        state.hasControlledUnit && state.onFoot &&
+        state.nativePreparesFirstPerson &&
+        !state.nativeInputBlocked && !state.nativeLookBlocked &&
+        !state.nativePaused && !state.nativeCinematicFlag &&
+        state.unit != 0xffffffffu && state.weapon != 0xffffffffu;
+}
+bool DiagnosticCeStableCommit(const HaloCELocalPlayerState& before,
+    bool beforeValid, const HaloCELocalPlayerState& after,
+    bool afterValid) noexcept
+{
+    return beforeValid && afterValid &&
+        DiagnosticCeOwned(before) && DiagnosticCeOwned(after) &&
+        before.generation == after.generation &&
+        before.unit == after.unit && before.weapon == after.weapon;
+}
 void RunPrepare(PrepareFn original,int16_t user,Scope* current,Scope* previous)
 {
     scope=current;
@@ -657,6 +679,32 @@ __declspec(noinline) void __fastcall PrepareHook(int16_t user)
     Callback callback;
     auto original=reinterpret_cast<PrepareFn>(prepareHook.original);
     if (!original) return;
+    // Diagnostic-only FP entry plus a before/after stable commit read. The
+    // pre-latch observation only counts as a stable FP commit when the
+    // validated identity survives the original prepare unchanged: a commit
+    // emitted before prepare alone would only prove what local state said,
+    // not what the preparation that ran actually used. No gameplay effect,
+    // independent of gunBarrelAim, and the original prepare is still called
+    // exactly once.
+    // Accepted limitation (N4): HaloCEControls_GetLocalPlayerState false can
+    // represent several state/lifecycle failures, so a failed CE observation
+    // is recorded as ReaderReturnedFalse, never GuardRejected. The analyser
+    // treats it as unavailable evidence for the negative FP-first proof.
+    const bool diagnosticArmed =
+        user == 0 && Telemetry_WeaponEventsAccepting();
+    HaloCELocalPlayerState diagnosticBefore{};
+    bool diagnosticBeforeValid = false;
+    if (diagnosticArmed)
+    {
+        Telemetry_PublishWeaponEvent(
+            static_cast<uint8_t>(WeaponOrderEventKind::FpEntry),
+            static_cast<uint8_t>(WeaponOrderEventStatus::NoObservation),
+            static_cast<uint8_t>(GameTitle::HaloCE),
+            generation.load(std::memory_order_acquire), 0,
+            UINT32_MAX, UINT32_MAX, uint64_t(user), 0);
+        diagnosticBeforeValid =
+            HaloCEControls_GetLocalPlayerState(diagnosticBefore);
+    }
     Scope local{};
     Scope* previous=scope;
     // The original prepare rebuilds stock first-person matrices. Invalidate
@@ -677,6 +725,21 @@ __declspec(noinline) void __fastcall PrepareHook(int16_t user)
         {local.muzzleUnit=state.unit;local.muzzleWeapon=state.weapon;}
     }
     RunPrepare(original,user,&local,previous);
+    if (diagnosticArmed)
+    {
+        HaloCELocalPlayerState diagnosticAfter{};
+        const bool diagnosticAfterValid =
+            HaloCEControls_GetLocalPlayerState(diagnosticAfter);
+        if (DiagnosticCeStableCommit(diagnosticBefore, diagnosticBeforeValid,
+                diagnosticAfter, diagnosticAfterValid))
+            Telemetry_PublishWeaponEvent(
+                static_cast<uint8_t>(WeaponOrderEventKind::FpWeaponCommit),
+                static_cast<uint8_t>(WeaponOrderEventStatus::Success),
+                static_cast<uint8_t>(GameTitle::HaloCE),
+                diagnosticBefore.generation,
+                local.valid ? local.context.tracking.serial : 0,
+                diagnosticBefore.unit, diagnosticBefore.weapon, 0, 0x3u);
+    }
 }
 #include "haloce_first_person_visibility.inl"
 #include "haloce_muzzle_lifecycle.inl"

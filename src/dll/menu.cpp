@@ -19,6 +19,7 @@
 #include "d3d_state.h"
 #include "d3d11_hook.h"
 #include "window_resize.h"
+#include "telemetry_recorder.h"
 #include "../common/log.h"
 #include "../common/config.h"
 #include "../common/weapon_interaction_logic.h"
@@ -45,6 +46,7 @@ namespace
     };
     VrPointerInput g_vrPointer;
     bool g_resetArmed = false; // "reset all settings" needs a second click
+    bool g_virtualStockResetArmed = false;
     // Panel drag state. The panel is otherwise completely locked; the grab
     // handle along the top edge is the only thing that moves it. vr.cpp owns the
     // drag itself because it holds the controller ray -- we only tell it whether
@@ -173,6 +175,7 @@ namespace
         Cat_Reload,
         Cat_Vehicles,
         Cat_WeaponAim,
+        Cat_VirtualStockLab,
         Cat_Crosshair,
         Cat_BodyHands,
         Cat_Picture,
@@ -180,6 +183,7 @@ namespace
         Cat_Subtitles,
         Cat_Desktop,
         Cat_Scope,
+        Cat_Telemetry,
         Cat_Advanced,
         Cat_Count
     };
@@ -202,6 +206,7 @@ namespace
         {"Reload & Holsters", "Magazine handling, weapon storage, and gesture zones."},
         {"Vehicles",      "First-person driving: sit in the seat instead of floating behind the vehicle."},
         {"Weapon & Aim",  "Gun placement, per-title calibration, muzzle alignment, and two-handed aiming."},
+        {"Virtual Stock Lab", "Experimental virtual shoulder aiming and proximity release."},
         {"Crosshair",     "The floating reticle that shows where the weapon really shoots."},
         {"Body & Hands",  "Arms, shoulders, and how much of Chief you can see."},
         {"Picture",       "Render resolution, sharpening, anti-aliasing and brightness."},
@@ -209,6 +214,7 @@ namespace
         {"Subtitles",     "Localized dialogue in gameplay and 3D theatre."},
         {"Desktop",       "The window on your monitor, not the headset."},
         {"Scope",         "Experimental gun-mounted zoom screen."},
+        {"Telemetry Recorder", "Records controller, headset and aim-solver data for troubleshooting."},
         {"Advanced",      "Tracking calibration, panel placement, and starting over."},
     };
     static_assert(sizeof(kCategories) / sizeof(kCategories[0]) == Cat_Count,
@@ -532,9 +538,16 @@ namespace
         ImGui::BeginChild("##sidebar", ImVec2(kSidebarWidth, -footerHeight), ImGuiChildFlags_Borders);
         for (int i = 0; i < Cat_Count; ++i)
         {
+            // Virtual Stock Lab is intentionally excluded from normal navigation;
+            // product controls live in Weapon & Aim.
+            if (i == Cat_VirtualStockLab)
+                continue;
             const bool selected = g_activeCategory == i;
             if (ImGui::Selectable(kCategories[i].label, selected))
+            {
                 g_activeCategory = i;
+                g_virtualStockResetArmed = false;
+            }
             // An orange bar down the left edge of the selected row, so the
             // current category reads at a glance from across the panel.
             if (selected)
@@ -1395,11 +1408,17 @@ namespace
             changed |= vr_menu::SliderFloat("Left palm depth (m)",
                                           &g_config.left_grip_forward_m,
                                           -0.05f, 0.25f, "%.3f");
-            ImGui::TextDisabled("Extends the two-hand grab line and grip-click zone to your visible palm.");
+            ImGui::TextDisabled("Moves the support-hand grab sample forward from the tracked controller toward the visible palm.");
             ImGui::Unindent();
         }
         ImGui::TextDisabled("Put your support hand on the front of the gun, click/hold its GRIP.\n"
                             "Engages only when your hand is on the barrel line.");
+
+        changed |= ImGui::Checkbox("Reduce Support-Hand Rotation",
+            &g_config.two_hand_support_grip_pose);
+        ImGui::TextDisabled(
+            "Reduces how much twisting your support hand affects two-handed aim.\n"
+            "Support-hand position still helps steer the weapon.");
 #include "virtual_stock_menu.inl"
         }
 
@@ -1780,6 +1799,63 @@ namespace
             "the desktop window shrinks to fit and the GPU downscales into it (no\n"
             "extra render pass, no measurable cost). OFF by default. Takes effect on\n"
             "the next launch -- close MCC and relaunch.");
+        }
+
+        if (g_activeCategory == Cat_Telemetry)
+        {
+        const TelemetryStatusSnapshot telemetry = Telemetry_GetStatus();
+        const bool active = telemetry.state == TelemetryRecorderState::Starting ||
+            telemetry.state == TelemetryRecorderState::Recording;
+        const bool busy = telemetry.state == TelemetryRecorderState::Finalizing;
+        ImGui::Text("Status: %s", Telemetry_StateName(telemetry.state));
+        if ((active || busy) && telemetry.sessionStartQpc > 0 &&
+            telemetry.qpcFrequency > 0 &&
+            telemetry.qpcNow >= telemetry.sessionStartQpc)
+        {
+            const double seconds = static_cast<double>(
+                telemetry.qpcNow - telemetry.sessionStartQpc) /
+                static_cast<double>(telemetry.qpcFrequency);
+            ImGui::Text("Duration: %.1f s", seconds);
+        }
+        ImGui::Text("Producer calls: %llu",
+            static_cast<unsigned long long>(telemetry.producerCalls));
+        ImGui::Text("Enqueued: %llu",
+            static_cast<unsigned long long>(telemetry.enqueued));
+        ImGui::Text("Written: %llu",
+            static_cast<unsigned long long>(telemetry.written));
+        ImGui::Text("Dropped (queue full): %llu",
+            static_cast<unsigned long long>(telemetry.droppedQueueFull));
+        ImGui::Text("Weapon events: enq %llu / written %llu / dropped %llu",
+            static_cast<unsigned long long>(telemetry.weaponEventsEnqueued),
+            static_cast<unsigned long long>(telemetry.weaponEventsWritten),
+            static_cast<unsigned long long>(
+                telemetry.weaponEventsDroppedQueueFull));
+        ImGui::Text("Duplicates suppressed: %llu",
+            static_cast<unsigned long long>(
+                telemetry.duplicateSerialSuppressed));
+        if (telemetry.state == TelemetryRecorderState::Error ||
+            telemetry.state == TelemetryRecorderState::Unavailable)
+        {
+            ImGui::TextColored(Rgb(kWarning), "Recorder: %s (system %u)",
+                Telemetry_ErrorName(telemetry.error), telemetry.systemError);
+        }
+
+        if (active)
+        {
+            if (ImGui::Button("Stop & save"))
+                Telemetry_RequestStop();
+        }
+        else
+        {
+            ImGui::BeginDisabled(busy ||
+                telemetry.state == TelemetryRecorderState::Unavailable);
+            if (ImGui::Button("Start recording"))
+                Telemetry_RequestStart();
+            ImGui::EndDisabled();
+        }
+        ImGui::Spacing();
+        ImGui::TextDisabled("One sample per prepared VR frame.");
+        ImGui::TextDisabled("Saved in the Telemetry Recordings folder beside HaloMCCVR.log.");
         }
 
         if (g_activeCategory == Cat_Advanced)

@@ -37,6 +37,7 @@
 #include "../common/config.h"
 #include "../common/log.h"
 #include "game.h"
+#include "telemetry_recorder.h"
 #include "title_adapter.h"
 #include "roomscale.h"
 #include "menu.h"
@@ -2394,11 +2395,29 @@ namespace
         return result;
     }
 
+    // ---- Weapon-order diagnostic tranche (read-only evidence) ----
+    void Halo2DiagnosticPublish(uint8_t kind, uint8_t status,
+        uint64_t preparedSerial, uint32_t unit, uint32_t weapon, uint64_t aux0,
+        uint64_t aux1) noexcept
+    {
+        if (!Telemetry_WeaponEventsAccepting())
+            return;
+        Telemetry_PublishWeaponEvent(kind, status,
+            static_cast<uint8_t>(GameTitle::Halo2),
+            g_generation.load(std::memory_order_acquire), preparedSerial,
+            unit, weapon, aux0, aux1);
+    }
+
     __declspec(noinline) int __fastcall Halo2FirstPersonPacketBuilderDetour(
         uint32_t user, uint32_t unitObject, const float* position,
         const float* forward, const float* up, int packetCapacity,
         uint32_t* packets, uint8_t publishToRenderer)
     {
+        if (user == kOwnedUser)
+            Halo2DiagnosticPublish(
+                static_cast<uint8_t>(WeaponOrderEventKind::FpEntry),
+                static_cast<uint8_t>(WeaponOrderEventStatus::NoObservation),
+                0, UINT32_MAX, UINT32_MAX, publishToRenderer, 0);
         g_packetBuilderActiveCallbacks.fetch_add(1, std::memory_order_acq_rel);
         g_packetBuilderCalls.fetch_add(1, std::memory_order_relaxed);
         const auto original = reinterpret_cast<Halo2FirstPersonPacketBuilderFn>(
@@ -2639,6 +2658,19 @@ namespace
                     context.muzzleLeftHanded=g_config.left_handed;
                     Halo2PrepareContactFrames(publication,independentPrimary,context);
                     context.valid = true;
+                    // Diagnostic-only FP weapon commit: admitted packet
+                    // identity for this renderer (no gameplay effect).
+                    Halo2DiagnosticPublish(
+                        static_cast<uint8_t>(
+                            WeaponOrderEventKind::FpWeaponCommit),
+                        static_cast<uint8_t>(
+                            WeaponOrderEventStatus::Success),
+                        publication.serial, unitObject,
+                        context.weaponObject,
+                        (anniversaryConsumer ? 1u : 0u) |
+                            ((context.secondaryWeaponObject != UINT32_MAX) ?
+                                2u : 0u),
+                        0);
                     if (binding.rigKind ==
                         Halo2FirstPersonRigKind::MasterChief)
                     {
@@ -6162,6 +6194,100 @@ void Halo2Observer6Dof_ShutdownForVrFailure() noexcept
     g_teardownRequested.store(true, std::memory_order_release);
 }
 
+// ---- Weapon-order diagnostic tranche (read-only evidence) ----
+// Independent datum/inventory view: owned local unit plus the FP user-data
+// primary slot validated through the native object table. The FP packet slot
+// is deliberately NOT consulted here; packet evidence arrives separately via
+// FpWeaponCommit so the analyser observes raw agreement or disagreement.
+bool Halo2DiagnosticReadPrimaryWeapon(uint32_t& unitOut, uint32_t& weaponOut,
+    uint32_t& detailOut) noexcept
+{
+    unitOut = UINT32_MAX;
+    weaponOut = UINT32_MAX;
+    detailOut = 0;
+    // Lifecycle-guard failures are reported distinctly (bit30 ->
+    // GuardRejected) so they cannot be confused with a reader that ran and
+    // returned false; bit31 is reserved for native faults.
+    if (!g_armed.load(std::memory_order_acquire) ||
+        !g_levelLive.load(std::memory_order_acquire) ||
+        g_teardownRequested.load(std::memory_order_acquire))
+    {
+        detailOut = 0x40000000u;
+        return false;
+    }
+    const uint32_t generationBefore =
+        g_generation.load(std::memory_order_acquire);
+    if (!generationBefore)
+    {
+        detailOut = 0x40000000u;
+        return false;
+    }
+    if (TitleAdapter_GetActiveTitle() != GameTitle::Halo2 ||
+        TitleAdapter_GetGeneration(GameTitle::Halo2) != generationBefore)
+    {
+        detailOut = 0x40000000u;
+        return false;
+    }
+    const uintptr_t module = g_moduleBase.load(std::memory_order_acquire);
+    if (!module)
+    {
+        detailOut = 0x40000000u;
+        return false;
+    }
+    __try
+    {
+        const uint32_t unit = Halo2OwnedUnit();
+        if (unit == UINT32_MAX || !(unit >> 16))
+            return false;
+        const uintptr_t userArray =
+            *reinterpret_cast<const volatile uintptr_t*>(module +
+                kHalo2FirstPersonUserDataPointerRva);
+        if (!userArray)
+            return false;
+        const uintptr_t weaponData = userArray +
+            static_cast<uintptr_t>(kOwnedUser) *
+                kHalo2FirstPersonUserStride +
+            kHalo2FirstPersonWeaponDataOffset;
+        const uint32_t primary =
+            *reinterpret_cast<const volatile uint32_t*>(weaponData +
+                kHalo2FirstPersonWeaponObjectOffset);
+        const uintptr_t secondaryData =
+            weaponData + kHalo2FirstPersonWeaponSlotStride;
+        const uint32_t secondaryObject =
+            *reinterpret_cast<const volatile uint32_t*>(secondaryData +
+                kHalo2FirstPersonWeaponObjectOffset);
+        const bool secondaryPresent =
+            (*reinterpret_cast<const volatile uint8_t*>(secondaryData) & 1u) &&
+            secondaryObject != UINT32_MAX;
+        // Datum ownership mirroring Halo2DualWeaponOwned, resolved through
+        // this core's own module base (no dual-aim install dependency).
+        bool owned = false;
+        if (primary != UINT32_MAX && (primary >> 16))
+        {
+            const uint8_t* object = static_cast<const uint8_t*>(
+                Halo2ObjectFromIndex(primary));
+            owned = object && object[0xAA] == 2 && (object[0x130] & 1u) &&
+                *reinterpret_cast<const uint32_t*>(object + 0x158) == unit;
+        }
+        if (g_generation.load(std::memory_order_acquire) != generationBefore)
+        {
+            detailOut = 0x40000000u;
+            return false;
+        }
+        if (!owned)
+            return false;
+        unitOut = unit;
+        weaponOut = primary;
+        detailOut = (secondaryPresent ? 1u : 0u) | 2u;
+        return true;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        detailOut = 0x80000000u;
+        return false;
+    }
+}
+
 #else
 
 bool Halo2Observer6Dof_Poll(
@@ -6202,5 +6328,13 @@ bool Halo2Observer6Dof_BeginClassicFirstPersonEye() noexcept { return false; }
 void Halo2Observer6Dof_EndClassicFirstPersonEye() noexcept {}
 void Halo2Observer6Dof_RequestRecenter() noexcept {}
 void Halo2Observer6Dof_ShutdownForVrFailure() noexcept {}
+bool Halo2DiagnosticReadPrimaryWeapon(uint32_t& unitOut, uint32_t& weaponOut,
+    uint32_t& detailOut) noexcept
+{
+    unitOut = UINT32_MAX;
+    weaponOut = UINT32_MAX;
+    detailOut = 0;
+    return false;
+}
 
 #endif

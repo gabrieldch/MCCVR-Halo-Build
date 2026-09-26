@@ -2,6 +2,7 @@
 
 #include <d3d11.h>
 #include <cstdint>
+#include "../common/virtual_stock_test_profiles.h"
 
 struct IDXGISwapChain;
 struct Halo2CameraRectangle;
@@ -10,6 +11,18 @@ enum class GameTitle : uint8_t;
 // Successful local slot-1 rendering only: inhibits support-grip coupling,
 // independently of collision/melee. Never authorizes inventory or firing.
 void VR_ObserveSecondaryWeaponPresentation(GameTitle title, uint32_t generation);
+
+// Runtime-only Hybrid troubleshooting control. It is intentionally absent from
+// Config and resets to Normal when the DLL process starts.
+HybridDiagnosticOverride VR_GetHybridDiagnosticOverride() noexcept;
+void VR_SetHybridDiagnosticOverride(HybridDiagnosticOverride value) noexcept;
+
+// Runtime-only aim test profile. It is intentionally absent from Config and
+// resets to Custom when the DLL process starts. The effective settings getter
+// is also the seam a future frame telemetry reader can use without menu state.
+VirtualStockTestProfile VR_GetVirtualStockTestProfile() noexcept;
+void VR_SetVirtualStockTestProfile(VirtualStockTestProfile value) noexcept;
+VirtualStockAimSettings VR_GetEffectiveVirtualStockAimSettings() noexcept;
 
 #ifndef HALOMCCVR_HALO2_STEREO6DOF
 #define HALOMCCVR_HALO2_STEREO6DOF 0
@@ -749,9 +762,13 @@ bool VR_EndPreparedAuthoredReticleSuppression();
 // M3: the game layer sets this when the crosshair is over an enemy (engine
 // target-lock). While true, the floating reticle repaints red like the OG HUD.
 void VR_SetReticleEnemy(bool enemy);
-// Weapon-hand aim pose shared by bullet steering, the reticle, and the visible
-// barrel. Position = right hand; orientation = right controller, or the
-// right->left two-hand line when two-handed aim engages. False until tracked.
+// Shared/base weapon-hand aim pose for bullet steering, the reticle, and the
+// visible gun. Base position = primary hand; orientation = primary
+// controller, or the engaged two-hand line (configured rear-reference blend ->
+// raw support hand with Virtual stock, else primary -> support) with
+// primary-owned roll.
+// Downstream verified barrel-origin aiming may substitute afterwards.
+// False until the primary hand is tracked.
 bool VR_GetAimPose(float outQuat[4], float outPos[3]);
 // Last controller pose actually used to place the floating reticle after
 // aim_stabilization. Published lock-free by the compositor so Reach's firing

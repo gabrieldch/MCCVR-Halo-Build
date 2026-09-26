@@ -46,6 +46,11 @@ static uint32_t targetUnit{};static uint16_t targetTeam{};static void* targetRes
 static halo_ce::NodeMatrix* contactNativePalette{};
 void VR_PublishReloadTarget(GameTitle,uint32_t,uint64_t,uint64_t,
     const contact_melee::TrackingToWorld&,const float[3]) noexcept {}
+// Weapon-order diagnostic tranche: recording is never active under test, so
+// the probes stay inert through these stubs (mirrors gate-off production).
+bool Telemetry_WeaponEventsAccepting() noexcept { return false; }
+uint64_t Telemetry_PublishWeaponEvent(uint8_t,uint8_t,uint8_t,uint32_t,
+    uint64_t,uint32_t,uint32_t,uint64_t,uint64_t) noexcept { return 0; }
 static uintptr_t contactGraphDefinition{};
 void HaloCEContact_ApplyPalette(const halo_ce::RenderContext& context,const halo_ce::FirstPersonBinding&,
     const halo_ce::NodeMatrix*,halo_ce::NodeMatrix*,HaloCEContactPublication& publication) noexcept
@@ -696,6 +701,27 @@ int main(int argc,char** argv)
     CHECK(visibilityPrepareHook.original&&visibilitySubmitHook.original);
     blockedQuiescenceCount=0;CHECK(RemoveVisibility()&&!visibilityRetiring&&installed.load());
     CHECK(!visibilityPrepareHook.original&&!visibilitySubmitHook.original);
+    {
+        // Weapon-order diagnostic: pure CE stable-commit decision. A commit
+        // requires valid identity on both sides of the original prepare and
+        // an unchanged generation/unit/weapon.
+        HaloCELocalPlayerState before{};
+        before.generation=testGeneration;before.hasControlledUnit=true;
+        before.onFoot=true;before.nativePreparesFirstPerson=true;
+        before.nativeInputBlocked=false;before.nativeLookBlocked=false;
+        before.unit=0x11110001u;before.weapon=0x22220001u;
+        HaloCELocalPlayerState after=before;
+        CHECK(DiagnosticCeStableCommit(before,true,after,true));
+        after.weapon=0x33330001u;
+        CHECK(!DiagnosticCeStableCommit(before,true,after,true));
+        after=before;after.nativePaused=true;
+        CHECK(!DiagnosticCeStableCommit(before,true,after,true));
+        after=before;after.generation=testGeneration+1;
+        CHECK(!DiagnosticCeStableCommit(before,true,after,true));
+        after=before;
+        CHECK(!DiagnosticCeStableCommit(before,false,after,true));
+        CHECK(!DiagnosticCeStableCommit(before,true,after,false));
+    }
     RunCeMuzzleTests();
     quiescenceCalls=quiescenceRanges=0;
     blockedQuiescenceCount=7;
