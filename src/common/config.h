@@ -938,11 +938,6 @@ struct Config
     float virtual_stock_proximity_full_m = kVirtualStockProximityFullDefaultM;
     float virtual_stock_proximity_release_m =
         kVirtualStockProximityReleaseDefaultM;
-    // Product head-turn sway correction. ON maps to the existing mature
-    // inverse-neck model (NK100 constants) in the product resolver; OFF uses
-    // raw coherent HMD positional geometry. No neck tuning is user-exposed.
-    bool virtual_stock_head_turn_sway_correction =
-        kVirtualStockHeadTurnSwayCorrectionDefault;
     // Reduce support-hand rotation by using the grip-pose position as the
     // support endpoint. Position still steers two-handed aim.
     bool two_hand_support_grip_pose = kTwoHandSupportGripPoseDefault;
@@ -1103,9 +1098,13 @@ inline bool VirtualStockUsesShoulderReference(const Config& config) noexcept
         : config.virtual_stock_rear_reference == 1;
 }
 
-// Product Q0 family: Virtual Stock ON and sway correction ON (effective).
-// Preserved across mode/reference/tuning changes; presentation recenter does
-// not invalidate; real epoch transitions do via the existing state machine.
+// Diagnostic-only Q0 capture family. Head-turn sway correction was retired
+// from the product on 2026-09-27, so product resolution can never activate it
+// (VirtualStockAimSettingsFromConfig always resolves inverse-neck off). It
+// survives for isolated diagnostic profiles and their neutral-capture
+// experiments. When it is somehow active it is preserved across
+// mode/reference/tuning changes; presentation recenter does not invalidate;
+// real epoch transitions do via the existing state machine.
 inline bool VirtualStockHeadTurnCorrectionFamilyActive(
     const VirtualStockAimSettings& settings) noexcept
 {
@@ -1180,8 +1179,6 @@ inline void ResetVirtualStockSettings(Config& config) noexcept
     config.virtual_stock_proximity_full_m = kVirtualStockProximityFullDefaultM;
     config.virtual_stock_proximity_release_m =
         kVirtualStockProximityReleaseDefaultM;
-    config.virtual_stock_head_turn_sway_correction =
-        kVirtualStockHeadTurnSwayCorrectionDefault;
     config.virtual_stock = enabled;
 }
 
@@ -1236,29 +1233,19 @@ inline VirtualStockAimSettings VirtualStockAimSettingsFromConfig(
     settings.virtualStockProximityFullM = config.virtual_stock_proximity_full_m;
     settings.virtualStockProximityReleaseM =
         config.virtual_stock_proximity_release_m;
-    // Product head-turn sway correction resolves into the existing mature
-    // inverse-neck effective fields. Explicit diagnostic profiles keep their
-    // own values via ResolveVirtualStockTestProfile; Custom uses this mapping.
-    if (config.virtual_stock_head_turn_sway_correction)
-    {
-        settings.hybridInverseNeckEnabled = true;
-        settings.hybridInverseNeckStrength =
-            kVirtualStockProductInverseNeckStrength;
-        settings.hybridInverseNeckForwardM = kVirtualStockProductNeckForwardM;
-        settings.hybridInverseNeckUpM = kVirtualStockProductNeckUpM;
-        settings.hybridInverseNeckLateralM = kVirtualStockProductNeckLateralM;
-    }
-    else
-    {
-        settings.hybridInverseNeckEnabled = false;
-        settings.hybridInverseNeckStrength =
-            kVirtualStockHybridInverseNeckStrengthDefault;
-        settings.hybridInverseNeckForwardM =
-            kVirtualStockHybridInverseNeckForwardDefaultM;
-        settings.hybridInverseNeckUpM = kVirtualStockHybridInverseNeckUpDefaultM;
-        settings.hybridInverseNeckLateralM =
-            kVirtualStockHybridInverseNeckLateralDefaultM;
-    }
+    // Head-turn sway correction was retired from the product (2026-09-27).
+    // Normal Standard/Plus resolution is the former sway=0 path: inverse-neck
+    // disabled with zeroed knobs. The generic NK capability that remains is
+    // reachable only through isolated diagnostic profiles; product resolution
+    // can never enable it here.
+    settings.hybridInverseNeckEnabled = false;
+    settings.hybridInverseNeckStrength =
+        kVirtualStockHybridInverseNeckStrengthDefault;
+    settings.hybridInverseNeckForwardM =
+        kVirtualStockHybridInverseNeckForwardDefaultM;
+    settings.hybridInverseNeckUpM = kVirtualStockHybridInverseNeckUpDefaultM;
+    settings.hybridInverseNeckLateralM =
+        kVirtualStockHybridInverseNeckLateralDefaultM;
     return settings;
 }
 

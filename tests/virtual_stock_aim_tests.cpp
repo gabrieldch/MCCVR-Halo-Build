@@ -3,6 +3,7 @@
 #include "../src/common/virtual_stock_test_profiles.h"
 #include "../src/dll/aim_pose_trace.h"
 #include <iostream>
+#include <cstring>
 #include <stdexcept>
 #include "virtual_stock_fixture.inl"
 
@@ -65,7 +66,37 @@ int main() {
             const auto independent=ComputeAimPose(input); input.virtualStockEnabled=false;
             Check(Same(independent.pose,ComputeAimPose(input).pose) && !independent.twoHandActive,"physical/independent dual-wield paths retain controller calibration");
         }
-        std::cout<<"640 production aim combinations passed: legacy zero/off parity and missing-head fallback on donor modes 0-2, Hybrid A/B zero-strength and head-invalid endpoints, grip isolation, raw-position invariance.\n";
+        // Retired head-turn sway correction (2026-09-27). With inverse-neck
+        // disabled, a stale-but-valid stored neutral orientation (kept far from
+        // the current head) must be completely inert: the full result is
+        // byte-identical and no inverse-neck evaluation is attempted, for
+        // product-like Standard (rear 0/1) and Plus (rear 3) strength.
+        for (const int rear : {0, 1, 3})
+        {
+            AimPoseInputs input;
+            input.rightValid = input.leftValid = input.twoHandEnabled = input.twoHandLatched = input.headValid = true;
+            input.right.position={.15f,1.30f,-.25f}; input.left.position={.15f,1.29f,-.60f};
+            input.supportPosition=input.left.position; input.headPosition={0,1.60f,0};
+            input.headOrientation={0,.3826834f,0,.9238795f};
+            input.virtualStockEnabled=true; input.virtualStockRearReference=rear;
+            input.virtualStockStrength=rear==3?.80f:.95f;
+            input.hybridInverseNeckEnabled=false;
+            AimPoseTrace withoutNeutralTrace;
+            const auto withoutNeutral=ComputeAimPoseImpl<true>(input,&withoutNeutralTrace);
+            Check(withoutNeutral.valid && !withoutNeutralTrace.inverseNeckAttempted &&
+                !withoutNeutralTrace.inverseNeckValid,
+                "disabled inverse-neck never attempts or validates a stored neutral");
+            input.inverseNeckNeutralValid=true;
+            input.inverseNeckNeutralOrientation={0,.7071068f,0,.7071068f}; // yaw 90 deg from the head
+            input.inverseNeckNeutralCaptureSerial=4321;
+            input.inverseNeckNeutralCaptureContactSpaceEpoch=7;
+            AimPoseTrace staleNeutralTrace;
+            const auto withStaleNeutral=ComputeAimPoseImpl<true>(input,&staleNeutralTrace);
+            Check(!staleNeutralTrace.inverseNeckAttempted && !staleNeutralTrace.inverseNeckValid &&
+                std::memcmp(&withoutNeutral,&withStaleNeutral,sizeof(AimPoseResult))==0,
+                "a stale stored neutral is byte-inert while inverse-neck is disabled");
+        }
+        std::cout<<"640 production aim combinations passed: legacy zero/off parity and missing-head fallback on donor modes 0-2, Hybrid A/B zero-strength and head-invalid endpoints, grip isolation, raw-position invariance; retired sway correction leaves a stale stored neutral byte-inert for Standard and Plus.\n";
         return 0;
     } catch (const std::exception& error) {std::cerr<<error.what()<<'\n';return 1;}
 }

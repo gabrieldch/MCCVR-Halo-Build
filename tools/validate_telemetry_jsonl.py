@@ -174,6 +174,7 @@ def validate_text(raw: str, expect_fixture: bool = False) -> bool:
     )
     profiles_by_id, _, profiles_by_role = build_profile_mapping(start)
 
+    previous_advance = None
     for frame in frames:
         require(isinstance(frame, dict), "frame record is not an object")
         require(frame.get("type") == "frame", "non-frame record inside frame range")
@@ -432,6 +433,14 @@ def validate_text(raw: str, expect_fixture: bool = False) -> bool:
             ),
             "serialized frame contains a non-finite JSON number",
         )
+        validate_transition_family(frame)
+        frame_advance = frame.get("transition_advance_count")
+        if type(frame_advance) is int and frame_advance >= 0:
+            require(
+                previous_advance is None or frame_advance >= previous_advance,
+                "transition advance count is not monotonic",
+            )
+            previous_advance = frame_advance
         if expect_fixture:
             validate_fixture_frame(frame, selected)
 
@@ -484,6 +493,131 @@ def validate_text(raw: str, expect_fixture: bool = False) -> bool:
         require(end["dropped_queue_full"] == 0, "fixture drop count mismatch")
 
     return end is not None and not trailing_partial
+
+
+TRANSITION_STOCK_MODES = frozenset((0, 1))
+TRANSITION_PHASES = frozenset((0, 1, 2))
+TRANSITION_EDGES = frozenset((0, 1, 2))
+TRANSITION_ANCHORS = frozenset((0, 1, 2, 3))
+TRANSITION_BOOL_FIELDS = (
+    "transition_active",
+    "transition_stock_mode_valid",
+    "transition_live_calibrated_forward_valid",
+    "transition_presented_forward_valid",
+    "transition_one_hand_anchor_valid",
+)
+TRANSITION_FLOAT_FIELDS = (
+    "transition_initial_correction_deg",
+    "transition_remaining_correction_deg",
+    "transition_elapsed_ms",
+)
+
+
+def validate_transition_family(frame) -> None:
+    """Grab/release aim-continuity family (optional, additive schema 2).
+
+    Recordings made before this family existed must still validate, so absence
+    is accepted; when present every field and cross-field invariant is checked.
+    """
+    if "transition_applied_serial" not in frame:
+        return
+    for key in (
+        "transition_stock_mode",
+        "transition_phase",
+        "transition_edge_kind",
+        "transition_anchor_source",
+        "transition_advance_count",
+        "transition_last_prepared_serial",
+        "transition_applied_serial",
+    ):
+        require(type(frame.get(key)) is int and frame[key] >= 0,
+                f"transition field {key} is not a non-negative integer")
+    for key in TRANSITION_BOOL_FIELDS:
+        require(type(frame.get(key)) is bool,
+                f"transition field {key} is not boolean")
+    for key in TRANSITION_FLOAT_FIELDS:
+        require(is_finite_number(frame.get(key)),
+                f"transition field {key} is not a finite number")
+        require(frame[key] >= 0.0,
+                f"transition field {key} is negative")
+    require(frame["transition_stock_mode"] in TRANSITION_STOCK_MODES,
+            "transition stock mode is unknown")
+    require(frame["transition_phase"] in TRANSITION_PHASES,
+            "transition phase is unknown")
+    require(frame["transition_edge_kind"] in TRANSITION_EDGES,
+            "transition edge kind is unknown")
+    require(frame["transition_anchor_source"] in TRANSITION_ANCHORS,
+            "transition anchor source is unknown")
+    # The stock mode is only meaningful while Virtual Stock is enabled; an
+    # invalid mode must read Standard (0), never a stale or guessed mode.
+    if not frame["transition_stock_mode_valid"]:
+        require(
+            frame["transition_stock_mode"] == 0,
+            "an invalid transition stock mode must read 0",
+        )
+    for key in (
+        "transition_live_calibrated_forward",
+        "transition_presented_forward",
+        "transition_one_hand_anchor_forward",
+    ):
+        vector = frame.get(key)
+        require(
+            isinstance(vector, list) and len(vector) == 3
+            and all(is_finite_number(value) for value in vector),
+            f"transition vector {key} is not a finite three-element array",
+        )
+    require(
+        frame["transition_initial_correction_deg"] <= 180.0
+        and frame["transition_remaining_correction_deg"] <= 180.0,
+        "transition correction exceeds a half turn",
+    )
+    require(
+        frame["transition_remaining_correction_deg"]
+        <= frame["transition_initial_correction_deg"] + 1e-3,
+        "transition remaining correction exceeds its seed",
+    )
+    if frame["transition_active"]:
+        require(
+            frame["transition_phase"] in (1, 2),
+            "an active transition must be acquiring or releasing",
+        )
+        require(
+            frame["transition_edge_kind"] != 0,
+            "an active transition must name its edge",
+        )
+        require(
+            frame["transition_anchor_source"] != 0,
+            "an active transition must name its anchor source",
+        )
+        require(
+            frame["transition_presented_forward_valid"]
+            or not frame["transition_live_calibrated_forward_valid"],
+            "an active transition must present a valid orientation unless the "
+            "live solve is invalid",
+        )
+    if frame["transition_applied_serial"]:
+        # The process-lifetime advance count and the module's per-state serial
+        # are independent: any invalidation resets the module's serial to zero
+        # while the count persists, and a non-positive prepared display delta
+        # writes the layer output without consuming a serial. Combinations such
+        # as (applied_serial=N, advance_count=0, last=0) and
+        # (applied_serial=N, advance_count>0, last=0) are therefore legitimate,
+        # so only the ordering below is invariant.
+        require(
+            frame["transition_applied_serial"]
+            >= frame["transition_last_prepared_serial"],
+            "transition applied serial precedes the module's last serial",
+        )
+    require(
+        frame["transition_live_calibrated_forward_valid"]
+        == frame["transition_presented_forward_valid"],
+        "presented forward without a valid live calibrated solve",
+    )
+    require(
+        not frame["transition_one_hand_anchor_valid"]
+        or frame["transition_live_calibrated_forward_valid"],
+        "one-hand anchor without a valid live calibrated solve",
+    )
 
 
 def validate_fixture_frame(frame, selected_profile) -> None:
@@ -567,6 +701,50 @@ def validate_fixture_frame(frame, selected_profile) -> None:
         and frame["cf_fixed_head"]["orientation_rebuild_succeeded"],
         "fixture fixed-control cause fields mismatch",
     )
+    require(
+        frame["transition_stock_mode"] == 1
+        and frame["transition_stock_mode_valid"]
+        and frame["transition_active"]
+        and frame["transition_phase"] == 1
+        and frame["transition_edge_kind"] == 1
+        and frame["transition_anchor_source"] == 1,
+        "fixture transition-family identity fields mismatch",
+    )
+    require(
+        approximately_equal(frame["transition_initial_correction_deg"], 12.5)
+        and approximately_equal(frame["transition_remaining_correction_deg"], 4.25)
+        and approximately_equal(frame["transition_elapsed_ms"], 33.3),
+        "fixture transition-family correction values mismatch",
+    )
+    require(
+        frame["transition_live_calibrated_forward_valid"]
+        and frame["transition_presented_forward_valid"]
+        and frame["transition_one_hand_anchor_valid"],
+        "fixture transition-family forward validity mismatch",
+    )
+    require(
+        approximately_equal_sequence(
+            frame["transition_live_calibrated_forward"], [0.0, 0.0, -1.0]
+        ),
+        "fixture transition-family live calibrated forward mismatch",
+    )
+    require(
+        approximately_equal_sequence(
+            frame["transition_presented_forward"],
+            frame["transition_one_hand_anchor_forward"],
+        ),
+        "fixture grab frame does not present the same-frame one-hand aim",
+    )
+    require(
+        frame["transition_advance_count"] == 7,
+        "fixture transition-family advance count mismatch",
+    )
+    if frame["prepared_serial"] == 42:
+        require(
+            frame["transition_last_prepared_serial"] == 42
+            and frame["transition_applied_serial"] == 42,
+            "fixture transition-family serial evidence mismatch",
+        )
 
 
 def records_to_text(records) -> str:
@@ -841,6 +1019,103 @@ def run_self_test(fixture_raw: str) -> None:
     require_rejected(
         inconsistent_diagnostic,
         "inconsistent Force Stock diagnostic authority was accepted",
+    )
+
+    legacy_without_family = copy.deepcopy(records)
+    for legacy_frame in legacy_without_family[1:-1]:
+        for key in list(legacy_frame):
+            if key.startswith("transition_"):
+                del legacy_frame[key]
+    require(
+        validate_text(records_to_text(legacy_without_family)),
+        "an additive recording without the transition family was rejected",
+    )
+
+    invalid_stock_mode = copy.deepcopy(records)
+    invalid_stock_mode[1]["transition_stock_mode_valid"] = False
+    invalid_stock_mode[1]["transition_stock_mode"] = 1
+    require_rejected(
+        invalid_stock_mode,
+        "an invalid stock mode reading Plus was accepted",
+    )
+
+    invalid_stock_mode_zero = copy.deepcopy(records)
+    invalid_stock_mode_zero[1]["transition_stock_mode_valid"] = False
+    invalid_stock_mode_zero[1]["transition_stock_mode"] = 0
+    require(
+        validate_text(records_to_text(invalid_stock_mode_zero)),
+        "a disabled Virtual Stock reading Standard mode was rejected",
+    )
+
+    unknown_stock_mode = copy.deepcopy(records)
+    unknown_stock_mode[1]["transition_stock_mode"] = 2
+    require_rejected(
+        unknown_stock_mode,
+        "an unknown transition stock mode was accepted",
+    )
+
+    remaining_over_seed = copy.deepcopy(records)
+    remaining_over_seed[1]["transition_remaining_correction_deg"] = 20.0
+    require_rejected(
+        remaining_over_seed,
+        "a remaining correction larger than its seed was accepted",
+    )
+
+    nonmonotonic_advance = copy.deepcopy(records)
+    nonmonotonic_advance[1]["transition_advance_count"] = 9
+    nonmonotonic_advance[2]["transition_advance_count"] = 3
+    require_rejected(
+        nonmonotonic_advance,
+        "a decreasing transition advance count was accepted",
+    )
+
+    # An engaged frame may legitimately write the layer output without the
+    # process-lifetime advance count and the module's per-state serial implying
+    # anything about each other. Two accepted shapes:
+    #   (a) first engaged frame, non-positive prepared delta: no consumed serial
+    #       at all, so advance_count == 0 and last_prepared_serial == 0;
+    #   (b) an invalidation reset the module's serial to zero while the
+    #       process-lifetime count persists: advance_count > 0 and last == 0.
+    first_engaged = copy.deepcopy(records)
+    for first_frame in first_engaged[1:-1]:
+        first_frame["transition_advance_count"] = 0
+        first_frame["transition_last_prepared_serial"] = 0
+    require(
+        validate_text(records_to_text(first_engaged)),
+        "the first engaged frame without a consumed advance was rejected",
+    )
+
+    applied_after_reset = copy.deepcopy(records)
+    applied_after_reset[2]["transition_last_prepared_serial"] = 0
+    require(
+        validate_text(records_to_text(applied_after_reset)),
+        "an applied serial after a module-serial reset was rejected",
+    )
+
+    applied_before_module_serial = copy.deepcopy(records)
+    applied_before_module_serial[2]["transition_last_prepared_serial"] = 50
+    require_rejected(
+        applied_before_module_serial,
+        "an applied serial preceding the module's last serial was accepted",
+    )
+
+    # An active transition over a frame whose live solve is invalid must present
+    # nothing, not be rejected: the seam only marks presented valid when the
+    # live solve is valid.
+    invalid_live_active = copy.deepcopy(records)
+    invalid_live_active[2]["transition_live_calibrated_forward_valid"] = False
+    invalid_live_active[2]["transition_presented_forward_valid"] = False
+    invalid_live_active[2]["transition_one_hand_anchor_valid"] = False
+    require(
+        validate_text(records_to_text(invalid_live_active)),
+        "an active transition over an invalid live solve was rejected",
+    )
+
+    presented_without_live = copy.deepcopy(records)
+    presented_without_live[2]["transition_live_calibrated_forward_valid"] = False
+    require_rejected(
+        presented_without_live,
+        "a presented orientation without a valid live solve was accepted",
     )
 
     truncated = fixture_raw.rstrip("\r\n")[:-8]

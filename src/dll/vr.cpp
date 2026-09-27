@@ -9,6 +9,7 @@
 #include "../common/title_runtime_state.h"
 #include <windows.h>
 #include "../common/virtual_stock_logic.h"
+#include "../common/virtual_stock_aim_continuity.h"
 #include "../common/virtual_stock_neutral_capture.h"
 #include <tlhelp32.h>
 #include <d3d11.h>
@@ -1690,6 +1691,248 @@ namespace
     std::atomic<uint64_t> g_prepareQpcPublished{0};
     std::atomic<uint64_t> g_cameraSerialObserved{0};
     std::atomic<uint64_t> g_firstCameraDelayUs{0};
+
+    // ---- Grab/release aim continuity (Virtual Stock, Standard and Plus) ----
+    //
+    // The layer in src/common/virtual_stock_aim_continuity.h is advanced once
+    // per prepared serial on the OpenXR frame thread, after input capture
+    // (including UpdateTwoHandLatch) and head capture and before any
+    // publication that must show the corrected aim. Game/render threads read a
+    // lock-free, fail-open correction packet instead (VR_GetAimPose is called
+    // from several threads), so the feature works with recording off and never
+    // takes a lock in the getter.
+    struct AimContinuityLayerState
+    {
+        virtual_stock::AimContinuityState transition{};
+        // The layer's own last presented orientation, i.e. the Apply() output
+        // actually emitted for the previous engaged serial. Used as the release
+        // seed and for rapid re-grab continuity.
+        bool lastPresentedValid = false;
+        virtual_stock::Quat4 lastPresented{};
+        bool publishedValid = false;
+        // Process-lifetime monotonic count of prepared serials that advanced the
+        // layer (the module's own duplicate-serial and non-positive-dt guards
+        // leave it untouched). Telemetry evidence; never reset.
+        uint64_t advanceCount = 0;
+        GameTitle title = GameTitle::None;
+        uint32_t generation = 0;
+        uint64_t contactSpaceEpoch = 0;
+        bool haveIdentity = false;
+    };
+    AimContinuityLayerState g_aimContinuityLayer;
+
+    // Same-thread (prepared-frame) view of the last serial the layer ran for,
+    // with the exact orientations the seam solved. Consumed by the presentation
+    // publishers and by telemetry capture in that same prepared serial.
+    struct AimContinuityPreparedOutput
+    {
+        uint64_t serial = 0;
+        bool liveValid = false;
+        virtual_stock::Quat4 live{};
+        bool oneHandValid = false;
+        virtual_stock::Quat4 oneHand{};
+        bool presentedValid = false;
+        virtual_stock::Quat4 presented{};
+    };
+    AimContinuityPreparedOutput g_aimContinuityOutput;
+
+    // Cross-thread publication for VR_GetAimPose. Seqlock shape mirrors
+    // ReticleAimPosePublication: no locks, no allocation, trivially small.
+    struct AimContinuityPublication
+    {
+        std::atomic<uint32_t> sequence{0};
+        std::atomic<uint64_t> serial{0};
+        std::atomic<uint64_t> contactSpaceEpoch{0};
+        std::atomic<uint8_t> valid{0};
+        // Assembly identity of the live solve the correction belongs to: the
+        // stock-aware head sample and the support endpoint source. A reader
+        // whose own solve was assembled differently must fail open, because a
+        // correction is only meaningful against the live pose it was derived
+        // from.
+        std::atomic<uint8_t> stockHeadCoherent{0};
+        std::atomic<uint8_t> supportEndpointUsedGrip{0};
+        std::atomic<float> cx{0.0f};
+        std::atomic<float> cy{0.0f};
+        std::atomic<float> cz{0.0f};
+        std::atomic<float> cw{1.0f};
+    };
+    AimContinuityPublication g_aimContinuityPublication;
+
+    void PublishAimContinuityCorrection(
+        uint64_t serial, uint64_t contactSpaceEpoch, bool valid,
+        bool stockHeadCoherent, bool supportEndpointUsedGrip,
+        virtual_stock::Quat4 correction) noexcept
+    {
+        auto& published = g_aimContinuityPublication;
+        published.sequence.fetch_add(1, std::memory_order_acq_rel);
+        published.serial.store(serial, std::memory_order_relaxed);
+        published.contactSpaceEpoch.store(
+            contactSpaceEpoch, std::memory_order_relaxed);
+        published.valid.store(valid ? 1u : 0u, std::memory_order_relaxed);
+        published.stockHeadCoherent.store(
+            stockHeadCoherent ? 1u : 0u, std::memory_order_relaxed);
+        published.supportEndpointUsedGrip.store(
+            supportEndpointUsedGrip ? 1u : 0u, std::memory_order_relaxed);
+        published.cx.store(correction.x, std::memory_order_relaxed);
+        published.cy.store(correction.y, std::memory_order_relaxed);
+        published.cz.store(correction.z, std::memory_order_relaxed);
+        published.cw.store(correction.w, std::memory_order_relaxed);
+        published.sequence.fetch_add(1, std::memory_order_release);
+    }
+
+    // Conservative, deterministic invalidation: no stale history may replay
+    // after a reset, epoch change, title/handedness change or feature disable.
+    // Consumers see identity afterwards because the packet is published
+    // invalid, which is also what every fail-open path returns.
+    void InvalidateAimContinuityLayer() noexcept
+    {
+        ResetAimContinuity(g_aimContinuityLayer.transition);
+        g_aimContinuityLayer.lastPresentedValid = false;
+        g_aimContinuityLayer.lastPresented = virtual_stock::Quat4{};
+        g_aimContinuityLayer.publishedValid = false;
+        g_aimContinuityLayer.haveIdentity = false;
+        g_aimContinuityOutput = AimContinuityPreparedOutput{};
+        PublishAimContinuityCorrection(
+            0, 0, false, false, false, virtual_stock::Quat4{});
+    }
+
+    // presented = live (x) correction, in exactly the frame finishAimPose
+    // calibrated: the correction is local to the live pose, so the composition
+    // needs no re-calibration and never moves the aim position. Returns the
+    // input orientation untouched whenever anything cannot be proven valid.
+    XrQuaternionf ComposeAimContinuityCorrection(
+        XrQuaternionf orientation, virtual_stock::Quat4 correction) noexcept
+    {
+        virtual_stock::Quat4 live{};
+        virtual_stock::Quat4 normalizedCorrection{};
+        if (!virtual_stock::TryNormalizeQuaternion(
+                {orientation.x, orientation.y, orientation.z, orientation.w},
+                live) ||
+            !virtual_stock::TryNormalizeQuaternion(
+                correction, normalizedCorrection))
+            return orientation;
+        virtual_stock::Quat4 presented{};
+        if (!virtual_stock::TryNormalizeQuaternion(
+                virtual_stock::MultiplyQuat4(live, normalizedCorrection),
+                presented) ||
+            !virtual_stock::Finite(presented))
+            return orientation;
+        return XrQuaternionf{
+            presented.x, presented.y, presented.z, presented.w};
+    }
+
+    // Prepared-frame presentation publishers (contact/Halo 2/Halo 4/Reach/CE
+    // tracking snapshots) run on the thread that advanced the layer, so they
+    // read that serial's own output directly. Only the emitted orientation
+    // changes; positions and every control path stay raw.
+    XrQuaternionf PresentAimContinuity(
+        XrQuaternionf orientation, uint64_t preparedSerial) noexcept
+    {
+        const AimContinuityLayerState& layer = g_aimContinuityLayer;
+        if (!layer.transition.active ||
+            g_aimContinuityOutput.serial != preparedSerial)
+            return orientation;
+        return ComposeAimContinuityCorrection(
+            orientation, layer.transition.correction);
+    }
+
+    // Orientation-only variant for the per-title snapshots that publish a whole
+    // pose: the position is always the untouched solver output.
+    XrPosef PresentedAimContinuityPose(
+        XrPosef pose, uint64_t preparedSerial) noexcept
+    {
+        pose.orientation =
+            PresentAimContinuity(pose.orientation, preparedSerial);
+        return pose;
+    }
+
+    // Cross-thread correction read for VR_GetAimPose. The packet carries its
+    // own serial, the contact-space epoch and assembly identity it was computed
+    // under, and a valid flag that is only set while a correction is active.
+    // `expectedSerial` is the prepared serial whose poses the caller solved;
+    // a packet from any other serial describes a different live pose, so it
+    // fails open instead of presenting a snap-sized correction against the
+    // wrong solve. Any inconsistency (torn read, inactive, other serial, epoch
+    // change, different solver assembly, non-finite) fails open to identity.
+    bool ReadAimContinuityPublishedCorrection(
+        uint64_t expectedSerial, bool& outStockHeadCoherent,
+        bool& outSupportEndpointUsedGrip,
+        virtual_stock::Quat4& outCorrection) noexcept
+    {
+        // Serial zero means no prepared frame has published yet: nothing to
+        // match, and the packet must not be trusted.
+        if (!expectedSerial)
+            return false;
+        auto& published = g_aimContinuityPublication;
+        for (int attempt = 0; attempt < 2; ++attempt)
+        {
+            const uint32_t before =
+                published.sequence.load(std::memory_order_acquire);
+            if (!before || (before & 1u))
+                continue;
+            const bool valid =
+                published.valid.load(std::memory_order_relaxed) != 0;
+            const uint64_t serial =
+                published.serial.load(std::memory_order_relaxed);
+            const uint64_t epoch =
+                published.contactSpaceEpoch.load(std::memory_order_relaxed);
+            const bool stockHeadCoherent =
+                published.stockHeadCoherent.load(std::memory_order_relaxed) != 0;
+            const bool supportEndpointUsedGrip =
+                published.supportEndpointUsedGrip.load(
+                    std::memory_order_relaxed) != 0;
+            const virtual_stock::Quat4 candidate{
+                published.cx.load(std::memory_order_relaxed),
+                published.cy.load(std::memory_order_relaxed),
+                published.cz.load(std::memory_order_relaxed),
+                published.cw.load(std::memory_order_relaxed)};
+            if (published.sequence.load(std::memory_order_acquire) != before)
+                continue;
+            if (!valid || !serial)
+                return false;
+            if (serial != expectedSerial)
+                return false;
+            if (epoch != g_contactSpaceEpoch.load(std::memory_order_acquire))
+                return false;
+            virtual_stock::Quat4 normalized{};
+            if (!virtual_stock::TryNormalizeQuaternion(candidate, normalized))
+                return false;
+            // Re-read the published serial immediately after the packet read:
+            // if a prepare completed under this call, both the packet and the
+            // poses now describe a serial this call never solved, so the
+            // correction must not be composed with them.
+            if (g_preparedSerialPublished.load(std::memory_order_acquire) !=
+                expectedSerial)
+                return false;
+            outStockHeadCoherent = stockHeadCoherent;
+            outSupportEndpointUsedGrip = supportEndpointUsedGrip;
+            outCorrection = normalized;
+            return true;
+        }
+        return false;
+    }
+
+    XrQuaternionf PresentAimContinuityFromPublication(
+        XrQuaternionf orientation, uint64_t expectedSerial,
+        bool stockHeadCoherent, bool supportEndpointUsedGrip) noexcept
+    {
+        bool publishedStockHeadCoherent = false;
+        bool publishedSupportEndpointUsedGrip = false;
+        virtual_stock::Quat4 correction{};
+        if (!ReadAimContinuityPublishedCorrection(
+                expectedSerial, publishedStockHeadCoherent,
+                publishedSupportEndpointUsedGrip, correction))
+            return orientation;
+        // The correction is local to the live pose it was derived from. A
+        // reader whose own solve was assembled differently (no coherent head,
+        // or a different support endpoint source) is a different live pose, so
+        // it fails open instead of composing a mismatched correction for one
+        // frame.
+        if (publishedStockHeadCoherent != stockHeadCoherent ||
+            publishedSupportEndpointUsedGrip != supportEndpointUsedGrip)
+            return orientation;
+        return ComposeAimContinuityCorrection(orientation, correction);
+    }
 #if HALOMCCVR_EXPERIMENTAL_REACH_RENDER_CANDIDATE
     // Two fixed publication slots carry a coherent head/pad/eye sample from
     // PrepareNextFrame into Reach's later render transaction. The high state
@@ -7402,6 +7645,13 @@ float4 ps_scope_linearize(VSOut i):SV_Target { return paint(i.uv,true); }
         // controller/head pairing afterwards.
         g_stockAimFresh.store(false, std::memory_order_release);
         g_supportGripPoseFresh.store(false, std::memory_order_release);
+        // The grab/release transition layer deliberately SURVIVES the routine
+        // prepared-frame retire: it is advanced once per prepared serial in
+        // PrepareNextFrame, and SubmitPreparedFrame's unconditional
+        // ResetPreparedFrame runs between every pair of those advances, so
+        // invalidating here would make every frame a first observation and no
+        // grab/release edge could ever seed. Only the genuine abort / session /
+        // incoherence paths below invalidate the layer.
 #if HALOMCCVR_HALO2_STEREO6DOF
         g_halo2PreparedCadenceSerial.store(0, std::memory_order_release);
 #endif
@@ -7413,6 +7663,12 @@ float4 ps_scope_linearize(VSOut i):SV_Target { return paint(i.uv,true); }
 
     void EndPreparedFrameWithoutLayers(const char* reason)
     {
+        // Every caller of this abort path is exceptional (session stopping,
+        // failed swapchain layer transactions, a failed next-wait dispatch
+        // gate). Unlike the routine SubmitPreparedFrame retire, an aborted
+        // frame must not leave a transition correction or history behind, so
+        // both branches invalidate.
+        InvalidateAimContinuityLayer();
         if (!g_preparedFrame.begun || g_session == XR_NULL_HANDLE)
         {
             ResetPreparedFrame();
@@ -7437,6 +7693,7 @@ float4 ps_scope_linearize(VSOut i):SV_Target { return paint(i.uv,true); }
         // the pairing here too so no stale coherence survives session loss.
         g_stockAimFresh.store(false, std::memory_order_release);
         g_supportGripPoseFresh.store(false, std::memory_order_release);
+        InvalidateAimContinuityLayer();
         g_waitThreadStop.store(true, std::memory_order_release);
         if (g_waitConsumedEvent)
             SetEvent(g_waitConsumedEvent);
@@ -7526,6 +7783,10 @@ float4 ps_scope_linearize(VSOut i):SV_Target { return paint(i.uv,true); }
                     // would allow a later origin jump to look like a punch.
                     g_contactSpaceChangeAtNs.store(change.changeTime, std::memory_order_release);
                     g_contactSpaceEpoch.fetch_add(1, std::memory_order_acq_rel);
+                    // The stock anchor and any active transition belong to the
+                    // old reference space; drop them before the new space is
+                    // used. The seam also compares the epoch per serial.
+                    InvalidateAimContinuityLayer();
                 }
                 break;
             }
@@ -7603,6 +7864,10 @@ float4 ps_scope_linearize(VSOut i):SV_Target { return paint(i.uv,true); }
                 else if (sc.state == XR_SESSION_STATE_EXITING || sc.state == XR_SESSION_STATE_LOSS_PENDING)
                 {
                     StopControllerHaptics();
+                    // The session is ending: drop the transition layer with the
+                    // prepared frame instead of letting it survive into a later
+                    // session (the routine retire no longer does this).
+                    InvalidateAimContinuityLayer();
                     ResetPreparedFrame();
                     g_authoredReticlePreparationReady.store(
                         false, std::memory_order_release);
@@ -7614,6 +7879,7 @@ float4 ps_scope_linearize(VSOut i):SV_Target { return paint(i.uv,true); }
             }
             case XR_TYPE_EVENT_DATA_INSTANCE_LOSS_PENDING:
                 StopControllerHaptics();
+                InvalidateAimContinuityLayer();
                 ResetPreparedFrame();
                 g_authoredReticlePreparationReady.store(
                     false, std::memory_order_release);
@@ -9392,6 +9658,96 @@ float4 ps_scope_linearize(VSOut i):SV_Target { return paint(i.uv,true); }
                      : ComputeAimPoseImpl<false>(inputs, nullptr);
     }
 
+    #include "virtual_stock_aim_continuity_runtime.inl"
+
+    // Live advance seam: exactly once per prepared serial, on the OpenXR frame
+    // thread, after input capture (including UpdateTwoHandLatch) and head
+    // capture and before anything that must show the corrected aim. It is
+    // deliberately outside CapturePreparedFrameTelemetry, so the feature works
+    // with recording off.
+    //
+    // Engagement: g_config.virtual_stock && g_config.two_handed_aim. Standard
+    // (rear reference 0/1/2) and Plus (rear reference 3) both get the same
+    // fixed continuity law; ordinary non-Virtual-Stock two-hand aim does not.
+    // Anything else is inert: no extra solve, no state change, identity for
+    // every consumer. A running transition always finishes even if the mode,
+    // menu or config changed meanwhile.
+    //
+    // Switching Plus<->Standard mid-transition deliberately does NOT
+    // invalidate: it is a menu-driven geometry change, not a latch edge, and
+    // the running ease keeps decaying against the live solve of whichever mode
+    // is now selected, so the player still sees a continuous presentation.
+    void AdvanceAimContinuityForPreparedFrame(
+        bool padFresh, float dtSeconds) noexcept
+    {
+        AimContinuityLayerState& layer = g_aimContinuityLayer;
+        const GameTitle title = TitleAdapter_GetActiveTitle();
+        const uint32_t generation = TitleAdapter_GetGeneration(title);
+        const uint64_t contactSpaceEpoch =
+            g_contactSpaceEpoch.load(std::memory_order_acquire);
+
+        // Title/generation and reference-space identity changes invalidate the
+        // layer even when a transition is active; a new session must never
+        // resume a previous anchor.
+        if (layer.haveIdentity &&
+            (layer.title != title || layer.generation != generation ||
+                layer.contactSpaceEpoch != contactSpaceEpoch))
+            InvalidateAimContinuityLayer();
+        layer.title = title;
+        layer.generation = generation;
+        layer.contactSpaceEpoch = contactSpaceEpoch;
+        layer.haveIdentity = true;
+
+        const bool applicable =
+            g_config.virtual_stock && g_config.two_handed_aim;
+        if (!applicable)
+        {
+            if (layer.transition.initialized || layer.transition.active ||
+                layer.lastPresentedValid || layer.publishedValid ||
+                g_aimContinuityOutput.serial)
+                InvalidateAimContinuityLayer();
+            return;
+        }
+
+        // Same-frame stock-aware inputs: the exact assembly the dominant
+        // presentation customers use (Reach/Halo 2/Halo 4 render snapshots,
+        // the contact-tracking snapshot and the CE rig), i.e. the
+        // CurrentFrameStockAimPoseInputs head/support-grip pairing for this
+        // prepared serial. VR_GetAimPose assembles the identical values under
+        // g_headCs from the same globals.
+        const bool rightFresh = padFresh && g_rightAimPoseValid;
+        const bool leftFresh = padFresh && g_leftAimPoseValid;
+        const AimPoseInputs stockInputs = CurrentFrameStockAimPoseInputs(
+            rightFresh, g_rightAimPose, leftFresh, g_leftAimPose);
+
+        const AimContinuityFrameSolve solve = AdvanceAimContinuityFrame(
+            layer.transition, stockInputs, g_preparedFrame.serial,
+            dtSeconds, layer.lastPresentedValid, layer.lastPresented);
+        if (solve.advanceConsumed)
+            ++layer.advanceCount;
+
+        g_aimContinuityOutput.serial = g_preparedFrame.serial;
+        g_aimContinuityOutput.liveValid = solve.liveValid;
+        g_aimContinuityOutput.live = solve.live;
+        g_aimContinuityOutput.oneHandValid = solve.oneHandValid;
+        g_aimContinuityOutput.oneHand = solve.oneHand;
+        g_aimContinuityOutput.presentedValid = solve.presentedValid;
+        g_aimContinuityOutput.presented = solve.presented;
+
+        if (solve.presentedValid)
+        {
+            layer.lastPresentedValid = true;
+            layer.lastPresented = solve.presented;
+        }
+        const bool publishValid =
+            layer.transition.active && solve.presentedValid;
+        layer.publishedValid = publishValid;
+        PublishAimContinuityCorrection(
+            g_preparedFrame.serial, contactSpaceEpoch, publishValid,
+            stockInputs.headValid, stockInputs.supportEndpointUsedGrip,
+            solve.correction);
+    }
+
 
     TelemetryVec3 ToTelemetryVec3(const XrVector3f& value) noexcept
     {
@@ -9505,6 +9861,74 @@ float4 ps_scope_linearize(VSOut i):SV_Target { return paint(i.uv,true); }
         return control;
     }
 
+    // Grab/release aim continuity telemetry for this prepared serial. Fills the
+    // transition family from the layer state and the seam's own same-frame
+    // output; raw live aim evidence (aim_trace.final_direction, canonical_aim)
+    // is untouched by this function.
+    void FillAimContinuityTelemetry(TelemetryFrame& frame) noexcept
+    {
+        const virtual_stock::AimContinuityDiagnostics diagnostics =
+            ReadAimContinuityDiagnostics(g_aimContinuityLayer.transition);
+        // Product stock mode this frame: 1 = Plus (rear reference 3),
+        // 0 = Standard. The mode is only meaningful while Virtual Stock is
+        // enabled; an invalid mode is reported as 0, never as a stale or
+        // guessed value.
+        frame.transitionStockModeValid = g_config.virtual_stock;
+        frame.transitionStockMode =
+            frame.transitionStockModeValid && VirtualStockUsesPlusMode(g_config)
+            ? 1u : 0u;
+        frame.transitionActive = diagnostics.active;
+        frame.transitionPhase = static_cast<uint8_t>(diagnostics.phase);
+        frame.transitionEdgeKind =
+            static_cast<uint8_t>(diagnostics.edge_kind);
+        frame.transitionAnchorSource =
+            static_cast<uint8_t>(diagnostics.anchor_source);
+        frame.transitionInitialCorrectionDeg =
+            std::isfinite(diagnostics.initial_correction_deg)
+            ? diagnostics.initial_correction_deg : 0.0f;
+        frame.transitionRemainingCorrectionDeg =
+            std::isfinite(diagnostics.remaining_correction_deg)
+            ? diagnostics.remaining_correction_deg : 0.0f;
+        frame.transitionElapsedMs =
+            std::isfinite(diagnostics.transition_elapsed_ms)
+            ? diagnostics.transition_elapsed_ms : 0.0f;
+        frame.transitionAdvanceCount = g_aimContinuityLayer.advanceCount;
+        frame.transitionLastPreparedSerial =
+            diagnostics.last_prepared_serial;
+
+        // Everything below is only meaningful when the layer actually ran for
+        // this prepared serial. Absence is recorded as invalid, never as a
+        // zero/identity value that could be mistaken for an observation.
+        const AimContinuityPreparedOutput& output = g_aimContinuityOutput;
+        if (output.serial != g_preparedFrame.serial)
+            return;
+        frame.transitionAppliedSerial = output.serial;
+        const auto forward = [](virtual_stock::Quat4 orientation,
+                                TelemetryVec3& out) {
+            const virtual_stock::Point3 direction = virtual_stock::RotatePoint(
+                orientation, {0.0f, 0.0f, -1.0f});
+            if (!virtual_stock::Finite(direction))
+                return false;
+            out = {direction.x, direction.y, direction.z};
+            return true;
+        };
+        if (output.liveValid)
+        {
+            frame.transitionLiveCalibratedForwardValid =
+                forward(output.live, frame.transitionLiveCalibratedForward);
+        }
+        if (output.oneHandValid)
+        {
+            frame.transitionOneHandAnchorValid =
+                forward(output.oneHand, frame.transitionOneHandAnchorForward);
+        }
+        if (output.presentedValid)
+        {
+            frame.transitionPresentedForwardValid =
+                forward(output.presented, frame.transitionPresentedForward);
+        }
+    }
+
     void CapturePreparedFrameTelemetry(
         const XrFrameState& frameState, bool upcomingPadFresh,
         bool upcomingViewsValid, bool upcomingHeadValid) noexcept
@@ -9554,6 +9978,7 @@ float4 ps_scope_linearize(VSOut i):SV_Target { return paint(i.uv,true); }
             inputs.testProfileUsed == VirtualStockTestProfile::Custom;
         frame.effectiveSettings = ToTelemetrySettings(inputs);
         frame.canonicalAim = ToTelemetryAimResult(canonical);
+        FillAimContinuityTelemetry(frame);
 
         const auto solveControl = [&](VirtualStockTestProfile profile,
                                       TelemetryControlResult& output) {
@@ -10183,6 +10608,9 @@ float4 ps_scope_linearize(VSOut i):SV_Target { return paint(i.uv,true); }
             g_twoHandLatched.store(false, std::memory_order_release);
             g_contactHaptics[0].store(0.0f, std::memory_order_release);
             g_contactHaptics[1].store(0.0f, std::memory_order_release);
+            // Handedness swaps the semantic primary/support roles, so a stored
+            // transition anchor would be replayed against the wrong hand.
+            InvalidateAimContinuityLayer();
         }
         EnterCriticalSection(&g_headCs);
         g_physicalControllerPose[0] = leftLocation.pose;
@@ -11058,8 +11486,10 @@ float4 ps_scope_linearize(VSOut i):SV_Target { return paint(i.uv,true); }
         next.primaryAimValid=aim.valid;
         if (aim.valid)
         {
-            const float q[]{aim.pose.orientation.x, aim.pose.orientation.y,
-                            aim.pose.orientation.z, aim.pose.orientation.w};
+            const XrQuaternionf presented =
+                PresentAimContinuity(aim.pose.orientation, serial);
+            const float q[]{presented.x, presented.y, presented.z,
+                            presented.w};
             memcpy(next.primaryAimOrientation, q, sizeof(q));
         }
         auto physicalInputs=CurrentAimPoseInputs(rightFresh,g_rightAimPose,leftFresh,g_leftAimPose);
@@ -11141,13 +11571,19 @@ float4 ps_scope_linearize(VSOut i):SV_Target { return paint(i.uv,true); }
         next.twoHandAimActive = aim.valid && aim.twoHandActive;
         if (aim.valid)
         {
-            next.rightAimOrientation[0] = aim.pose.orientation.x;
-            next.rightAimOrientation[1] = aim.pose.orientation.y;
-            next.rightAimOrientation[2] = aim.pose.orientation.z;
-            next.rightAimOrientation[3] = aim.pose.orientation.w;
-            next.rightAimPosition[0] = aim.pose.position.x;
-            next.rightAimPosition[1] = aim.pose.position.y;
-            next.rightAimPosition[2] = aim.pose.position.z;
+            // Orientation only: the presentation surfaces consume the aim that
+            // includes any active grab/release transition correction; the
+            // position and the raw two-hand activity flag stay exactly as the
+            // solver returned them.
+            const XrPosef presentedAim = PresentedAimContinuityPose(
+                aim.pose, preparedSerial);
+            next.rightAimOrientation[0] = presentedAim.orientation.x;
+            next.rightAimOrientation[1] = presentedAim.orientation.y;
+            next.rightAimOrientation[2] = presentedAim.orientation.z;
+            next.rightAimOrientation[3] = presentedAim.orientation.w;
+            next.rightAimPosition[0] = presentedAim.position.x;
+            next.rightAimPosition[1] = presentedAim.position.y;
+            next.rightAimPosition[2] = presentedAim.position.z;
         }
         next.leftControllerValid = leftPoseFresh;
         if (leftPoseFresh)
@@ -11269,13 +11705,19 @@ float4 ps_scope_linearize(VSOut i):SV_Target { return paint(i.uv,true); }
         next.twoHandAimActive = aim.valid && aim.twoHandActive;
         if (aim.valid)
         {
-            next.rightAimOrientation[0] = aim.pose.orientation.x;
-            next.rightAimOrientation[1] = aim.pose.orientation.y;
-            next.rightAimOrientation[2] = aim.pose.orientation.z;
-            next.rightAimOrientation[3] = aim.pose.orientation.w;
-            next.rightAimPosition[0] = aim.pose.position.x;
-            next.rightAimPosition[1] = aim.pose.position.y;
-            next.rightAimPosition[2] = aim.pose.position.z;
+            // Orientation only: the presentation surfaces consume the aim that
+            // includes any active grab/release transition correction; the
+            // position and the raw two-hand activity flag stay exactly as the
+            // solver returned them.
+            const XrPosef presentedAim = PresentedAimContinuityPose(
+                aim.pose, preparedSerial);
+            next.rightAimOrientation[0] = presentedAim.orientation.x;
+            next.rightAimOrientation[1] = presentedAim.orientation.y;
+            next.rightAimOrientation[2] = presentedAim.orientation.z;
+            next.rightAimOrientation[3] = presentedAim.orientation.w;
+            next.rightAimPosition[0] = presentedAim.position.x;
+            next.rightAimPosition[1] = presentedAim.position.y;
+            next.rightAimPosition[2] = presentedAim.position.z;
         }
         next.leftControllerValid = leftPoseFresh;
         if (leftPoseFresh)
@@ -11386,13 +11828,19 @@ float4 ps_scope_linearize(VSOut i):SV_Target { return paint(i.uv,true); }
         next.twoHandAimActive = aim.valid && aim.twoHandActive;
         if (aim.valid)
         {
-            next.rightAimOrientation[0] = aim.pose.orientation.x;
-            next.rightAimOrientation[1] = aim.pose.orientation.y;
-            next.rightAimOrientation[2] = aim.pose.orientation.z;
-            next.rightAimOrientation[3] = aim.pose.orientation.w;
-            next.rightAimPosition[0] = aim.pose.position.x;
-            next.rightAimPosition[1] = aim.pose.position.y;
-            next.rightAimPosition[2] = aim.pose.position.z;
+            // Orientation only: the presentation surfaces consume the aim that
+            // includes any active grab/release transition correction; the
+            // position and the raw two-hand activity flag stay exactly as the
+            // solver returned them.
+            const XrPosef presentedAim = PresentedAimContinuityPose(
+                aim.pose, preparedSerial);
+            next.rightAimOrientation[0] = presentedAim.orientation.x;
+            next.rightAimOrientation[1] = presentedAim.orientation.y;
+            next.rightAimOrientation[2] = presentedAim.orientation.z;
+            next.rightAimOrientation[3] = presentedAim.orientation.w;
+            next.rightAimPosition[0] = presentedAim.position.x;
+            next.rightAimPosition[1] = presentedAim.position.y;
+            next.rightAimPosition[2] = presentedAim.position.z;
         }
         next.leftControllerValid = leftPoseFresh;
         if (leftPoseFresh)
@@ -12018,6 +12466,23 @@ float4 ps_scope_linearize(VSOut i):SV_Target { return paint(i.uv,true); }
                 g_inverseNeckNeutralCapture, neutralInput);
             LeaveCriticalSection(&g_headCs);
         }
+        // Grab/release transition continuity: advance the Virtual Stock layer
+        // exactly once for this prepared serial. It sits after the input and
+        // head captures above (so UpdateTwoHandLatch and the coherent head
+        // sample already describe this serial) and before every publication
+        // below (telemetry, contact snapshot, Halo 2/Halo 4/Reach/CE snapshots,
+        // reticle). The prepared-frame display delta is the same dt the rest of
+        // the frame pipeline uses; an unavailable or non-positive delta makes
+        // the module skip the advance, exactly as if the layer were off.
+        {
+            const float preparedDtSeconds =
+                g_preparedFrame.predictedDisplayDelta > 0
+                ? static_cast<float>(g_preparedFrame.predictedDisplayDelta) *
+                    1.0e-9f
+                : 0.0f;
+            AdvanceAimContinuityForPreparedFrame(
+                upcomingPadFresh, preparedDtSeconds);
+        }
         CapturePreparedFrameTelemetry(
             frameState, upcomingPadFresh, upcomingViewsValid,
             upcomingHeadValid);
@@ -12093,7 +12558,11 @@ float4 ps_scope_linearize(VSOut i):SV_Target { return paint(i.uv,true); }
                     upcomingPadFresh&&g_rightAimPoseValid,g_rightAimPose,
                     upcomingPadFresh&&g_leftAimPoseValid,g_leftAimPose);
                 const auto aim=ComputeAimPose(aimInputs);
-                rig.primaryAim=pose(aim.pose,aim.valid);
+                // CE's visible weapon/hand rig consumes the presented aim:
+                // orientation-only continuity, position untouched. The
+                // independent solve below stays raw.
+                rig.primaryAim=pose(PresentedAimContinuityPose(
+                    aim.pose,g_preparedFrame.serial),aim.valid);
                 rig.twoHandAimActive=rig.primaryAim.valid&&aim.twoHandActive;
                 aimInputs.twoHandEnabled=false;
                 const auto independent=ComputeAimPose(aimInputs);
@@ -19153,12 +19622,22 @@ bool VR_GetAimPose(float outQuat[4], float outPos[3])
     if (!g_headCsInit)
         return false;
     AimPoseInputs inputs{};
+    // Hoisted out of the critical section: the transition packet must only be
+    // applied to a live pose assembled the same way the seam assembled its live
+    // pose, and only for the prepared serial those poses belong to (see
+    // PresentAimContinuityFromPublication).
+    bool okH = false;
+    // Serial of the prepared frame whose poses this call is about to read. The
+    // reader re-checks it after reading the packet, so a prepare completing
+    // under this call can never compose a correction from another serial.
+    const uint64_t expectedSerial =
+        g_preparedSerialPublished.load(std::memory_order_acquire);
     EnterCriticalSection(&g_headCs);
     const bool okR = g_rightAimPoseValid;
     const XrPosef right = g_rightAimPose;
     const bool okL = g_leftAimPoseValid;
     const XrPosef left = g_leftAimPose;
-    const bool okH = g_headPoseValid &&
+    okH = g_headPoseValid &&
         g_stockAimFresh.load(std::memory_order_acquire);
     const XrVector3f head = g_headPose.position;
     const bool supportGripFresh = g_supportGripPoseValid &&
@@ -19173,12 +19652,23 @@ bool VR_GetAimPose(float outQuat[4], float outPos[3])
     if (!aim.updateTwoHandActivity)
         return false;
 
+    // Grab/release aim continuity (Virtual Stock, Standard and Plus): only the
+    // emitted orientation may change, and only while a correction is active
+    // for a valid published packet that belongs to this prepared serial and
+    // was assembled from the same solver inputs. Position, validation, the
+    // two-hand activity indicator and the logging below are byte-for-byte
+    // unchanged.
+    const XrQuaternionf presentedOrientation =
+        PresentAimContinuityFromPublication(
+            aim.pose.orientation, expectedSerial, okH,
+            inputs.supportEndpointUsedGrip);
+
     // Preserve the getter's existing output contract: once the right pose is
     // valid, publish the best pose even if final quaternion validation fails.
-    outQuat[0] = aim.pose.orientation.x;
-    outQuat[1] = aim.pose.orientation.y;
-    outQuat[2] = aim.pose.orientation.z;
-    outQuat[3] = aim.pose.orientation.w;
+    outQuat[0] = presentedOrientation.x;
+    outQuat[1] = presentedOrientation.y;
+    outQuat[2] = presentedOrientation.z;
+    outQuat[3] = presentedOrientation.w;
     outPos[0] = aim.pose.position.x;
     outPos[1] = aim.pose.position.y;
     outPos[2] = aim.pose.position.z;

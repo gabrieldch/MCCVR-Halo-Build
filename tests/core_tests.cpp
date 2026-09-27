@@ -13517,7 +13517,6 @@ int main()
         reset.virtual_stock_hybrid_seat_full_m = 0.10f;
         reset.virtual_stock_hybrid_seat_release_m = 0.20f;
         reset.virtual_stock_proximity_release = false;
-        reset.virtual_stock_head_turn_sway_correction = false;
         reset.two_hand_support_grip_pose = false;
         reset.gun_pitch_deg = 17.0f;
         ResetVirtualStockSettings(reset);
@@ -13539,64 +13538,64 @@ int main()
                 settings.virtualStockProximityRelease &&
                 settings.virtualStockProximityFullM == 0.270f &&
                 settings.virtualStockProximityReleaseM == 0.425f &&
-                reset.virtual_stock_head_turn_sway_correction &&
-                settings.hybridInverseNeckEnabled &&
-                settings.hybridInverseNeckStrength == 1.00f &&
-                settings.hybridInverseNeckForwardM == 0.100f &&
-                settings.hybridInverseNeckUpM == 0.040f &&
-                settings.hybridInverseNeckLateralM == 0.000f,
-            "Virtual Stock reset restores the accepted Plus Centre production composition");
+                !settings.hybridInverseNeckEnabled &&
+                settings.hybridInverseNeckStrength ==
+                    kVirtualStockHybridInverseNeckStrengthDefault &&
+                settings.hybridInverseNeckForwardM ==
+                    kVirtualStockHybridInverseNeckForwardDefaultM &&
+                settings.hybridInverseNeckUpM ==
+                    kVirtualStockHybridInverseNeckUpDefaultM &&
+                settings.hybridInverseNeckLateralM ==
+                    kVirtualStockHybridInverseNeckLateralDefaultM,
+            "Virtual Stock reset restores the accepted Plus Centre composition with inverse-neck disabled");
         Check(!reset.two_hand_support_grip_pose && reset.gun_pitch_deg == 17.0f,
             "Virtual Stock reset preserves support-hand rotation reduction and unrelated aim settings");
         reset.virtual_stock = false;
         reset.virtual_stock_standard_strength = 0.12f;
         reset.virtual_stock_plus_strength = 0.13f;
-        reset.virtual_stock_head_turn_sway_correction = false;
         ResetVirtualStockSettings(reset);
         Check(!reset.virtual_stock &&
                 reset.virtual_stock_standard_strength ==
                     kVirtualStockStandardStrengthDefault &&
                 reset.virtual_stock_plus_strength ==
                     kVirtualStockPlusStrengthDefault &&
-                reset.virtual_stock_head_turn_sway_correction &&
                 !reset.two_hand_support_grip_pose &&
                 reset.gun_pitch_deg == 17.0f,
             "Virtual Stock reset also preserves the disabled state and unrelated settings");
     }
     {
-        Check(Config{}.virtual_stock_head_turn_sway_correction &&
-                kVirtualStockHeadTurnSwayCorrectionDefault &&
-                kVirtualStockProductInverseNeckStrength == 1.00f &&
-                kVirtualStockProductNeckForwardM == 0.100f &&
-                kVirtualStockProductNeckUpM == 0.040f &&
-                kVirtualStockProductNeckLateralM == 0.000f,
-            "head-turn sway correction defaults ON with NK100 product constants");
-        Config sway{};
-        sway.virtual_stock = true;
-        const VirtualStockAimSettings swayOn = VirtualStockAimSettingsFromConfig(
-            sway, HybridDiagnosticOverride::Normal);
-        Check(swayOn.hybridInverseNeckEnabled &&
-                swayOn.hybridInverseNeckStrength == 1.00f &&
-                swayOn.hybridInverseNeckForwardM == 0.100f &&
-                swayOn.hybridInverseNeckUpM == 0.040f &&
-                swayOn.hybridInverseNeckLateralM == 0.000f &&
-                VirtualStockHeadTurnCorrectionFamilyActive(swayOn),
-            "sway correction ON resolves to the mature inverse-neck model with an active Q0 family");
-        sway.virtual_stock_head_turn_sway_correction = false;
-        const VirtualStockAimSettings swayOff = VirtualStockAimSettingsFromConfig(
-            sway, HybridDiagnosticOverride::Normal);
-        Check(!swayOff.hybridInverseNeckEnabled &&
-                !VirtualStockHeadTurnCorrectionFamilyActive(swayOff),
-            "sway correction OFF uses raw HMD geometry with no active Q0 family");
+        // Product resolution can never enable inverse-neck after the
+        // 2026-09-27 head-turn sway correction retirement. Standard rear
+        // references 0/1/2 and Plus rear reference 3 all resolve NK-off with
+        // zeroed knobs and an inactive diagnostic capture family.
+        for (const int rearReference : {0, 1, 2, 3})
+        {
+            Config product{};
+            product.virtual_stock = true;
+            product.virtual_stock_rear_reference = rearReference;
+            const VirtualStockAimSettings resolved =
+                VirtualStockAimSettingsFromConfig(
+                    product, HybridDiagnosticOverride::Normal);
+            Check(!resolved.hybridInverseNeckEnabled &&
+                    resolved.hybridInverseNeckStrength ==
+                        kVirtualStockHybridInverseNeckStrengthDefault &&
+                    resolved.hybridInverseNeckForwardM ==
+                        kVirtualStockHybridInverseNeckForwardDefaultM &&
+                    resolved.hybridInverseNeckUpM ==
+                        kVirtualStockHybridInverseNeckUpDefaultM &&
+                    resolved.hybridInverseNeckLateralM ==
+                        kVirtualStockHybridInverseNeckLateralDefaultM &&
+                    !VirtualStockHeadTurnCorrectionFamilyActive(resolved),
+                "product Virtual Stock resolution keeps inverse-neck disabled and the capture family inactive");
+        }
         Config vsOff{};
         vsOff.virtual_stock = false;
-        vsOff.virtual_stock_head_turn_sway_correction = true;
         const VirtualStockAimSettings vsOffSettings =
             VirtualStockAimSettingsFromConfig(
                 vsOff, HybridDiagnosticOverride::Normal);
-        Check(vsOffSettings.hybridInverseNeckEnabled &&
+        Check(!vsOffSettings.hybridInverseNeckEnabled &&
                 !VirtualStockHeadTurnCorrectionFamilyActive(vsOffSettings),
-            "VS OFF with sway ON leaves no active capture family");
+            "Virtual Stock OFF leaves inverse-neck disabled with no active capture family");
         Config planted{};
         planted.virtual_stock = true;
         planted.virtual_stock_rear_reference = 0;
@@ -13663,8 +13662,8 @@ int main()
             CountText(organizedConfig,"\nvirtual_stock_proximity_release_m = 0.425")==1,
         "proximity release defaults are written exactly once to legacy configurations");
     Check(CountText(organizedConfig,
-                "\nvirtual_stock_head_turn_sway_correction = 1") == 1,
-        "sway correction default is written exactly once to legacy configurations");
+                "virtual_stock_head_turn_sway_correction") == 0,
+        "the retired sway correction key is never written to generated configurations");
     Check(CountText(organizedConfig,"\nvirtual_stock_rear_reference = 3")==1 &&
             CountText(organizedConfig,"\nvirtual_stock_shoulder_back_m = 0.005")==1 &&
             CountText(organizedConfig,"\nvirtual_stock_shoulder_side_m = 0.015")==1,
@@ -13905,25 +13904,25 @@ int main()
             g_config.virtual_stock_proximity_full_m == 0.31f &&
             g_config.virtual_stock_proximity_release_m == 0.57f,
         "proximity release and both distances persist through a config round trip");
-    g_config.virtual_stock_head_turn_sway_correction = false;
-    ConfigSave();
-    g_config.virtual_stock_head_turn_sway_correction = true;
-    ConfigLoad(primary.c_str());
-    Check(!g_config.virtual_stock_head_turn_sway_correction,
-        "head-turn sway correction OFF persists through a config round trip");
-    g_config.virtual_stock_head_turn_sway_correction = true;
-    ConfigSave();
-    g_config.virtual_stock_head_turn_sway_correction = false;
-    ConfigLoad(primary.c_str());
-    Check(g_config.virtual_stock_head_turn_sway_correction,
-        "head-turn sway correction ON persists through a config round trip");
     {
-        std::ofstream invalidSway(primary);
-        invalidSway << "virtual_stock_head_turn_sway_correction = 7\n";
+        // Retired key inertness: an existing cfg carrying the old key must
+        // load without re-enabling inverse-neck, and must never be re-emitted.
+        std::ofstream retiredSway(primary);
+        retiredSway << "virtual_stock_head_turn_sway_correction = 1\n";
     }
     ConfigLoad(primary.c_str());
-    Check(g_config.virtual_stock_head_turn_sway_correction,
-        "invalid sway correction values retain the ON default per the bool parser");
+    {
+        const VirtualStockAimSettings retiredKeySettings =
+            VirtualStockAimSettingsFromConfig(
+                g_config, HybridDiagnosticOverride::Normal);
+        Check(!retiredKeySettings.hybridInverseNeckEnabled &&
+                !VirtualStockHeadTurnCorrectionFamilyActive(retiredKeySettings),
+            "a legacy sway correction config key cannot re-enable inverse-neck");
+    }
+    ConfigSave();
+    Check(ReadTextFile(primary).find(
+                "virtual_stock_head_turn_sway_correction") == std::string::npos,
+        "the retired sway correction key is never re-emitted by ConfigSave");
     g_config.virtual_stock_proximity_release=true;
     g_config.virtual_stock_proximity_full_m=0.270f;
     g_config.virtual_stock_proximity_release_m=0.425f;

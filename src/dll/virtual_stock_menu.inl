@@ -1,7 +1,7 @@
 // Included in the Weapon & Aim panel; shares its existing `changed` flag.
 // Donor final product surface: Plus first, Standard second, the selected
-// product mode's strength, rear reference, sway correction, and the reset
-// confirmation. Lab-only rows stay out of normal navigation.
+// product mode's strength, rear reference, and the reset confirmation.
+// Lab-only rows stay out of normal navigation.
         ImGui::Spacing();
         ImGui::Separator();
         ImGui::Text("Virtual Stock");
@@ -43,11 +43,6 @@
             }
             ImGui::TextDisabled(
                 "Offsets the virtual stock point toward your firing shoulder.");
-            changed |= ImGui::Checkbox("Head-turn sway correction",
-                &g_config.virtual_stock_head_turn_sway_correction);
-            ImGui::TextDisabled(
-                "Steadies the stocked rear position when turning your head.");
-
             float stockStrengthPercent =
                 VirtualStockActiveStrength(g_config) * 100.0f;
             if (vr_menu::SliderFloat("Virtual Stock Strength",

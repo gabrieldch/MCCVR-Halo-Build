@@ -569,12 +569,24 @@ several evidence families rather than as one Virtual Stock record.
 | Active settings/profile | `test_profile_*`, `effective_settings` | Exact effective control settings used for the solve |
 | Aim trace | `aim_trace` | Intermediate geometry, authority, path and provenance from the canonical solve |
 | Canonical output | `canonical_aim` | Recorded output of the active settings/profile |
+| Grab/release aim continuity | `transition_stock_mode`, `transition_active`, `transition_presented_forward`, `transition_one_hand_anchor_forward`, `transition_advance_count`, ... | Presentation-only correction layered after the live solve for Virtual Stock (Standard and Plus); raw live aim is still `aim_trace`/`canonical_aim` |
 | Same-frame controls | `cf_vs_off`, `cf_fixed_head`, `cf_fixed_shoulder` | Pure telemetry-only counterfactual solves using the same captured frame inputs |
 
 This table is a contribution map, not a substitute for the schema. When adding
 or changing fields, inspect `TelemetryFrame`, the serializer, the validator,
 the analyser inventories and the tests together, and follow
 [§12](#12-extending-telemetry-adding-a-new-signal).
+
+The `transition_*` family was added as an additive schema-2 family: every
+existing field meaning is unchanged, absence in older recordings is
+unambiguous, and the validator accepts its absence as legacy while checking
+every present field and cross-field invariant. `transition_stock_mode` (0 =
+Standard, 1 = Plus) is only meaningful while `transition_stock_mode_valid` is
+true (Virtual Stock enabled); an invalid mode must read 0. The family keeps the
+schema-2 version: the experiment-era `transition_mode` and
+`transition_motion_gate_*` fields were removed before landing, so no released
+recording contains them. The feature contract is in
+`docs/VIRTUAL-STOCK-AIM-CONTINUITY-2026-09-27.md`.
 
 ### 8.2 Identity and timing
 
@@ -636,7 +648,11 @@ support_grip_valid = false, support_grip_position = [0, 0, 0]
 
 does not mean the grip pose was located at the origin; it means the position is
 not applicable. Examples of explicit validity relationships in schema 2 include
-(the manifest annotates the known-validity pairings; the head-sample/HMD pairing is declared by the analyser's signal bindings):
+(the manifest annotates the analyser's known-validity pairings; the
+head-sample/HMD pairing is declared by the analyser's signal bindings; the
+`transition_*` pairings below are enforced by `tools/validate_telemetry_jsonl.py`
+and are not listed in the analyser's known-validity table, because that
+analyser's approved byte identity is pinned by the packaging and install gates):
 
 ```text
 semantic_primary_aim_valid         -> semantic_primary_aim / semantic_primary_forward
@@ -650,6 +666,10 @@ head_sample_valid                  -> semantic_hmd
 upcoming_views_valid               -> views
 pad.valid                          -> pad
 canonical_aim.valid                -> canonical_aim payload
+transition_live_calibrated_forward_valid -> transition_live_calibrated_forward
+transition_presented_forward_valid -> transition_presented_forward
+transition_one_hand_anchor_valid   -> transition_one_hand_anchor_forward
+transition_stock_mode_valid        -> transition_stock_mode (0 = Standard, 1 = Plus; an invalid mode reads 0)
 ```
 
 `aim_trace` and the counterfactual sections contain additional applicability

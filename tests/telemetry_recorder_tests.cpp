@@ -296,6 +296,24 @@ TelemetryFrame EvidenceFrame(uint64_t serial)
     frame.aimTrace.correctedHeadTarget = {13.01f, 13.8f, 14.999f};
     frame.canonicalAim.valid = true;
     frame.canonicalAim.forward = {0.0f, 0.0f, -1.0f};
+    frame.transitionStockMode = 1;
+    frame.transitionStockModeValid = true;
+    frame.transitionActive = true;
+    frame.transitionPhase = 1;
+    frame.transitionEdgeKind = 1;
+    frame.transitionAnchorSource = 1;
+    frame.transitionLiveCalibratedForwardValid = true;
+    frame.transitionLiveCalibratedForward = {0.0f, 0.0f, -1.0f};
+    frame.transitionPresentedForwardValid = true;
+    frame.transitionPresentedForward = {0.1f, 0.0f, -0.99498743f};
+    frame.transitionOneHandAnchorValid = true;
+    frame.transitionOneHandAnchorForward = {0.1f, 0.0f, -0.99498743f};
+    frame.transitionInitialCorrectionDeg = 12.5f;
+    frame.transitionRemainingCorrectionDeg = 4.25f;
+    frame.transitionElapsedMs = 33.3f;
+    frame.transitionAdvanceCount = 7;
+    frame.transitionLastPreparedSerial = serial;
+    frame.transitionAppliedSerial = serial;
     frame.cfVsOff.profileId = static_cast<uint8_t>(kVsOffControlProfile);
     frame.cfFixedHead.profileId = static_cast<uint8_t>(kFixedHeadControlProfile);
     frame.cfFixedHead.path = static_cast<uint8_t>(AimSolverPath::FixedStock);
@@ -633,6 +651,8 @@ void TestLifecycleAndAccounting(const std::wstring& outputPath)
     Check(!Telemetry_BeginFrame(0),
         "Prepared serial zero duplicates are suppressed with explicit state");
     frame.preparedSerial = 42;
+    frame.transitionLastPreparedSerial = 42;
+    frame.transitionAppliedSerial = 42;
     Check(Telemetry_BeginFrame(42),
         "A distinct non-zero serial is accepted");
     Telemetry_PublishFrame(frame);

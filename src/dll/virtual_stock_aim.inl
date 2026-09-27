@@ -398,9 +398,11 @@
                     toPoint(inputs.headPosition),
                     inputs.virtualStockRearHeightM, rawHeadTarget);
             virtual_stock::HybridInverseNeckEvaluation inverseNeck{};
-            // Product sway correction applies to both Plus Centre and Plus
-            // Shoulder; only the rear-reference geometry differs. Horizontal
-            // release below stays on raw HMD XZ regardless.
+            // Diagnostic inverse-neck correction only: the product sway
+            // correction was retired on 2026-09-27 and is reachable solely
+            // through explicit diagnostic profiles. It applies to both Plus
+            // Centre and Plus Shoulder; only the rear-reference geometry
+            // differs. Horizontal release below stays on raw HMD XZ regardless.
             const bool inverseNeckAttempted =
                 inputs.hybridInverseNeckEnabled;
             if (inverseNeckAttempted && inputs.headValid &&
@@ -745,8 +747,10 @@
             inputs.virtualStockRearReference == 2 && inputs.headValid;
         const bool adaptiveRequested = inputs.virtualStockEnabled &&
             inputs.virtualStockRearReference == 3 && inputs.headValid;
-        // Product sway correction for Standard Centre/Shoulder only. Corrects
-        // the positional base only; Shoulder keeps the current HMD yaw basis.
+        // Diagnostic inverse-neck correction for Standard Centre/Shoulder only:
+        // the product sway correction was retired on 2026-09-27 and is
+        // reachable solely through explicit diagnostic profiles. Corrects the
+        // positional base only; Shoulder keeps the current HMD yaw basis.
         // Dormant Chest/Adaptive never evaluate or consume correction.
         // Failure falls back to raw HMD and never drops stock.
         virtual_stock::HybridInverseNeckEvaluation fixedInverseNeck{};
@@ -955,8 +959,9 @@
         {
             // This is the released Head path, including its existing fallback
             // behavior when the optional Shoulder basis is unavailable.
-            // Product sway correction supplies the positional base; raw-H
-            // fallback is already selected in fixedHeadBase.
+            // The product sway correction that used to supply this positional
+            // base was retired 2026-09-27; raw-H fallback is already selected
+            // in fixedHeadBase.
             stockStrength = virtual_stock::ApplyVirtualStockProximityRelease(
                 inputs.virtualStockProximityRelease,
                 inputs.virtualStockStrength, toPoint(rp), inputs.headValid,

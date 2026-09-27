@@ -1071,12 +1071,6 @@ void ConfigLoad(const wchar_t* path)
                 g_config.virtual_stock_hybrid_horizontal_release);
             continue;
         }
-        if(!strcmp(key,"virtual_stock_head_turn_sway_correction"))
-        {
-            ParseBoolSetting(key, val,
-                g_config.virtual_stock_head_turn_sway_correction);
-            continue;
-        }
         if(!strcmp(key,"two_hand_support_grip_pose"))
         {
             ParseBoolSetting(key, val, g_config.two_hand_support_grip_pose);
@@ -2535,10 +2529,6 @@ void ConfigSave()
     fprintf(f, "virtual_stock_proximity_full_m = %.3f\n", g_config.virtual_stock_proximity_full_m);
     fprintf(f, "virtual_stock_proximity_release_m = %.3f\n\n",
         g_config.virtual_stock_proximity_release_m);
-    fprintf(f, "# Head-turn sway correction for the stocked rear position (both modes, Centre/Shoulder).\n");
-    fprintf(f, "# (default %d)\n", d.virtual_stock_head_turn_sway_correction ? 1 : 0);
-    fprintf(f, "virtual_stock_head_turn_sway_correction = %d\n\n",
-        g_config.virtual_stock_head_turn_sway_correction ? 1 : 0);
     fprintf(f, "# Reduce support-hand rotation while preserving support-position steering.\n");
     fprintf(f, "# (default %d)\n", d.two_hand_support_grip_pose ? 1 : 0);
     fprintf(f, "two_hand_support_grip_pose = %d\n\n", g_config.two_hand_support_grip_pose ? 1 : 0);

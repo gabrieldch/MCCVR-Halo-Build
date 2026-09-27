@@ -480,6 +480,18 @@ if(BUILD_TESTING)
     target_include_directories(halomccvr_virtual_stock_tests PRIVATE src/common)
     target_compile_definitions(halomccvr_virtual_stock_tests PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
     add_test(NAME halomccvr_virtual_stock_tests COMMAND halomccvr_virtual_stock_tests)
+    # Pure grab/release aim-continuity state machine (fixed 200 ms smoothstep
+    # for both directions) shared by Standard and Plus Virtual Stock.
+    # Header-only and dependency-free, so it gets its own deterministic
+    # standalone suite.
+    add_executable(halomccvr_virtual_stock_aim_continuity_tests
+        tests/virtual_stock_aim_continuity_tests.cpp)
+    target_include_directories(halomccvr_virtual_stock_aim_continuity_tests
+        PRIVATE src/common)
+    target_compile_definitions(halomccvr_virtual_stock_aim_continuity_tests
+        PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+    add_test(NAME halomccvr_virtual_stock_aim_continuity_tests
+        COMMAND halomccvr_virtual_stock_aim_continuity_tests)
     set(HALOMCCVR_STOCK_FIXTURE "${HALOMCCVR_GENERATED_DIR}/virtual_stock_fixture.inl")
     add_custom_command(OUTPUT "${HALOMCCVR_STOCK_FIXTURE}"
         COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tools/generate_virtual_stock_fixture.py"
@@ -490,6 +502,29 @@ if(BUILD_TESTING)
     target_include_directories(halomccvr_virtual_stock_aim_tests PRIVATE
         "${HALOMCCVR_GENERATED_DIR}" "${openxr_SOURCE_DIR}/include")
     add_test(NAME halomccvr_virtual_stock_aim_tests COMMAND halomccvr_virtual_stock_aim_tests)
+    # End-to-end live seam for grab/release aim continuity: the test includes
+    # the production runtime fragment against the generated production aim
+    # solver, so the asserted latch-frame anchor contract, the 200 ms ease and
+    # the release continuity are the shipping code, not a model of it. It
+    # builds both Standard (rear reference 0/1) and Plus (rear reference 3)
+    # inputs.
+    add_executable(halomccvr_virtual_stock_aim_continuity_live_tests
+        tests/virtual_stock_aim_continuity_live_tests.cpp
+        "${HALOMCCVR_STOCK_FIXTURE}")
+    target_include_directories(
+        halomccvr_virtual_stock_aim_continuity_live_tests PRIVATE
+        "${HALOMCCVR_GENERATED_DIR}" "${openxr_SOURCE_DIR}/include")
+    add_test(NAME halomccvr_virtual_stock_aim_continuity_live_tests
+        COMMAND halomccvr_virtual_stock_aim_continuity_live_tests)
+    # Source-consistency guard for the aim-continuity invalidation topology:
+    # the layer must be invalidated on exactly its eight exceptional lifecycle
+    # paths (definition plus eight call sites) and never by the routine
+    # prepared-frame retire (ResetPreparedFrame). Python stdlib only; the
+    # --self-test mode exercises the checker logic on synthetic sources.
+    add_test(NAME halomccvr_aim_continuity_lifecycle_guard
+        COMMAND "${Python3_EXECUTABLE}" -O
+            "${CMAKE_CURRENT_SOURCE_DIR}/tools/check_aim_continuity_lifecycle.py"
+            --self-test)
     set(HALOMCCVR_HAPTICS_FIXTURE "${HALOMCCVR_GENERATED_DIR}/haptics_runtime_functions.inl")
     add_custom_command(OUTPUT "${HALOMCCVR_HAPTICS_FIXTURE}"
         COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tools/generate_haptics_runtime_fixture.py"

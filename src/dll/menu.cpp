@@ -1277,6 +1277,56 @@ namespace
 
         if (g_activeCategory == Cat_WeaponAim)
         {
+        ImGui::Text("Two-handed aiming");
+        changed |= ImGui::Checkbox("Two-handed aiming", &g_config.two_handed_aim);
+        ImGui::SameLine();
+        ImGui::TextDisabled(VR_IsTwoHandAiming() ? "[engaged]" : "[one-handed]");
+        changed |= ImGui::Checkbox("Left-handed main weapon", &g_config.left_handed);
+        if (g_config.left_handed)
+        {
+            ImGui::Indent();
+            changed |= ImGui::Checkbox("Fix Hand Alignment (Experimental)",
+                &g_config.experimental_hand_alignment);
+            ImGui::TextDisabled("Off: released hand positioning. On: experimental hand/arm correction.\n"
+                                "Leave off if hands become misaligned.");
+            ImGui::Unindent();
+        }
+        ImGui::TextDisabled("Main weapon, aiming and trigger follow your left hand.\n"
+                            "Your right hand supports the weapon or holds the second gun.");
+        if (g_config.two_handed_aim)
+        {
+            ImGui::Indent();
+            if (ImGui::RadioButton("Toggle (click grip)", g_config.two_hand_toggle))
+            { g_config.two_hand_toggle = true; changed = true; }
+            ImGui::SameLine();
+            if (ImGui::RadioButton("Hold grip", !g_config.two_hand_toggle))
+            { g_config.two_hand_toggle = false; changed = true; }
+            changed |= vr_menu::SliderFloat("Left hand forward offset (m)",
+                                          &g_config.left_hand_forward_m,
+                                          -0.15f, 0.30f, "%.3f");
+            ImGui::TextDisabled("Moves the visible support hand; the aiming line stays on the controllers.");
+            changed |= vr_menu::SliderFloat("Grab zone side offset (m)",
+                                          &g_config.two_hand_zone_right_m,
+                                          -0.10f, 0.10f, "%.3f");
+            ImGui::TextDisabled("Slides the grip-click zone sideways (+ = right) onto the visible barrel.");
+            changed |= vr_menu::SliderFloat("Left palm depth (m)",
+                                          &g_config.left_grip_forward_m,
+                                          -0.05f, 0.25f, "%.3f");
+            ImGui::TextDisabled("Moves the support-hand grab sample forward from the tracked controller toward the visible palm.");
+            ImGui::Unindent();
+        }
+        ImGui::TextDisabled("Put your support hand on the front of the gun, click/hold its GRIP.\n"
+                            "Engages only when your hand is on the barrel line.");
+
+        changed |= ImGui::Checkbox("Reduce Support-Hand Rotation",
+            &g_config.two_hand_support_grip_pose);
+        ImGui::TextDisabled(
+            "Reduces how much twisting your support hand affects two-handed aim.\n"
+            "Support-hand position still helps steer the weapon.");
+#include "virtual_stock_menu.inl"
+
+        ImGui::Spacing();
+        ImGui::Separator();
         ImGui::Text("Hand-held weapon");
         if(ImGui::Checkbox("Per-gun alignment",&g_config.per_gun_alignment))
         { Config_RefreshWeaponProfile();changed=true; }
@@ -1371,55 +1421,6 @@ namespace
             g_config.right_hand_mesh_z_m=0.0f;
             changed=true;
         }
-        ImGui::Spacing();
-        ImGui::Separator();
-        ImGui::Text("Two-handed aiming");
-        changed |= ImGui::Checkbox("Two-handed aiming", &g_config.two_handed_aim);
-        ImGui::SameLine();
-        ImGui::TextDisabled(VR_IsTwoHandAiming() ? "[engaged]" : "[one-handed]");
-        changed |= ImGui::Checkbox("Left-handed main weapon", &g_config.left_handed);
-        if (g_config.left_handed)
-        {
-            ImGui::Indent();
-            changed |= ImGui::Checkbox("Fix Hand Alignment (Experimental)",
-                &g_config.experimental_hand_alignment);
-            ImGui::TextDisabled("Off: released hand positioning. On: experimental hand/arm correction.\n"
-                                "Leave off if hands become misaligned.");
-            ImGui::Unindent();
-        }
-        ImGui::TextDisabled("Main weapon, aiming and trigger follow your left hand.\n"
-                            "Your right hand supports the weapon or holds the second gun.");
-        if (g_config.two_handed_aim)
-        {
-            ImGui::Indent();
-            if (ImGui::RadioButton("Toggle (click grip)", g_config.two_hand_toggle))
-            { g_config.two_hand_toggle = true; changed = true; }
-            ImGui::SameLine();
-            if (ImGui::RadioButton("Hold grip", !g_config.two_hand_toggle))
-            { g_config.two_hand_toggle = false; changed = true; }
-            changed |= vr_menu::SliderFloat("Left hand forward offset (m)",
-                                          &g_config.left_hand_forward_m,
-                                          -0.15f, 0.30f, "%.3f");
-            ImGui::TextDisabled("Moves the visible support hand; the aiming line stays on the controllers.");
-            changed |= vr_menu::SliderFloat("Grab zone side offset (m)",
-                                          &g_config.two_hand_zone_right_m,
-                                          -0.10f, 0.10f, "%.3f");
-            ImGui::TextDisabled("Slides the grip-click zone sideways (+ = right) onto the visible barrel.");
-            changed |= vr_menu::SliderFloat("Left palm depth (m)",
-                                          &g_config.left_grip_forward_m,
-                                          -0.05f, 0.25f, "%.3f");
-            ImGui::TextDisabled("Moves the support-hand grab sample forward from the tracked controller toward the visible palm.");
-            ImGui::Unindent();
-        }
-        ImGui::TextDisabled("Put your support hand on the front of the gun, click/hold its GRIP.\n"
-                            "Engages only when your hand is on the barrel line.");
-
-        changed |= ImGui::Checkbox("Reduce Support-Hand Rotation",
-            &g_config.two_hand_support_grip_pose);
-        ImGui::TextDisabled(
-            "Reduces how much twisting your support hand affects two-handed aim.\n"
-            "Support-hand position still helps steer the weapon.");
-#include "virtual_stock_menu.inl"
         }
 
         if (g_activeCategory == Cat_Crosshair)

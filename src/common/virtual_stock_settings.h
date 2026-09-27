@@ -96,11 +96,6 @@ inline constexpr float kVirtualStockHybridInverseNeckLateralDefaultM = 0.0f;
 inline constexpr float kVirtualStockHybridInverseNeckLateralMinimumM = -0.30f;
 inline constexpr float kVirtualStockHybridInverseNeckLateralMaximumM = 0.30f;
 inline constexpr float kVirtualStockHybridInverseNeckCorrectionCapM = 0.15f;
-inline constexpr bool kVirtualStockHeadTurnSwayCorrectionDefault = true;
-inline constexpr float kVirtualStockProductInverseNeckStrength = 1.00f;
-inline constexpr float kVirtualStockProductNeckForwardM = 0.100f;
-inline constexpr float kVirtualStockProductNeckUpM = 0.040f;
-inline constexpr float kVirtualStockProductNeckLateralM = 0.000f;
 inline constexpr bool kTwoHandSupportGripPoseDefault = true;
 
 struct VirtualStockAimSettings

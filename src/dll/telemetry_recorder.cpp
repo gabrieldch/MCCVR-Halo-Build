@@ -1273,6 +1273,37 @@ namespace
         AppendEffectiveSettings(output, first, "effective_settings", frame.effectiveSettings);
         AppendAimTrace(output, first, frame.aimTrace);
         AppendAimResult(output, first, "canonical_aim", frame.canonicalAim);
+        AppendIntegerField(output, first, "transition_stock_mode", frame.transitionStockMode);
+        AppendBoolField(output, first, "transition_stock_mode_valid",
+            frame.transitionStockModeValid);
+        AppendBoolField(output, first, "transition_active", frame.transitionActive);
+        AppendIntegerField(output, first, "transition_phase", frame.transitionPhase);
+        AppendIntegerField(output, first, "transition_edge_kind", frame.transitionEdgeKind);
+        AppendIntegerField(output, first, "transition_anchor_source", frame.transitionAnchorSource);
+        AppendBoolField(output, first, "transition_live_calibrated_forward_valid",
+            frame.transitionLiveCalibratedForwardValid);
+        AppendVec3(output, first, "transition_live_calibrated_forward",
+            frame.transitionLiveCalibratedForward);
+        AppendBoolField(output, first, "transition_presented_forward_valid",
+            frame.transitionPresentedForwardValid);
+        AppendVec3(output, first, "transition_presented_forward",
+            frame.transitionPresentedForward);
+        AppendFloatField(output, first, "transition_initial_correction_deg",
+            frame.transitionInitialCorrectionDeg);
+        AppendFloatField(output, first, "transition_remaining_correction_deg",
+            frame.transitionRemainingCorrectionDeg);
+        AppendFloatField(output, first, "transition_elapsed_ms",
+            frame.transitionElapsedMs);
+        AppendBoolField(output, first, "transition_one_hand_anchor_valid",
+            frame.transitionOneHandAnchorValid);
+        AppendVec3(output, first, "transition_one_hand_anchor_forward",
+            frame.transitionOneHandAnchorForward);
+        AppendIntegerField(output, first, "transition_advance_count",
+            frame.transitionAdvanceCount);
+        AppendIntegerField(output, first, "transition_last_prepared_serial",
+            frame.transitionLastPreparedSerial);
+        AppendIntegerField(output, first, "transition_applied_serial",
+            frame.transitionAppliedSerial);
         AppendControl(output, first, "cf_vs_off", frame.cfVsOff);
         AppendControl(output, first, "cf_fixed_head", frame.cfFixedHead);
         AppendControl(output, first, "cf_fixed_shoulder", frame.cfFixedShoulder);

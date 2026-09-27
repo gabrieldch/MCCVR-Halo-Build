@@ -226,6 +226,34 @@ struct TelemetryFrame
     AimPoseTrace aimTrace{};
     TelemetryAimResult canonicalAim{};
 
+    // Grab/release aim continuity (Virtual Stock, Standard and Plus). This
+    // family describes the presentation layer only; aim_trace.final_direction
+    // and canonical_aim above stay the raw live solve. transition_stock_mode is
+    // the product stock mode this frame (0 = Standard, 1 = Plus, i.e. rear
+    // reference 3) and is only meaningful while transition_stock_mode_valid is
+    // true (Virtual Stock enabled); when invalid it reads 0, never a stale
+    // mode.
+    uint8_t transitionStockMode = 0;
+    bool transitionStockModeValid = false;
+    bool transitionActive = false;
+    uint8_t transitionPhase = 0;
+    uint8_t transitionEdgeKind = 0;
+    uint8_t transitionAnchorSource = 0;
+    bool transitionLiveCalibratedForwardValid = false;
+    TelemetryVec3 transitionLiveCalibratedForward{};
+    bool transitionPresentedForwardValid = false;
+    TelemetryVec3 transitionPresentedForward{};
+    float transitionInitialCorrectionDeg = 0.0f;
+    float transitionRemainingCorrectionDeg = 0.0f;
+    float transitionElapsedMs = 0.0f;
+    bool transitionOneHandAnchorValid = false;
+    TelemetryVec3 transitionOneHandAnchorForward{};
+    uint64_t transitionAdvanceCount = 0;
+    uint64_t transitionLastPreparedSerial = 0;
+    // The prepared serial the layer actually ran for; 0 when it did not run
+    // (feature off/inactive), so absence is unambiguous.
+    uint64_t transitionAppliedSerial = 0;
+
     TelemetryControlResult cfVsOff{};
     TelemetryControlResult cfFixedHead{};
     TelemetryControlResult cfFixedShoulder{};
