@@ -3,13 +3,42 @@
 #include "../src/dll/telemetry_recorder.h"
 
 #include <Windows.h>
+#include <openxr/openxr.h>
+#include "../src/common/virtual_stock_logic.h"
+#include "../src/common/two_hand_lab_logic.h"
+
+// File-local rotate for the extracted production solver below (mirrors the
+// solver tests): the fixture calls unqualified Rotate, so it must be
+// declared before the fixture include. Static: no linkage clash with the
+// recorder object in this same binary.
+static XrVector3f Rotate(const XrQuaternionf& q, const XrVector3f& v)
+{
+    const XrVector3f u{q.x, q.y, q.z};
+    const auto cross = [](const XrVector3f& a, const XrVector3f& b) {
+        return XrVector3f{
+            a.y * b.z - a.z * b.y,
+            a.z * b.x - a.x * b.z,
+            a.x * b.y - a.y * b.x};
+    };
+    XrVector3f c1 = cross(u, v);
+    c1.x += q.w * v.x;
+    c1.y += q.w * v.y;
+    c1.z += q.w * v.z;
+    const XrVector3f c2 = cross(u, c1);
+    return {v.x + 2.0f * c2.x, v.y + 2.0f * c2.y, v.z + 2.0f * c2.z};
+}
+#include "aim_pose_functions.inl"
+#include "../src/dll/two_hand_lab_temporal_runtime.inl"
+
 #include <algorithm>
 #include <atomic>
+#include <charconv>
 #include <clocale>
 #include <cmath>
 #include <cwchar>
 #include <cstdio>
 #include <cstring>
+#include <limits>
 #include <string>
 #include <thread>
 #include <type_traits>
@@ -247,6 +276,9 @@ TelemetryFrame EvidenceFrame(uint64_t serial)
     frame.pad.valid = true;
     frame.pad.moveX = 0.5f;
     frame.pad.a = true;
+    frame.pad.weaponButtons = 17;
+    frame.pad.weaponPulseUntilMs = 7654321;
+    frame.pad.weaponGeneration = 3;
     frame.testProfileId = static_cast<uint8_t>(
         VirtualStockTestProfile::E_HybridMaxSeat);
     frame.testProfileCustom = false;
@@ -264,6 +296,11 @@ TelemetryFrame EvidenceFrame(uint64_t serial)
     frame.effectiveSettings.inverseNeckUpM = 0.04f;
     frame.effectiveSettings.inverseNeckLateralM = 0.0f;
     frame.effectiveSettings.supportEndpointUsedGrip = true;
+    frame.effectiveSettings.aimStabilization = 0.48f;
+    frame.effectiveSettings.crosshairDistanceM = 41.0f;
+    frame.effectiveSettings.crosshairSizeDeg = 10.10f;
+    frame.effectiveSettings.crosshair = true;
+    frame.effectiveSettings.killReticle = true;
     frame.aimTrace.path = AimSolverPath::Hybrid;
     frame.aimTrace.cAttempted = true;
     frame.aimTrace.cValid = true;
@@ -314,6 +351,73 @@ TelemetryFrame EvidenceFrame(uint64_t serial)
     frame.transitionAdvanceCount = 7;
     frame.transitionLastPreparedSerial = serial;
     frame.transitionAppliedSerial = serial;
+    // Free two-hand (VS-OFF) product offhand directional authority: the frozen
+    // assembly value recorded beside the VS-OFF smoothing family.
+    frame.twoHandOffhandInfluence = 0.5f;
+    // Two-Hand Lab family: an enabled GG-100 Soft-authority Constant-damping
+    // frame, coherent by construction (effective == requested at full
+    // confidence, presented valid while temporal is active).
+    frame.twoHandLabEnabled = true;
+    frame.twoHandLabAnchorRequested = 4;
+    frame.twoHandLabAnchorResolved = 4;
+    frame.twoHandLabAnchorFallback = 0;
+    frame.twoHandLabOffhandInfluence = 1.0f;
+    frame.twoHandLabAgreementMode = 1;
+    frame.twoHandLabAgreement = 0.958f;
+    frame.twoHandLabAgreementConfidence = 1.0f;
+    frame.twoHandLabEffectiveInfluence = 1.0f;
+    frame.twoHandLabTemporalMode = 2;
+    frame.twoHandLabPrimaryPivotValid = true;
+    frame.twoHandLabPrimaryPivot = {0.0f, 0.0f, 0.0f};
+    frame.twoHandLabSupportPivotValid = true;
+    frame.twoHandLabSupportPivot = {0.5f, 0.0f, -1.0f};
+    frame.twoHandLabStatelessDirectionValid = true;
+    frame.twoHandLabStatelessDirection = {0.0f, 0.0f, -1.0f};
+    frame.twoHandLabPresentedDirectionValid = true;
+    frame.twoHandLabPresentedDirection = {0.05f, 0.0f, -0.998749f};
+    frame.twoHandLabTemporalActive = true;
+    frame.twoHandLabTemporalErrorDeg = 2.5f;
+    // Shots-vs-reticle tranche: a coherent valid observation. The reticle
+    // serial (41) deliberately differs from both fixture prepared serials
+    // (0, 42): capture precedes the reticle publish, so the validator must
+    // accept the lag and never assert equality with prepared_serial.
+    frame.presentedAimValid = true;
+    frame.presentedAimForward = {0.0f, 0.0f, -1.0f};
+    frame.reticlePresentedValid = true;
+    frame.reticlePresentedSerial = 41;
+    frame.reticlePresentedSampleMs = 1234567;
+    frame.reticlePresentedSupportEpoch = 5;
+    frame.reticlePresentedSupportTrusted = true;
+    frame.reticlePresentedOrientation = {0.0f, 0.0f, 0.0f, 1.0f};
+    frame.reticlePresentedPosition = {0.5f, -0.25f, 4.0f};
+    frame.engineAimValid = true;
+    frame.engineAimSource = 1;
+    frame.engineAimForward = {1.0f, 0.0f, 0.0f};
+    frame.engineAimSerial = 0;
+    frame.engineAimSampleMs = 0;
+    frame.engineAimPitchValid = false;
+    frame.engineAimPitchDeg = 0.0f;
+    frame.engineCameraBaseValid = true;
+    frame.engineCameraBasePosition = {10.0f, 20.0f, 30.0f};
+    frame.engineCameraEyeValid = true;
+    frame.engineCameraEyePosition = {11.0f, 21.0f, 31.0f};
+    frame.engineCameraSource = 1;
+    frame.engineCameraSerial = 0;
+    frame.worldScaleValid = true;
+    frame.worldScale = 1.0f / 3.048f;
+    frame.dualActive = true;
+    // Persistent grip frozen solve-time provenance. The fixture frame is a
+    // PG-on, readable, engaged and trusted solve whose stamped solve serial
+    // lags the frame's prepared serial by one (serial 0 can only ever carry
+    // the initial published serial 0), mirroring the real capture ordering.
+    frame.persistentSupportGripConfigured = true;
+    frame.persistentSupportGripApplicable = true;
+    frame.supportRelationshipReadable = true;
+    frame.supportRelationshipEngaged = true;
+    frame.supportEpoch = 5;
+    frame.supportSolveTrusted = true;
+    frame.supportForceOneHand = false;
+    frame.supportSolveSerial = serial == 0 ? 0 : serial - 1;
     frame.cfVsOff.profileId = static_cast<uint8_t>(kVsOffControlProfile);
     frame.cfFixedHead.profileId = static_cast<uint8_t>(kFixedHeadControlProfile);
     frame.cfFixedHead.path = static_cast<uint8_t>(AimSolverPath::FixedStock);
@@ -460,6 +564,9 @@ void TestSerializerHelpers()
     Check(std::strstr(serialized, "\"two_hand_toggle\":false") != nullptr,
         "Effective settings serialize Toggle versus Hold acquisition mode");
     Check(std::strstr(serialized,
+            "\"two_hand_offhand_influence\":0.5") != nullptr,
+        "The free two-hand offhand authority serializes as its frozen value");
+    Check(std::strstr(serialized,
                 "\"horizontal_release_enabled\":false") != nullptr &&
             std::strstr(serialized,
                 "\"horizontal_release_full_m\":0.27") != nullptr &&
@@ -503,6 +610,175 @@ void TestSerializerHelpers()
     Check(std::strstr(serialized,
             "\"orientation_rebuild_succeeded\":true") != nullptr,
         "Compact fixed controls serialize their decisive solver cause fields");
+
+    Check(std::strstr(serialized,
+                "\"two_hand_lab_enabled\":true") != nullptr &&
+            std::strstr(serialized,
+                "\"two_hand_lab_anchor_requested\":4") != nullptr &&
+            std::strstr(serialized,
+                "\"two_hand_lab_anchor_resolved\":4") != nullptr &&
+            std::strstr(serialized,
+                "\"two_hand_lab_anchor_fallback\":0") != nullptr &&
+            std::strstr(serialized,
+                "\"two_hand_lab_agreement_mode\":1") != nullptr &&
+            std::strstr(serialized,
+                "\"two_hand_lab_temporal_mode\":2") != nullptr &&
+            std::strstr(serialized,
+                "\"two_hand_lab_primary_pivot_valid\":true") != nullptr &&
+            std::strstr(serialized,
+                "\"two_hand_lab_support_pivot_valid\":true") != nullptr &&
+            std::strstr(serialized,
+                "\"two_hand_lab_stateless_direction_valid\":true") != nullptr &&
+            std::strstr(serialized,
+                "\"two_hand_lab_presented_direction_valid\":true") != nullptr &&
+            std::strstr(serialized,
+                "\"two_hand_lab_temporal_active\":true") != nullptr,
+        "Two-Hand Lab identity, validity and temporal state serialize "
+        "explicitly");
+    Check(std::strstr(serialized,
+                "\"two_hand_lab_offhand_influence\":1") != nullptr &&
+            std::strstr(serialized,
+                "\"two_hand_lab_agreement_confidence\":1") != nullptr &&
+            std::strstr(serialized,
+                "\"two_hand_lab_effective_influence\":1") != nullptr &&
+            std::strstr(serialized,
+                "\"two_hand_lab_temporal_error_deg\":2.5") != nullptr,
+        "Two-Hand Lab scalars serialize explicitly");
+    Check(std::strstr(serialized,
+                "\"two_hand_lab_support_pivot\":[0.5,0,-1]") != nullptr,
+        "Two-Hand Lab support pivot serializes explicitly");
+    Check(std::strstr(serialized,
+                "\"two_hand_lab_stateless_direction\":[0,0,-1]") != nullptr,
+        "Two-Hand Lab stateless direction serializes explicitly");
+
+    // VS-OFF Two-Hand Transition plus Pavlov-inspired input smoothing: the
+    // whole new frame tranche must survive the fixed transport field-for-field
+    // and then serialize with the analyser's frozen names.
+    Telemetry_TestResetRing();
+    {
+        TelemetryFrame smoothing = EvidenceFrame(77);
+        smoothing.twoHandTransitionSmoothingConfigured = true;
+        smoothing.twoHandTransitionActive = true;
+        smoothing.twoHandSmoothingConfigured = true;
+        smoothing.twoHandSmoothingApplied = true;
+        smoothing.twoHandSmoothingStrength = 12.5f;
+        smoothing.twoHandSmoothingAlpha = 0.25f;
+        smoothing.twoHandSmoothingPrimaryOrientationErrorDeg = 3.5f;
+        smoothing.twoHandSmoothingPrimaryPositionErrorM = 0.125f;
+        smoothing.twoHandSmoothingSupportPositionErrorM = 0.0625f;
+        smoothing.twoHandOffhandInfluence = 0.75f;
+        Check(Telemetry_TestPushRing(smoothing),
+            "A frame carrying the new smoothing tranche is admitted to the "
+            "fixed transport");
+        TelemetryFrame poppedSmoothing{};
+        Check(Telemetry_TestPopRing(poppedSmoothing) &&
+                poppedSmoothing.twoHandTransitionSmoothingConfigured &&
+                poppedSmoothing.twoHandTransitionActive &&
+                poppedSmoothing.twoHandSmoothingConfigured &&
+                poppedSmoothing.twoHandSmoothingApplied &&
+                poppedSmoothing.twoHandSmoothingStrength == 12.5f &&
+                poppedSmoothing.twoHandOffhandInfluence == 0.75f &&
+                poppedSmoothing.twoHandSmoothingAlpha == 0.25f &&
+                poppedSmoothing.twoHandSmoothingPrimaryOrientationErrorDeg ==
+                    3.5f &&
+                poppedSmoothing.twoHandSmoothingPrimaryPositionErrorM == 0.125f &&
+                poppedSmoothing.twoHandSmoothingSupportPositionErrorM == 0.0625f,
+            "The transport preserves every new smoothing tranche field");
+        char smoothingText[32768]{};
+        size_t smoothingBytes = 0;
+        Check(Telemetry_TestSerializeFrame(poppedSmoothing, smoothingText,
+                    sizeof(smoothingText), smoothingBytes) &&
+                std::strstr(smoothingText,
+                    "\"two_hand_transition_smoothing_configured\":true") !=
+                    nullptr &&
+                std::strstr(smoothingText,
+                    "\"two_hand_transition_active\":true") != nullptr &&
+                std::strstr(smoothingText,
+                    "\"two_hand_smoothing_configured\":true") != nullptr &&
+                std::strstr(smoothingText,
+                    "\"two_hand_smoothing_applied\":true") != nullptr &&
+                std::strstr(smoothingText,
+                    "\"two_hand_offhand_influence\":0.75") != nullptr &&
+                std::strstr(smoothingText,
+                    "\"two_hand_smoothing_strength\":12.5") != nullptr &&
+                std::strstr(smoothingText,
+                    "\"two_hand_smoothing_mix\":0.5") != nullptr &&
+                std::strstr(smoothingText,
+                    "\"two_hand_smoothing_alpha\":0.25") != nullptr &&
+                std::strstr(smoothingText,
+                    "\"two_hand_smoothing_primary_orientation_error_deg\":3.5") !=
+                    nullptr &&
+                std::strstr(smoothingText,
+                    "\"two_hand_smoothing_primary_position_error_m\":0.125") !=
+                    nullptr &&
+                std::strstr(smoothingText,
+                    "\"two_hand_smoothing_support_position_error_m\":0.0625") !=
+                    nullptr,
+            "The new smoothing tranche serializes explicitly");
+
+        // Feature-off shape: the wiring leaves the tranche at its frozen
+        // false/false/false/0 defaults, and that absence serializes as itself.
+        TelemetryFrame smoothingOff = EvidenceFrame(78);
+        Check(Telemetry_TestSerializeFrame(smoothingOff, smoothingText,
+                    sizeof(smoothingText), smoothingBytes) &&
+                std::strstr(smoothingText,
+                    "\"two_hand_transition_smoothing_configured\":false") !=
+                    nullptr &&
+                std::strstr(smoothingText,
+                    "\"two_hand_transition_active\":false") != nullptr &&
+                std::strstr(smoothingText,
+                    "\"two_hand_smoothing_configured\":false") != nullptr &&
+                std::strstr(smoothingText,
+                    "\"two_hand_smoothing_applied\":false") != nullptr &&
+                std::strstr(smoothingText,
+                    "\"two_hand_smoothing_strength\":0") != nullptr &&
+                std::strstr(smoothingText,
+                    "\"two_hand_smoothing_mix\":0") != nullptr &&
+                std::strstr(smoothingText,
+                    "\"two_hand_smoothing_alpha\":0") != nullptr,
+            "A frame without the smoothing tranche serializes the frozen "
+            "false/zero defaults, never a stale receipt");
+    }
+
+    TelemetryFrame disabledLab = frame;
+    disabledLab.twoHandLabEnabled = false;
+    disabledLab.twoHandLabAnchorRequested = 0;
+    disabledLab.twoHandLabAnchorResolved = 0;
+    disabledLab.twoHandLabAnchorFallback = 0;
+    disabledLab.twoHandLabOffhandInfluence = 0.0f;
+    disabledLab.twoHandLabAgreementMode = 0;
+    disabledLab.twoHandLabAgreement = 0.0f;
+    disabledLab.twoHandLabAgreementConfidence = 0.0f;
+    disabledLab.twoHandLabEffectiveInfluence = 0.0f;
+    disabledLab.twoHandLabTemporalMode = 0;
+    disabledLab.twoHandLabPrimaryPivotValid = false;
+    disabledLab.twoHandLabPrimaryPivot = {};
+    disabledLab.twoHandLabSupportPivotValid = false;
+    disabledLab.twoHandLabSupportPivot = {};
+    disabledLab.twoHandLabStatelessDirectionValid = false;
+    disabledLab.twoHandLabStatelessDirection = {};
+    disabledLab.twoHandLabPresentedDirectionValid = false;
+    disabledLab.twoHandLabPresentedDirection = {};
+    disabledLab.twoHandLabTemporalActive = false;
+    disabledLab.twoHandLabTemporalErrorDeg = 0.0f;
+    Check(Telemetry_TestSerializeFrame(
+            disabledLab, serialized, sizeof(serialized), serializedBytes) &&
+            std::strstr(serialized,
+                "\"two_hand_lab_enabled\":false") != nullptr &&
+            std::strstr(serialized,
+                "\"two_hand_lab_temporal_mode\":0") != nullptr &&
+            std::strstr(serialized,
+                "\"two_hand_lab_presented_direction_valid\":false") != nullptr &&
+            std::strstr(serialized,
+                "\"two_hand_lab_stateless_direction_valid\":false") != nullptr &&
+            std::strstr(serialized,
+                "\"two_hand_lab_primary_pivot_valid\":false") != nullptr &&
+            std::strstr(serialized,
+                "\"two_hand_lab_support_pivot_valid\":false") != nullptr &&
+            std::strstr(serialized,
+                "\"two_hand_lab_temporal_active\":false") != nullptr,
+        "A Lab-inactive frame keeps the family defaults observationally "
+        "unavailable rather than stale");
 
     Check(std::strstr(serialized,
                 "\"semantic_primary_grip_position_valid\":true") != nullptr &&
@@ -653,6 +929,23 @@ void TestLifecycleAndAccounting(const std::wstring& outputPath)
     frame.preparedSerial = 42;
     frame.transitionLastPreparedSerial = 42;
     frame.transitionAppliedSerial = 42;
+    // The persistent-grip solve serial is stamped from the last published
+    // prepared serial at capture, so it lags this frame's serial by one.
+    frame.supportSolveSerial = 41;
+    // Two-Hand Smoothing strength receipt: the fixture must carry a live
+    // non-zero strength/mix shape so the JSONL validator checks the slider
+    // family's ranges, mix = strength/25 and configured agreement end to end.
+    frame.twoHandTransitionSmoothingConfigured = true;
+    frame.twoHandSmoothingConfigured = true;
+    frame.twoHandSmoothingApplied = true;
+    frame.twoHandSmoothingStrength = 12.5f;
+    frame.twoHandSmoothingAlpha = 0.25f;
+    frame.twoHandSmoothingPrimaryOrientationErrorDeg = 3.5f;
+    frame.twoHandSmoothingPrimaryPositionErrorM = 0.125f;
+    frame.twoHandSmoothingSupportPositionErrorM = 0.0625f;
+    // Free two-hand offhand authority receipt: the fixture carries a live
+    // non-zero value so the JSONL validator exercises its finite [0,1] range.
+    frame.twoHandOffhandInfluence = 0.75f;
     Check(Telemetry_BeginFrame(42),
         "A distinct non-zero serial is accepted");
     Telemetry_PublishFrame(frame);
@@ -663,6 +956,82 @@ void TestLifecycleAndAccounting(const std::wstring& outputPath)
             status.duplicateSerialSuppressed == 2 &&
             status.enqueued == 2 && status.droppedQueueFull == 0,
         "Producer accounting identity holds before clean Stop");
+
+    // T-2 sparse shot evidence: a shot published in this recording session
+    // must be serialized into the same file and accounted exactly, so the
+    // exported fixture proves the recorder-side shot contract end to end.
+    TelemetryShotPayload fixtureShot{};
+    fixtureShot.origin[0] = 11.5f;
+    fixtureShot.origin[1] = -0.25f;
+    fixtureShot.origin[2] = 4.0f;
+    fixtureShot.direction[0] = 0.0f;
+    fixtureShot.direction[1] = 0.0f;
+    fixtureShot.direction[2] = -1.0f;
+    fixtureShot.engineAim[0] = 0.5f;
+    fixtureShot.engineAim[1] = 0.25f;
+    fixtureShot.engineAim[2] = -0.75f;
+    fixtureShot.reticleDirection[0] = 0.125f;
+    fixtureShot.reticleDirection[1] = 0.0f;
+    fixtureShot.reticleDirection[2] = -0.9921568f;
+    fixtureShot.slot = 0;
+    fixtureShot.barrel = 1;
+    fixtureShot.flags = 0x0067u;
+    fixtureShot.engineAimSource = 1; // Halo 3 shared g_aimFwd
+    const uint64_t fixtureShotSequence = Telemetry_PublishShotEvent(
+        static_cast<uint8_t>(WeaponOrderEventStatus::Success), 1, 3, 42, 7,
+        0x50, fixtureShot);
+    Check(fixtureShotSequence != 0,
+        "A shot event publishes inside a real recording session");
+
+    // ODST-shaped shot: the firing-origin producer has no direction of its own
+    // and no slot/barrel/weapon context, so the event is direction-absent with
+    // the in-memory indexes mapped to the wire -1 and no engine aim snapshot
+    // (source 0 with an exact zero vector). The Python fixture validator
+    // enforces this shape end to end.
+    TelemetryShotPayload fixtureOdstShot{};
+    fixtureOdstShot.origin[0] = 3.25f;
+    fixtureOdstShot.origin[1] = 1.5f;
+    fixtureOdstShot.origin[2] = -2.0f;
+    fixtureOdstShot.direction[0] = 0.0f;
+    fixtureOdstShot.direction[1] = 0.0f;
+    fixtureOdstShot.direction[2] = 0.0f;
+    fixtureOdstShot.engineAimSource = 0;
+    fixtureOdstShot.slot = kTelemetryShotIndexUnknown;
+    fixtureOdstShot.barrel = kTelemetryShotIndexUnknown;
+    fixtureOdstShot.flags = 0x0002u; // substituted, no aim-authority flags
+    const uint64_t fixtureOdstShotSequence = Telemetry_PublishShotEvent(
+        static_cast<uint8_t>(WeaponOrderEventStatus::Success), 2, 5, 42, 9,
+        UINT32_MAX, fixtureOdstShot);
+    Check(fixtureOdstShotSequence != 0,
+        "An ODST-shaped shot event publishes inside the recording session");
+
+    // Halo 2-shaped shot: the firing detour publishes the engine's final ray
+    // with the firing context's own slot, an absent barrel index, the
+    // independent-path substitution flag and the observer engine aim snapshot
+    // (source 7, Halo 2 observer). The Python fixture validator enforces this
+    // row's shape end to end.
+    TelemetryShotPayload fixtureHalo2Shot{};
+    fixtureHalo2Shot.origin[0] = 6.0f;
+    fixtureHalo2Shot.origin[1] = -1.5f;
+    fixtureHalo2Shot.origin[2] = 2.25f;
+    fixtureHalo2Shot.direction[0] = 0.5f;
+    fixtureHalo2Shot.direction[1] = -0.5f;
+    fixtureHalo2Shot.direction[2] = 0.5f;
+    fixtureHalo2Shot.engineAim[0] = 0.25f;
+    fixtureHalo2Shot.engineAim[1] = 0.5f;
+    fixtureHalo2Shot.engineAim[2] = -0.75f;
+    fixtureHalo2Shot.reticleDirection[0] = 0.125f;
+    fixtureHalo2Shot.reticleDirection[1] = 0.25f;
+    fixtureHalo2Shot.reticleDirection[2] = -0.5f;
+    fixtureHalo2Shot.slot = 1;
+    fixtureHalo2Shot.barrel = kTelemetryShotIndexUnknown;
+    fixtureHalo2Shot.flags = 0x00A2u; // substituted, dual, unit aim
+    fixtureHalo2Shot.engineAimSource = 7; // Halo 2 observer stock forward
+    const uint64_t fixtureHalo2ShotSequence = Telemetry_PublishShotEvent(
+        static_cast<uint8_t>(WeaponOrderEventStatus::Success), 6, 11, 42, 0x77,
+        0x51, fixtureHalo2Shot);
+    Check(fixtureHalo2ShotSequence != 0,
+        "A Halo 2-shaped shot event publishes inside the recording session");
 
     Telemetry_RequestStop();
     Check(WaitForState(TelemetryRecorderState::Idle) &&
@@ -690,6 +1059,74 @@ void TestLifecycleAndAccounting(const std::wstring& outputPath)
             "\"semantic_grip_positions\":\"position-only OpenXR grip-action locates in LOCAL at controller sample time, routed through MCC semantic primary/support handedness roles; each position is valid only when its corresponding validity flag is true\"") !=
             std::string::npos,
         "Session provenance documents semantic grip space, timing, routing, and validity");
+    Check(cleanSession.find("\"frame_field_domains\":\"") != std::string::npos &&
+            cleanSession.find("\"engine_world_axes\":\"") != std::string::npos &&
+            cleanSession.find("\"engine_world_scale_authority\":\"") !=
+                std::string::npos &&
+            cleanSession.find("\"engine_aim_sources\":\"") != std::string::npos &&
+            cleanSession.find("\"engine_camera_sources\":\"") != std::string::npos &&
+            cleanSession.find("\"reticle_presented_lag\":\"") != std::string::npos &&
+            cleanSession.find("\"dual_slot_semantics\":\"") != std::string::npos &&
+            cleanSession.find("\"shot_event_semantics\":\"") !=
+                std::string::npos,
+        "Session provenance declares field domains, engine-world axes/scale authority, per-title sources, reticle lag, dual and shot semantics");
+    Check(cleanSession.find(
+            "\"two_hand_offhand_influence_provenance\":\"") !=
+            std::string::npos,
+        "Session provenance declares the frozen free two-hand offhand authority");
+    Check(cleanSession.find(
+            "never a consumption receipt for the free two-hand product geometry") !=
+            std::string::npos,
+        "Session provenance states the support-endpoint selection is not the "
+        "free two-hand consumption receipt");
+    Check(cleanSession.find("\"two_hand_offhand_influence\":0.75") !=
+            std::string::npos,
+        "The recorded frame carries the frozen free two-hand offhand authority");
+    Check(cleanSession.find("\"kind\":\"shot\"") != std::string::npos &&
+            cleanSession.find("\"shot_origin\":[11.5,-0.25,4]") !=
+                std::string::npos &&
+            cleanSession.find("\"shot_direction\":[0,0,-1]") !=
+                std::string::npos &&
+            cleanSession.find("\"shot_engine_aim\":[0.5,0.25,-0.75]") !=
+                std::string::npos &&
+            cleanSession.find(
+                "\"shot_reticle_direction\":[0.125,0,-0.992156804]") !=
+                std::string::npos &&
+            cleanSession.find("\"shot_slot\":0") != std::string::npos &&
+            cleanSession.find("\"shot_barrel\":1") != std::string::npos &&
+            cleanSession.find("\"shot_flags\":103") != std::string::npos &&
+            cleanSession.find("\"shot_engine_aim_source\":1") !=
+                std::string::npos,
+        "The recording session serializes the fixed shot payload into the fixture");
+    Check(cleanSession.find("\"shot_origin\":[3.25,1.5,-2]") !=
+                std::string::npos &&
+            cleanSession.find("\"shot_direction\":[0,0,0]") !=
+                std::string::npos &&
+            cleanSession.find("\"shot_engine_aim\":[0,0,0]") !=
+                std::string::npos &&
+            cleanSession.find("\"shot_slot\":-1") != std::string::npos &&
+            cleanSession.find("\"shot_barrel\":-1") != std::string::npos &&
+            cleanSession.find("\"shot_engine_aim_source\":0") !=
+                std::string::npos,
+        "The recording session serializes a direction-absent ODST-shaped shot");
+    Check(cleanSession.find("\"shot_origin\":[6,-1.5,2.25]") !=
+                std::string::npos &&
+            cleanSession.find("\"shot_direction\":[0.5,-0.5,0.5]") !=
+                std::string::npos &&
+            cleanSession.find("\"shot_engine_aim\":[0.25,0.5,-0.75]") !=
+                std::string::npos &&
+            cleanSession.find("\"shot_reticle_direction\":[0.125,0.25,-0.5]") !=
+                std::string::npos &&
+            cleanSession.find("\"shot_slot\":1") != std::string::npos &&
+            cleanSession.find("\"shot_barrel\":-1") != std::string::npos &&
+            cleanSession.find("\"shot_flags\":162") != std::string::npos &&
+            cleanSession.find("\"shot_engine_aim_source\":7") !=
+                std::string::npos,
+        "The recording session serializes a Halo 2-shaped shot with its observer source");
+    Check(status.weaponEventsEnqueued == 3 &&
+            status.weaponEventsWritten == 3 &&
+            status.weaponEventsDroppedQueueFull == 0,
+        "Shot-event accounting is exact for a clean recording session");
     Check(!firstFile.empty() &&
             CopyFileW(firstFile.c_str(), outputPath.c_str(), FALSE) != FALSE,
         "Lifecycle test exports its JSONL for strict Python validation");
@@ -1391,8 +1828,8 @@ int RunAnalyserSmoke(
     // capture-independent guide. Lowercase: the analyser emits sha256
     // hexdigest, and this smoke check is a case-sensitive find.
     constexpr char kExpectedHash[] =
-        "73945db9971d63b0f688effcbcb433b266c262800757291e8ce8acb896b4d722";
-    constexpr char kExpectedVersion[] = "6.0.0-standalone";
+        "053cf61671be281551b89a459e0611490f29d0ffd00387b43668043793bae5b4";
+    constexpr char kExpectedVersion[] = "6.3.0-standalone";
     const uint64_t deadline = GetTickCount64() + 30000;
     do
     {
@@ -1553,6 +1990,366 @@ bool VerifyWeaponEventCoverage(uint64_t claimed,
     return true;
 }
 
+void TestTwoHandLabLiveSerialization()
+{
+    // The serialized Lab identity must match the live solve: production
+    // solver -> production serializer across the anchor matrix
+    // (Production/AA/AG/GA/GG plus a GG grip-fallback), both agreement modes
+    // and all four temporal phases. Trace D/S equals the live D/S, the
+    // resolved label and effective influence match, and stateless versus
+    // presented stay distinguishable.
+    std::string jsonFloat;
+    const auto expectFloat = [&](float value) {
+        char buffer[64]{};
+        const auto converted = std::to_chars(buffer, buffer + sizeof(buffer),
+            value, std::chars_format::general,
+            std::numeric_limits<float>::max_digits10);
+        Check(converted.ec == std::errc{},
+            "Two-Hand Lab expected value formats as JSON");
+        return std::string(buffer, converted.ptr);
+    };
+    const auto rotate = [](const XrQuaternionf& q, const XrVector3f& v) {
+        const XrVector3f u{q.x, q.y, q.z};
+        const auto cross = [](const XrVector3f& a, const XrVector3f& b) {
+            return XrVector3f{a.y * b.z - a.z * b.y, a.z * b.x - a.x * b.z,
+                a.x * b.y - a.y * b.x};
+        };
+        XrVector3f c1 = cross(u, v);
+        c1.x += q.w * v.x;
+        c1.y += q.w * v.y;
+        c1.z += q.w * v.z;
+        const XrVector3f c2 = cross(u, c1);
+        return XrVector3f{
+            v.x + 2.0f * c2.x, v.y + 2.0f * c2.y, v.z + 2.0f * c2.z};
+    };
+    const auto vecKey = [&](const char* key, float x, float y, float z) {
+        return std::string("\"") + key + "\":[" + expectFloat(x) + "," +
+            expectFloat(y) + "," + expectFloat(z) + "]";
+    };
+    const auto buildInputs = [](int anchor, float influence, int agreement,
+                                 int temporal, bool gripsValid) {
+        AimPoseInputs inputs{};
+        inputs.rightValid = true;
+        inputs.right.orientation = {0.0f, 0.0f, 0.0f, 1.0f};
+        inputs.right.position = {0.0f, 0.0f, 0.0f};
+        inputs.leftValid = true;
+        inputs.left.orientation = {0.0f, 0.0f, 0.0f, 1.0f};
+        inputs.left.position = {0.3f, 0.0f, -1.0f};
+        inputs.supportPosition = {0.3f, 0.0f, -1.0f};
+        inputs.twoHandEnabled = true;
+        inputs.twoHandLatched = true;
+        inputs.virtualStockEnabled = false;
+        inputs.twoHandLabEnabled = true;
+        inputs.twoHandLabAnchor = anchor;
+        inputs.twoHandLabOffhandInfluence = influence;
+        inputs.twoHandLabAgreement = agreement;
+        inputs.twoHandLabSoftFullAgreement = 0.9f;
+        inputs.twoHandLabTemporal = temporal;
+        inputs.twoHandLabGeneration = 7;
+        inputs.primaryGripValid = gripsValid;
+        inputs.primaryGripPosition = {0.05f, -0.02f, -0.15f};
+        inputs.supportGripValid = gripsValid;
+        inputs.supportGripPosition = {0.32f, -0.02f, -0.95f};
+        return inputs;
+    };
+    const auto toPoint = [](const XrVector3f& v) {
+        return virtual_stock::Point3{v.x, v.y, v.z};
+    };
+    char serialized[32768]{};
+    size_t serializedBytes = 0;
+
+    const int anchors[] = {0, 1, 2, 3, 4};
+    for (int anchor : anchors)
+    {
+        for (int agreement = 0; agreement <= 1; ++agreement)
+        {
+            const float influence = anchor == 4 ? 0.75f : 1.0f;
+            const AimPoseInputs inputs =
+                buildInputs(anchor, influence, agreement, 0, true);
+            AimPoseTrace trace{};
+            const AimPoseResult result = ComputeAimPose(inputs, &trace);
+            Check(result.valid && trace.labValid,
+                "Two-Hand Lab matrix solve is live and traced");
+            // Independent pivot oracle: the serialized D/S must equal the
+            // live resolved pair.
+            two_hand_lab::PivotInputs pivots{};
+            pivots.primaryAim = toPoint(inputs.right.position);
+            pivots.supportAim = toPoint(inputs.left.position);
+            pivots.primaryGripValid = inputs.primaryGripValid;
+            pivots.primaryGrip = toPoint(inputs.primaryGripPosition);
+            pivots.supportGripValid = inputs.supportGripValid;
+            pivots.supportGrip = toPoint(inputs.supportGripPosition);
+            pivots.productionSupportUsedGrip =
+                inputs.supportEndpointUsedGrip;
+            pivots.productionSupportPosition =
+                toPoint(inputs.supportPosition);
+            const two_hand_lab::ResolvedPivots expected =
+                two_hand_lab::ResolvePivots(pivots,
+                    static_cast<two_hand_lab::AnchorMode>(anchor));
+            Check(trace.lab.resolvedAnchor == expected.resolved,
+                "Two-Hand Lab resolved label matches the live resolve");
+            Check(trace.lab.pivotsValid == expected.valid,
+                "Two-Hand Lab pivot validity matches the live resolve");
+            if (expected.valid)
+            {
+                Check(trace.lab.primaryPivot.x == expected.primary.x &&
+                        trace.lab.primaryPivot.y == expected.primary.y &&
+                        trace.lab.primaryPivot.z == expected.primary.z &&
+                        trace.lab.supportPivot.x == expected.support.x &&
+                        trace.lab.supportPivot.y == expected.support.y &&
+                        trace.lab.supportPivot.z == expected.support.z,
+                    "Two-Hand Lab trace D/S equals the live D/S");
+            }
+            // Agreement/effective identity.
+            const float expectedConfidence = agreement == 1
+                ? two_hand_lab::SoftAuthorityConfidence(
+                      trace.lab.agreement, 0.9f)
+                : 1.0f;
+            Check(trace.lab.confidence == expectedConfidence,
+                "Two-Hand Lab confidence matches the live solve");
+            Check(trace.lab.confidence >= 0.0f &&
+                    trace.lab.confidence <= 1.0f,
+                "Two-Hand Lab confidence stays in [0,1]");
+            const float requested =
+                std::clamp(influence, 0.0f, 1.0f);
+            Check(trace.lab.effectiveInfluence == requested *
+                        expectedConfidence,
+                "Two-Hand Lab effective influence matches the live solve");
+            Check(trace.lab.effectiveInfluence <= requested + 1.0e-6f,
+                "Two-Hand Lab effective never exceeds requested");
+
+            // Serialize through the production serializer with the
+            // FillTwoHandLabTelemetry stateless mapping (well-formed live
+            // values, so the finite guards are no-ops).
+            TelemetryFrame frame{};
+            frame.preparedSerial = 11;
+            frame.aimTrace = trace;
+            frame.canonicalAim.valid = result.valid;
+            if (result.valid)
+            {
+                const XrVector3f forward =
+                    rotate(result.pose.orientation, {0.0f, 0.0f, -1.0f});
+                frame.canonicalAim.forward = {
+                    forward.x, forward.y, forward.z};
+            }
+            frame.twoHandLabEnabled = trace.labValid;
+            frame.twoHandLabAnchorRequested =
+                static_cast<uint8_t>(trace.lab.requestedAnchor);
+            frame.twoHandLabAnchorResolved =
+                static_cast<uint8_t>(trace.lab.resolvedAnchor);
+            frame.twoHandLabAnchorFallback =
+                static_cast<uint8_t>(trace.lab.fallback);
+            frame.twoHandLabOffhandInfluence =
+                trace.lab.requestedInfluence;
+            frame.twoHandLabAgreementMode =
+                static_cast<uint8_t>(trace.lab.agreementMode);
+            frame.twoHandLabAgreement = trace.lab.agreement;
+            frame.twoHandLabAgreementConfidence = trace.lab.confidence;
+            frame.twoHandLabEffectiveInfluence =
+                trace.lab.effectiveInfluence;
+            frame.twoHandLabTemporalMode =
+                static_cast<uint8_t>(trace.lab.temporalMode);
+            frame.twoHandLabPrimaryPivotValid = trace.lab.pivotsValid;
+            frame.twoHandLabSupportPivotValid = trace.lab.pivotsValid;
+            if (trace.lab.pivotsValid)
+            {
+                frame.twoHandLabPrimaryPivot = {trace.lab.primaryPivot.x,
+                    trace.lab.primaryPivot.y, trace.lab.primaryPivot.z};
+                frame.twoHandLabSupportPivot = {trace.lab.supportPivot.x,
+                    trace.lab.supportPivot.y, trace.lab.supportPivot.z};
+            }
+            frame.twoHandLabStatelessDirectionValid = result.valid;
+            if (result.valid)
+                frame.twoHandLabStatelessDirection =
+                    frame.canonicalAim.forward;
+            Check(Telemetry_TestSerializeFrame(frame, serialized,
+                    sizeof(serialized), serializedBytes),
+                "Two-Hand Lab matrix frame serializes");
+            jsonFloat = "\"two_hand_lab_anchor_resolved\":" +
+                std::to_string(static_cast<int>(expected.resolved));
+            Check(std::strstr(serialized, jsonFloat.c_str()) != nullptr,
+                "Two-Hand Lab resolved label serializes from the live solve");
+            jsonFloat = "\"two_hand_lab_effective_influence\":" +
+                expectFloat(trace.lab.effectiveInfluence);
+            Check(std::strstr(serialized, jsonFloat.c_str()) != nullptr,
+                "Two-Hand Lab effective influence serializes from the live "
+                "solve");
+            jsonFloat = "\"two_hand_lab_agreement\":" +
+                expectFloat(trace.lab.agreement);
+            Check(std::strstr(serialized, jsonFloat.c_str()) != nullptr,
+                "Two-Hand Lab agreement serializes from the live solve");
+            if (expected.valid)
+            {
+                jsonFloat = vecKey("two_hand_lab_primary_pivot",
+                    expected.primary.x, expected.primary.y,
+                    expected.primary.z);
+                Check(
+                    std::strstr(serialized, jsonFloat.c_str()) != nullptr,
+                    "Two-Hand Lab primary pivot serializes from the live "
+                    "D/S");
+                jsonFloat = vecKey("two_hand_lab_support_pivot",
+                    expected.support.x, expected.support.y,
+                    expected.support.z);
+                Check(
+                    std::strstr(serialized, jsonFloat.c_str()) != nullptr,
+                    "Two-Hand Lab support pivot serializes from the live "
+                    "D/S");
+                Check(std::strstr(serialized,
+                        "\"two_hand_lab_primary_pivot_valid\":true") !=
+                            nullptr &&
+                        std::strstr(serialized,
+                            "\"two_hand_lab_support_pivot_valid\":true") !=
+                            nullptr,
+                    "Two-Hand Lab both pivot flags serialize true when "
+                    "pivots resolve");
+            }
+            else
+            {
+                Check(std::strstr(serialized,
+                        "\"two_hand_lab_primary_pivot_valid\":false") !=
+                            nullptr &&
+                        std::strstr(serialized,
+                            "\"two_hand_lab_support_pivot_valid\":false") !=
+                            nullptr,
+                    "Two-Hand Lab both pivot flags serialize false when "
+                    "pivots do not resolve");
+            }
+            const XrVector3f liveForward = rotate(
+                result.pose.orientation, {0.0f, 0.0f, -1.0f});
+            jsonFloat = vecKey("two_hand_lab_stateless_direction",
+                liveForward.x, liveForward.y, liveForward.z);
+            Check(std::strstr(serialized, jsonFloat.c_str()) != nullptr,
+                "Two-Hand Lab stateless direction serializes from the live "
+                "solve");
+            Check(std::strstr(serialized,
+                    "\"two_hand_lab_presented_direction_valid\":false") !=
+                    nullptr &&
+                    std::strstr(serialized,
+                        "\"two_hand_lab_temporal_active\":false") != nullptr,
+                "Mode None serializes no presented direction");
+        }
+    }
+
+    // GG grip fallback: missing grips resolve to AA with a reason.
+    {
+        const AimPoseInputs inputs = buildInputs(4, 0.5f, 1, 0, false);
+        AimPoseTrace trace{};
+        const AimPoseResult result = ComputeAimPose(inputs, &trace);
+        Check(result.valid && trace.labValid &&
+                trace.lab.resolvedAnchor ==
+                    two_hand_lab::ResolvedAnchor::AA &&
+                trace.lab.fallback ==
+                    two_hand_lab::FallbackReason::MissingPrimaryGrip,
+            "Two-Hand Lab GG grip fallback resolves AA with a reason");
+        Check(trace.lab.pivotsValid,
+            "Two-Hand Lab fallback still selects valid pivots");
+    }
+
+    // Unresolved pivots: a Lab-active solve whose resolve produced no
+    // pivots serializes BOTH pivot flags false under the single
+    // pivotsValid authority, and no pivot coordinates are written.
+    {
+        const AimPoseInputs inputs = buildInputs(4, 0.75f, 1, 0, true);
+        AimPoseTrace trace{};
+        const AimPoseResult result = ComputeAimPose(inputs, &trace);
+        Check(result.valid && trace.labValid,
+            "Two-Hand Lab unresolved-pivot fixture solve is live and "
+            "traced");
+        trace.lab.pivotsValid = false;
+        TelemetryFrame frame{};
+        frame.preparedSerial = 23;
+        frame.aimTrace = trace;
+        frame.twoHandLabEnabled = trace.labValid;
+        frame.twoHandLabPrimaryPivotValid = trace.lab.pivotsValid;
+        frame.twoHandLabSupportPivotValid = trace.lab.pivotsValid;
+        if (trace.lab.pivotsValid)
+        {
+            frame.twoHandLabPrimaryPivot = {trace.lab.primaryPivot.x,
+                trace.lab.primaryPivot.y, trace.lab.primaryPivot.z};
+            frame.twoHandLabSupportPivot = {trace.lab.supportPivot.x,
+                trace.lab.supportPivot.y, trace.lab.supportPivot.z};
+        }
+        Check(Telemetry_TestSerializeFrame(frame, serialized,
+                sizeof(serialized), serializedBytes),
+            "Two-Hand Lab unresolved-pivot frame serializes");
+        Check(std::strstr(serialized,
+                "\"two_hand_lab_primary_pivot_valid\":false") != nullptr &&
+                std::strstr(serialized,
+                    "\"two_hand_lab_support_pivot_valid\":false") != nullptr,
+            "Two-Hand Lab both pivot flags serialize false when pivots "
+            "do not resolve");
+    }
+
+    // Lab damping phases 2/3 through the production fragment: presented
+    // stays distinguishable from stateless while temporal is active.
+    const int temporalModes[] = {2, 3};
+    for (int temporal : temporalModes)
+    {
+        TwoHandLabTemporalState state{};
+        two_hand_lab::Settings settings =
+            two_hand_lab::DefaultSettings();
+        settings.enabled = true;
+        settings.temporal =
+            static_cast<two_hand_lab::TemporalMode>(temporal);
+        uint64_t serial = 0;
+        bool lastValid = false;
+        virtual_stock::Quat4 last{};
+        AimPoseInputs inputs = buildInputs(4, 1.0f, 1, temporal, true);
+        AimPoseTrace trace{};
+        TwoHandLabTemporalFrameSolve solve{};
+        solve = AdvanceTwoHandLabTemporalFrame(state, inputs, settings,
+            ++serial, 1.0f / 64.0f, lastValid, last,
+            TwoHandLabProductPresentation{}, &trace);
+        lastValid = solve.presentedValid;
+        if (solve.presentedValid)
+            last = solve.presented;
+        inputs.right.orientation = {0.0f, 0.0871557f, 0.0f, 0.9961947f};
+        solve = AdvanceTwoHandLabTemporalFrame(state, inputs, settings,
+            ++serial, 1.0f / 64.0f, lastValid, last,
+            TwoHandLabProductPresentation{}, &trace);
+        Check(solve.temporalActive && solve.presentedValid,
+            "Two-Hand Lab temporal phase engages presentation");
+        Check(solve.errorDeg > 0.0f,
+            "Two-Hand Lab temporal phase reports a live error metric");
+        const virtual_stock::Point3 statelessForward =
+            virtual_stock::RotatePoint(solve.stateless, {0.0f, 0.0f, -1.0f});
+        const virtual_stock::Point3 presentedForward =
+            virtual_stock::RotatePoint(solve.presented, {0.0f, 0.0f, -1.0f});
+        Check(virtual_stock::Finite(statelessForward) &&
+                virtual_stock::Finite(presentedForward),
+            "Two-Hand Lab temporal directions are finite");
+        TelemetryFrame frame{};
+        frame.preparedSerial = serial;
+        frame.twoHandLabEnabled = true;
+        frame.twoHandLabTemporalMode = static_cast<uint8_t>(temporal);
+        frame.twoHandLabStatelessDirectionValid = true;
+        frame.twoHandLabStatelessDirection = {statelessForward.x,
+            statelessForward.y, statelessForward.z};
+        frame.twoHandLabPresentedDirectionValid = true;
+        frame.twoHandLabPresentedDirection = {presentedForward.x,
+            presentedForward.y, presentedForward.z};
+        frame.twoHandLabTemporalActive = true;
+        frame.twoHandLabTemporalErrorDeg = solve.errorDeg;
+        Check(Telemetry_TestSerializeFrame(frame, serialized,
+                sizeof(serialized), serializedBytes),
+            "Two-Hand Lab temporal frame serializes");
+        const std::string statelessKey = vecKey(
+            "two_hand_lab_stateless_direction", statelessForward.x,
+            statelessForward.y, statelessForward.z);
+        const std::string presentedKey = vecKey(
+            "two_hand_lab_presented_direction", presentedForward.x,
+            presentedForward.y, presentedForward.z);
+        Check(std::strstr(serialized, statelessKey.c_str()) != nullptr &&
+                std::strstr(serialized, presentedKey.c_str()) != nullptr &&
+                statelessKey != presentedKey,
+            "Two-Hand Lab stateless versus presented stay distinguishable");
+        jsonFloat = "\"two_hand_lab_temporal_error_deg\":" +
+            expectFloat(solve.errorDeg);
+        Check(std::strstr(serialized, jsonFloat.c_str()) != nullptr,
+            "Two-Hand Lab temporal error serializes from the live state");
+    }
+}
+
 void TestWeaponOrderEvents()
 {
     // Gate off: zero diagnostic work, null sequence, no counters.
@@ -1667,6 +2464,44 @@ void TestWeaponOrderEvents()
             std::string(text, written).find("\"status\":\"success\"") !=
                 std::string::npos,
         "Weapon-order serialization uses the fixed analyser vocabulary");
+
+    // T-2 shot round trip: the engine-aim source ordinal and a Reach-shaped
+    // payload (unknown slot, known barrel, seated-compact source) survive the
+    // fixed record, the pop and the production serializer.
+    Telemetry_TestResetWeaponEvents();
+    {
+        TelemetryShotPayload reachShot{};
+        reachShot.origin[0] = 5.0f;
+        reachShot.origin[1] = 0.0f;
+        reachShot.origin[2] = -1.0f;
+        reachShot.direction[2] = -1.0f;
+        reachShot.engineAim[2] = 1.0f;
+        reachShot.slot = kTelemetryShotIndexUnknown;
+        reachShot.barrel = 1;
+        reachShot.flags = 0x0002u;
+        reachShot.engineAimSource = 4; // Reach seated compact fallback
+        (void)Telemetry_PublishShotEvent(
+            static_cast<uint8_t>(WeaponOrderEventStatus::Success), 3, 21, 22,
+            0x12345678u, UINT32_MAX, reachShot);
+        Check(Telemetry_TestPopWeaponEvent(popped) &&
+                popped.kind ==
+                    static_cast<uint8_t>(WeaponOrderEventKind::Shot) &&
+                popped.shotEngineAimSource == 4,
+            "Shot payload round-trips through the event record");
+        char shotText[1024]{};
+        size_t shotWritten = 0;
+        Check(Telemetry_TestSerializeWeaponEvent(popped, shotText,
+                    sizeof(shotText), shotWritten) &&
+                std::string(shotText, shotWritten).find("\"kind\":\"shot\"") !=
+                    std::string::npos &&
+                std::string(shotText, shotWritten).find(
+                    "\"shot_engine_aim_source\":4") != std::string::npos &&
+                std::string(shotText, shotWritten).find("\"shot_slot\":-1") !=
+                    std::string::npos &&
+                std::string(shotText, shotWritten).find("\"shot_barrel\":1") !=
+                    std::string::npos,
+            "Shot serialization carries the engine aim source ordinal");
+    }
 
     // Worker drain parity: the production ordered-serialization core with an
     // in-memory sink. Session 0 is the forced-acceptance publish session here.
@@ -1973,6 +2808,409 @@ void TestWeaponOrderEvents()
     Telemetry_TestResetWeaponEvents();
 }
 
+void TestShotsVsReticleSerialization()
+{
+    char serialized[32768]{};
+    size_t serializedBytes = 0;
+    const TelemetryFrame frame = EvidenceFrame(0);
+    Check(Telemetry_TestSerializeFrame(
+            frame, serialized, sizeof(serialized), serializedBytes),
+        "Shots-vs-reticle frame serializes inside the bounded buffer");
+    Check(std::strstr(serialized, "\"presented_aim_valid\":true") != nullptr &&
+            std::strstr(serialized,
+                "\"presented_aim_forward\":[0,0,-1]") != nullptr,
+        "Presented aim validity and forward serialize explicitly");
+    Check(std::strstr(serialized,
+                "\"reticle_presented_valid\":true") != nullptr &&
+            std::strstr(serialized,
+                "\"reticle_presented_serial\":41") != nullptr &&
+            std::strstr(serialized,
+                "\"reticle_presented_sample_ms\":1234567") != nullptr &&
+            std::strstr(serialized,
+                "\"reticle_presented_support_epoch\":5") != nullptr &&
+            std::strstr(serialized,
+                "\"reticle_presented_support_trusted\":true") != nullptr &&
+            std::strstr(serialized,
+                "\"reticle_presented_orientation\":[0,0,0,1]") != nullptr &&
+            std::strstr(serialized,
+                "\"reticle_presented_position\":[0.5,-0.25,4]") != nullptr,
+        "Consumer-visible reticle pose travels with its own lagging serial");
+    Check(std::strstr(serialized, "\"engine_aim_valid\":true") != nullptr &&
+            std::strstr(serialized, "\"engine_aim_source\":1") != nullptr &&
+            std::strstr(serialized,
+                "\"engine_aim_forward\":[1,0,0]") != nullptr &&
+            std::strstr(serialized, "\"engine_aim_serial\":0") != nullptr &&
+            std::strstr(serialized,
+                "\"engine_aim_sample_ms\":0") != nullptr &&
+            std::strstr(serialized,
+                "\"engine_aim_pitch_valid\":false") != nullptr &&
+            std::strstr(serialized,
+                "\"engine_aim_pitch_deg\":0") != nullptr,
+        "Engine aim feedback serializes source, latest-only serial and pitch coupling");
+    Check(std::strstr(serialized,
+                "\"engine_camera_base_valid\":true") != nullptr &&
+            std::strstr(serialized,
+                "\"engine_camera_base_position\":[10,20,30]") != nullptr &&
+            std::strstr(serialized,
+                "\"engine_camera_eye_valid\":true") != nullptr &&
+            std::strstr(serialized,
+                "\"engine_camera_eye_position\":[11,21,31]") != nullptr &&
+            std::strstr(serialized,
+                "\"engine_camera_source\":1") != nullptr &&
+            std::strstr(serialized,
+                "\"engine_camera_serial\":0") != nullptr &&
+            std::strstr(serialized,
+                "\"world_scale_valid\":true") != nullptr &&
+            std::strstr(serialized, "\"world_scale\":") != nullptr &&
+            std::strstr(serialized, "\"dual_active\":true") != nullptr,
+        "Engine camera truth, authoritative scale and dual predicate serialize explicitly");
+    Check(std::strstr(serialized,
+                "\"aim_stabilization\":0.479999989") != nullptr &&
+            std::strstr(serialized,
+                "\"crosshair_distance_m\":41") != nullptr &&
+            std::strstr(serialized,
+                "\"crosshair_size_deg\":10.1000004") != nullptr &&
+            std::strstr(serialized, "\"crosshair\":true") != nullptr &&
+            std::strstr(serialized, "\"kill_reticle\":true") != nullptr,
+        "Effective reticle/steering settings serialize explicitly");
+    Check(std::strstr(serialized, "\"weapon_buttons\":17") != nullptr &&
+            std::strstr(serialized,
+                "\"weapon_pulse_until_ms\":7654321") != nullptr &&
+            std::strstr(serialized, "\"weapon_generation\":3") != nullptr,
+        "Weapon gesture pad state serializes explicitly");
+
+    // Finite handling: a non-finite engine vector serializes as JSON null
+    // (the worker never emits NaN/Infinity); validity still travels
+    // separately so the null is interpretable, not silent.
+    TelemetryFrame nonFinite = frame;
+    nonFinite.engineAimForward = {NAN, 0.0f, 0.0f};
+    Check(Telemetry_TestSerializeFrame(nonFinite, serialized,
+            sizeof(serialized), serializedBytes) &&
+            std::strstr(serialized,
+                "\"engine_aim_forward\":[null,0,0]") != nullptr &&
+            std::strstr(serialized,
+                "\"engine_aim_valid\":true") != nullptr,
+        "Non-finite engine vectors serialize as JSON null without losing validity");
+
+    // Validity coupling: an invalid observation keeps zero payloads (never
+    // stale, never non-finite), while the source still names the attributed
+    // publication (Halo 2 absent here).
+    TelemetryFrame absent = frame;
+    absent.presentedAimValid = false;
+    absent.presentedAimForward = {};
+    absent.reticlePresentedValid = false;
+    absent.reticlePresentedSerial = 0;
+    absent.reticlePresentedSampleMs = 0;
+    absent.reticlePresentedSupportEpoch = 0;
+    absent.reticlePresentedSupportTrusted = false;
+    // Note: TelemetryQuat{} defaults w to 1, so the zeroed invalid pose
+    // needs explicit zeros (matching the recorder's invalid convention).
+    absent.reticlePresentedOrientation =
+        TelemetryQuat{0.0f, 0.0f, 0.0f, 0.0f};
+    absent.reticlePresentedPosition = {};
+    absent.engineAimValid = false;
+    absent.engineAimSource = 8;
+    absent.engineAimForward = {};
+    absent.engineAimSerial = 0;
+    absent.engineAimSampleMs = 0;
+    absent.engineAimPitchValid = false;
+    absent.engineAimPitchDeg = 0.0f;
+    absent.engineCameraBaseValid = false;
+    absent.engineCameraBasePosition = {};
+    absent.engineCameraEyeValid = false;
+    absent.engineCameraEyePosition = {};
+    absent.engineCameraSource = 0;
+    absent.engineCameraSerial = 0;
+    absent.worldScaleValid = false;
+    absent.worldScale = 0.0f;
+    absent.dualActive = false;
+    Check(Telemetry_TestSerializeFrame(absent, serialized, sizeof(serialized),
+            serializedBytes) &&
+            std::strstr(serialized,
+                "\"presented_aim_valid\":false") != nullptr &&
+            std::strstr(serialized,
+                "\"presented_aim_forward\":[0,0,0]") != nullptr &&
+            std::strstr(serialized,
+                "\"reticle_presented_valid\":false") != nullptr &&
+            std::strstr(serialized,
+                "\"reticle_presented_serial\":0") != nullptr &&
+            std::strstr(serialized,
+                "\"reticle_presented_orientation\":[0,0,0,0]") != nullptr &&
+            std::strstr(serialized,
+                "\"engine_aim_valid\":false") != nullptr &&
+            std::strstr(serialized, "\"engine_aim_source\":8") != nullptr &&
+            std::strstr(serialized,
+                "\"engine_aim_forward\":[0,0,0]") != nullptr &&
+            std::strstr(serialized,
+                "\"engine_camera_eye_valid\":false") != nullptr &&
+            std::strstr(serialized,
+                "\"world_scale_valid\":false") != nullptr &&
+            std::strstr(serialized, "\"dual_active\":false") != nullptr,
+        "Invalid shots-vs-reticle observations keep zero payloads with an attributed source");
+}
+
+void TestPersistentSupportGripSerialization()
+{
+    char serialized[32768]{};
+    size_t serializedBytes = 0;
+    const TelemetryFrame frame = EvidenceFrame(42);
+    Check(Telemetry_TestSerializeFrame(
+            frame, serialized, sizeof(serialized), serializedBytes),
+        "Persistent-grip frame serializes inside the bounded buffer");
+    Check(std::strstr(serialized,
+                "\"persistent_support_grip_configured\":true") != nullptr &&
+            std::strstr(serialized,
+                "\"persistent_support_grip_applicable\":true") != nullptr &&
+            std::strstr(serialized,
+                "\"support_relationship_readable\":true") != nullptr &&
+            std::strstr(serialized,
+                "\"support_relationship_engaged\":true") != nullptr &&
+            std::strstr(serialized,
+                "\"support_solve_trusted\":true") != nullptr &&
+            std::strstr(serialized,
+                "\"support_force_one_hand\":false") != nullptr,
+        "Persistent-grip provenance bits serialize explicitly");
+    Check(std::strstr(serialized, "\"support_epoch\":5") != nullptr &&
+            std::strstr(serialized,
+                "\"support_solve_serial\":41") != nullptr,
+        "Persistent-grip epoch and solve serial serialize as integers");
+    // The stamped solve serial is the frame's own serial minus one at capture;
+    // it travels as its own value and is never rewritten to prepared_serial.
+    Check(std::strstr(serialized, "\"prepared_serial\":42") != nullptr,
+        "Persistent-grip serial lag is not rewritten to the frame identity");
+
+    // Epoch sentinel: all-ones means "the relationship could not be read" and
+    // must survive the wire as a plain unsigned integer (never a float, never
+    // a string, never truncated).
+    TelemetryFrame unknownEpoch = frame;
+    unknownEpoch.supportEpoch = UINT64_MAX;
+    unknownEpoch.supportRelationshipReadable = false;
+    unknownEpoch.supportRelationshipEngaged = false;
+    unknownEpoch.supportSolveTrusted = false;
+    unknownEpoch.supportForceOneHand = true;
+    Check(Telemetry_TestSerializeFrame(unknownEpoch, serialized,
+            sizeof(serialized), serializedBytes) &&
+            std::strstr(serialized,
+                "\"support_epoch\":18446744073709551615") != nullptr &&
+            std::strstr(serialized,
+                "\"support_force_one_hand\":true") != nullptr,
+        "Unknown-epoch sentinel round-trips as an exact unsigned integer");
+
+    // Absence/zero convention: with the feature off the qualification
+    // short-circuits and every carried field reads its frozen zero/false
+    // default, never a stale receipt.
+    TelemetryFrame featureOff = frame;
+    featureOff.persistentSupportGripConfigured = false;
+    featureOff.persistentSupportGripApplicable = false;
+    featureOff.supportRelationshipReadable = false;
+    featureOff.supportRelationshipEngaged = false;
+    featureOff.supportEpoch = 0;
+    featureOff.supportSolveTrusted = false;
+    featureOff.supportForceOneHand = false;
+    featureOff.supportSolveSerial = 0;
+    Check(Telemetry_TestSerializeFrame(featureOff, serialized,
+            sizeof(serialized), serializedBytes) &&
+            std::strstr(serialized,
+                "\"persistent_support_grip_configured\":false") != nullptr &&
+            std::strstr(serialized,
+                "\"persistent_support_grip_applicable\":false") != nullptr &&
+            std::strstr(serialized,
+                "\"support_relationship_readable\":false") != nullptr &&
+            std::strstr(serialized,
+                "\"support_relationship_engaged\":false") != nullptr &&
+            std::strstr(serialized, "\"support_epoch\":0") != nullptr &&
+            std::strstr(serialized,
+                "\"support_solve_trusted\":false") != nullptr &&
+            std::strstr(serialized,
+                "\"support_force_one_hand\":false") != nullptr &&
+            std::strstr(serialized, "\"support_solve_serial\":0") != nullptr,
+        "A feature-off frame reads the frozen zero/false provenance defaults");
+}
+
+void TestShotEvents()
+{
+    // Disabled gate: with recording off the shot producer returns on one
+    // admission load without touching any other state and publishes nothing.
+    Telemetry_TestForceWeaponEventsAccepting(false);
+    Telemetry_TestResetWeaponEvents();
+    TelemetryShotPayload blocked{};
+    blocked.origin[0] = 1.0f;
+    Check(Telemetry_PublishShotEvent(
+              static_cast<uint8_t>(WeaponOrderEventStatus::Success), 3, 7,
+              1234, 0xAABBCCDDu, 0x11223344u, blocked) == 0,
+        "Shot publish is inert while recording is off");
+    const TelemetryWeaponEventCounters disabled =
+        Telemetry_GetWeaponEventCounters();
+    Check(disabled.enqueued == 0 && disabled.droppedQueueFull == 0 &&
+            disabled.written == 0,
+        "No shot accounting moves while recording is off");
+
+    // Field-preserving round trip through the fixed transport.
+    Telemetry_TestForceWeaponEventsAccepting(true);
+    Telemetry_TestResetWeaponEvents();
+    TelemetryShotPayload payload{};
+    payload.origin[0] = 1.5f;
+    payload.origin[1] = -2.25f;
+    payload.origin[2] = 3.0f;
+    payload.direction[0] = 0.0f;
+    payload.direction[1] = 0.5f;
+    payload.direction[2] = -0.8660254f;
+    payload.engineAim[0] = 4.0f;
+    payload.engineAim[1] = 5.0f;
+    payload.engineAim[2] = 6.0f;
+    payload.reticleDirection[0] = -0.25f;
+    payload.reticleDirection[1] = 0.0f;
+    payload.reticleDirection[2] = 0.9682458f;
+    payload.slot = 1;
+    payload.barrel = 0;
+    payload.flags = 0x00A5u;
+    const uint64_t shotSequence = Telemetry_PublishShotEvent(
+        static_cast<uint8_t>(WeaponOrderEventStatus::Success), 3, 7, 1234,
+        0xAABBCCDDu, 0x11223344u, payload);
+    Check(shotSequence == 1,
+        "Shot events claim the same process-wide sequence as other events");
+    TelemetryWeaponEvent popped{};
+    Check(Telemetry_TestPopWeaponEvent(popped) &&
+            popped.kind == static_cast<uint8_t>(WeaponOrderEventKind::Shot) &&
+            popped.status ==
+                static_cast<uint8_t>(WeaponOrderEventStatus::Success) &&
+            popped.title == 3 && popped.titleGeneration == 7 &&
+            popped.preparedSerial == 1234 &&
+            popped.controlledUnit == 0xAABBCCDDu &&
+            popped.primaryWeapon == 0x11223344u &&
+            popped.aux0 == 0 && popped.aux1 == 0 &&
+            popped.shotOrigin[0] == payload.origin[0] &&
+            popped.shotOrigin[1] == payload.origin[1] &&
+            popped.shotOrigin[2] == payload.origin[2] &&
+            popped.shotDirection[0] == payload.direction[0] &&
+            popped.shotDirection[1] == payload.direction[1] &&
+            popped.shotDirection[2] == payload.direction[2] &&
+            popped.shotEngineAim[0] == payload.engineAim[0] &&
+            popped.shotEngineAim[1] == payload.engineAim[1] &&
+            popped.shotEngineAim[2] == payload.engineAim[2] &&
+            popped.shotReticleDirection[0] == payload.reticleDirection[0] &&
+            popped.shotReticleDirection[2] == payload.reticleDirection[2] &&
+            popped.shotSlot == 1 && popped.shotBarrel == 0 &&
+            popped.shotFlags == 0x00A5u &&
+            popped.tearGuard == popped.sequence &&
+            popped.threadId == GetCurrentThreadId(),
+        "Popped shot event preserves every fixed payload field");
+
+    // Wire vocabulary: the shot keys exist only for kind shot, use the
+    // documented names, and map the unknown sentinel to -1.
+    char shotText[2048]{};
+    size_t shotWritten = 0;
+    Check(Telemetry_TestSerializeWeaponEvent(popped, shotText,
+              sizeof(shotText), shotWritten),
+        "A shot event serializes inside the bounded buffer");
+    const std::string shotLine(shotText, shotWritten);
+    Check(shotLine.find("\"type\":\"weapon_event\"") != std::string::npos &&
+            shotLine.find("\"kind\":\"shot\"") != std::string::npos &&
+            shotLine.find("\"status\":\"success\"") != std::string::npos &&
+            shotLine.find("\"shot_origin\":[1.5,-2.25,3]") !=
+                std::string::npos &&
+            shotLine.find("\"shot_direction\":[0,0.5,-0.866025388]") !=
+                std::string::npos &&
+            shotLine.find("\"shot_engine_aim\":[4,5,6]") !=
+                std::string::npos &&
+            shotLine.find("\"shot_reticle_direction\":[-0.25,0,0.968245804]") !=
+                std::string::npos &&
+            shotLine.find("\"shot_slot\":1") != std::string::npos &&
+            shotLine.find("\"shot_barrel\":0") != std::string::npos &&
+            shotLine.find("\"shot_flags\":165") != std::string::npos,
+        "Shot serialization uses the fixed analyser vocabulary");
+    TelemetryWeaponEvent unknownIndex{};
+    unknownIndex.kind = static_cast<uint8_t>(WeaponOrderEventKind::Shot);
+    unknownIndex.shotSlot = kTelemetryShotIndexUnknown;
+    unknownIndex.shotBarrel = kTelemetryShotIndexUnknown;
+    Check(Telemetry_TestSerializeWeaponEvent(unknownIndex, shotText,
+              sizeof(shotText), shotWritten) &&
+            std::string(shotText, shotWritten).find("\"shot_slot\":-1") !=
+                std::string::npos &&
+            std::string(shotText, shotWritten).find("\"shot_barrel\":-1") !=
+                std::string::npos,
+        "An unknown shot slot/barrel serializes as -1, never as a fake identity");
+    TelemetryWeaponEvent nonShot{};
+    nonShot.kind = static_cast<uint8_t>(
+        WeaponOrderEventKind::CaptureProbeResult);
+    Check(Telemetry_TestSerializeWeaponEvent(nonShot, shotText,
+              sizeof(shotText), shotWritten) &&
+            std::string(shotText, shotWritten).find("\"shot_origin\"") ==
+                std::string::npos &&
+            std::string(shotText, shotWritten).find("\"shot_slot\"") ==
+                std::string::npos &&
+            std::string(shotText, shotWritten).find("\"shot_flags\"") ==
+                std::string::npos,
+        "Existing event kinds serialize without the shot payload keys");
+
+    // Non-finite safety: the serializer never emits NaN/Infinity. Producers
+    // suppress a non-finite final ray before publishing; this is the wire's
+    // last-resort convention.
+    TelemetryWeaponEvent nonFinite{};
+    nonFinite.kind = static_cast<uint8_t>(WeaponOrderEventKind::Shot);
+    nonFinite.shotOrigin[0] = std::numeric_limits<float>::quiet_NaN();
+    nonFinite.shotOrigin[1] = std::numeric_limits<float>::infinity();
+    nonFinite.shotOrigin[2] = 2.0f;
+    nonFinite.shotDirection[2] = -std::numeric_limits<float>::infinity();
+    Check(Telemetry_TestSerializeWeaponEvent(nonFinite, shotText,
+              sizeof(shotText), shotWritten) &&
+            std::string(shotText, shotWritten).find(
+                "\"shot_origin\":[null,null,2]") != std::string::npos &&
+            std::string(shotText, shotWritten).find(
+                "\"shot_direction\":[0,0,null]") != std::string::npos,
+        "Non-finite shot vectors serialize as JSON null, never NaN/Infinity");
+
+    // Admission/gap semantics are unchanged: a cross-session shot claim is
+    // counted and drained as an explicit gap marker.
+    Telemetry_TestResetWeaponEvents();
+    (void)Telemetry_PublishShotEvent(
+        static_cast<uint8_t>(WeaponOrderEventStatus::Success), 3, 7, 1234,
+        0xAABBCCDDu, 0x11223344u, payload);
+    {
+        std::vector<std::string> lines;
+        Check(Telemetry_TestDrainWeaponEvents(7, lines) && lines.size() == 1 &&
+                lines[0].find("\"type\":\"event_gap\"") !=
+                    std::string::npos &&
+                lines[0].find("\"first_missing_seq\":1") !=
+                    std::string::npos,
+            "A cross-session shot claim drains as an explicit gap marker");
+        Check(Telemetry_GetWeaponEventCounters().sessionSkipped == 1,
+            "Cross-session shot claims stay counted, never silent");
+    }
+
+    // Queue pressure: records plus explicit gaps, exact coverage.
+    Telemetry_TestResetWeaponEvents();
+    for (uint32_t i = 0; i < kWeaponOrderEventQueueSlots + 3; ++i)
+        (void)Telemetry_PublishShotEvent(
+            static_cast<uint8_t>(WeaponOrderEventStatus::Success), 3, 7, 1234,
+            0xAABBCCDDu, 0x11223344u, payload);
+    {
+        std::vector<std::string> lines;
+        Check(Telemetry_TestDrainWeaponEvents(0, lines) &&
+                lines.size() == kWeaponOrderEventQueueSlots + 3,
+            "Shot overflow drains as records plus explicit gap lines");
+        size_t gapLines = 0, shotLines = 0;
+        for (const std::string& line : lines)
+        {
+            if (line.find("\"type\":\"event_gap\"") != std::string::npos)
+                ++gapLines;
+            else if (line.find("\"kind\":\"shot\"") != std::string::npos)
+                ++shotLines;
+        }
+        Check(gapLines == 3 && shotLines == kWeaponOrderEventQueueSlots,
+            "Exactly the dropped shot sequences become explicit gap markers");
+        std::string why;
+        Check(VerifyWeaponEventCoverage(kWeaponOrderEventQueueSlots + 3, lines,
+                  why),
+            "Shot events preserve the transport's exact sequence coverage");
+        if (!why.empty())
+            std::fprintf(stderr, "shot coverage: %s\n", why.c_str());
+    }
+
+    Telemetry_TestForceWeaponEventsAccepting(false);
+    Telemetry_TestResetWeaponEvents();
+}
+
 int wmain(int argc, wchar_t** argv)
 {
     if (argc == 4 && std::wcscmp(argv[1], L"--analyser-smoke") == 0)
@@ -1981,7 +3219,11 @@ int wmain(int argc, wchar_t** argv)
     TestRing();
     TestConcurrentRing();
     TestSerializerHelpers();
+    TestTwoHandLabLiveSerialization();
+    TestShotsVsReticleSerialization();
+    TestPersistentSupportGripSerialization();
     TestWeaponOrderEvents();
+    TestShotEvents();
     TestAnalyserLaunchHelpers();
     if (argc == 2)
         TestLifecycleAndAccounting(argv[1]);

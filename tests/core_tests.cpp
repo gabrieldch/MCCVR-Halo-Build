@@ -15,6 +15,7 @@ int RunRoomscaleInputTests();
 #include "../src/dll/contact_melee_queue.h"
 #include <array>
 #include <cstdlib>
+#include <cstdio>
 #include <cmath>
 #include <cstring>
 #include <filesystem>
@@ -10098,6 +10099,28 @@ int main()
     Check(Halo4Adapter_RuntimeHooksPermitted(),
         "C-H4-3 permits the camera core's hooks; the install proof, not this "
         "flag, is what actually admits them");
+    // T6c: the prepared snapshot's owner-safe ordinary one-hand fallback is an
+    // immutable per-serial field consumed lock-free from the double buffer. A
+    // snapshot that never filled it must never look like a valid one-hand
+    // pose, and a copied record must carry it bit-exactly.
+    {
+        Halo4VrRenderSnapshot fallback{};
+        Check(!fallback.oneHandRightAimValid &&
+                  fallback.oneHandRightAimOrientation[0] == 0.0f &&
+                  fallback.oneHandRightAimOrientation[1] == 0.0f &&
+                  fallback.oneHandRightAimOrientation[2] == 0.0f &&
+                  fallback.oneHandRightAimOrientation[3] == 1.0f,
+            "an unfilled Halo 4 one-hand fallback is not a usable pose");
+        Halo4VrRenderSnapshot filled{};
+        filled.oneHandRightAimValid = true;
+        filled.oneHandRightAimOrientation[0] = 0.25f;
+        filled.oneHandRightAimOrientation[3] = 0.9682458f;
+        const Halo4VrRenderSnapshot copy = filled;
+        Check(copy.oneHandRightAimValid &&
+                  copy.oneHandRightAimOrientation[0] == 0.25f &&
+                  copy.oneHandRightAimOrientation[3] == 0.9682458f,
+            "the Halo 4 prepared one-hand fallback survives the snapshot copy");
+    }
 #else
     Check(Halo4Adapter_GetStage() ==
               Halo4AdapterStage::ControllerInputAndColdObservation,
@@ -13380,6 +13403,15 @@ int main()
     ConfigLoad(primary.c_str());
     Check(g_config.independent_dual_aim,"independent dual aim persists through a config round trip");
     g_config.independent_dual_aim=false;ConfigSave();
+    Check(CountText(organizedConfig,"\ntwo_hand_switch_inherit = 0")==1,
+        "switched-weapon two-hand inheritance is written with its default off");
+    Check(!g_config.two_hand_switch_inherit,
+        "switched-weapon two-hand inheritance defaults off");
+    g_config.two_hand_switch_inherit=true;ConfigSave();
+    g_config.two_hand_switch_inherit=false;ConfigLoad(primary.c_str());
+    Check(g_config.two_hand_switch_inherit,
+        "switched-weapon two-hand inheritance persists through a config round trip");
+    g_config.two_hand_switch_inherit=false;ConfigSave();
     Check(!g_config.gun_barrel_aim && CountText(organizedConfig,"\ngun_barrel_aim = 0")==1,
         "barrel trajectory is separate and defaults off in legacy configurations");
     g_config.gun_barrel_aim=true;ConfigSave();g_config.gun_barrel_aim=false;
@@ -13982,6 +14014,158 @@ int main()
     Check(Config{}.two_hand_support_grip_pose &&
             CountText(organizedConfig,"\ntwo_hand_support_grip_pose = 1")==1,
         "support-hand rotation reduction defaults on in generated configurations");
+    Check(Config{}.persistent_support_grip &&
+            Config{}.two_hand_smoothing_strength ==
+                kTwoHandSmoothingStrengthDefault &&
+            Config{}.two_hand_offhand_influence ==
+                kTwoHandOffhandInfluenceDefault &&
+            kTwoHandOffhandInfluenceDefault == 0.50f &&
+            kTwoHandOffhandInfluenceMinimum == 0.0f &&
+            kTwoHandOffhandInfluenceMaximum == 1.0f &&
+            CountText(organizedConfig,
+                "\npersistent_support_grip = 1") == 1 &&
+            CountText(organizedConfig,
+                "\ntwo_hand_smoothing_strength = 0.00") == 1 &&
+            CountText(organizedConfig,
+                "\ntwo_hand_offhand_influence = 0.50") == 1,
+        "PG defaults on, the Two-Hand Smoothing strength slider defaults off at 0, and the free two-hand offhand influence defaults to half authority");
+    Check(TwoHandTransitionContinuityEnabled() &&
+            TwoHandTransitionContinuityAppliesToFrame(true) &&
+            !TwoHandTransitionContinuityAppliesToFrame(false) &&
+            CountText(organizedConfig,
+                "\ntwo_hand_transition_smoothing =") == 0,
+        "the fixed 200 ms VS-OFF latch continuity always resolves enabled with no control, so the retired key is never written");
+    Check(TwoHandLabTemporalEngagedFor(true, false, false) &&
+            !TwoHandLabTemporalEngagedFor(true, false, true) &&
+            !TwoHandLabTemporalEngagedFor(true, true, false) &&
+            !TwoHandLabTemporalEngagedFor(false, false, false),
+        "the Lab temporal correction engages only when Virtual Stock is off and the fixed product continuity does not own the frame, so the two 200 ms corrections can never stack");
+    {
+        std::ofstream settings(primary);
+        settings << "persistent_support_grip = 0\n"
+                    "two_hand_smoothing = 1\n"
+                    "two_hand_transition_smoothing = 0\n";
+    }
+    ConfigLoad(primary.c_str());
+    Check(!g_config.persistent_support_grip &&
+            g_config.two_hand_smoothing_strength ==
+                kTwoHandSmoothingStrengthMaximum &&
+            !g_config.two_hand_transition_smoothing &&
+            TwoHandTransitionContinuityEnabled(),
+        "the legacy boolean two_hand_smoothing = 1 migrates to the full 25 strength, never slider value 1; a historical two_hand_transition_smoothing = 0 is parsed into the dormant field and can never disable the fixed 200 ms continuity");
+    ConfigSave();
+    const std::string twoHandConfig = ReadTextFile(primary);
+    Check(CountText(twoHandConfig, "\npersistent_support_grip = 0") == 1 &&
+            CountText(twoHandConfig,
+                "\ntwo_hand_smoothing_strength = 25.00") == 1 &&
+            CountText(twoHandConfig,
+                "\ntwo_hand_transition_smoothing =") == 0 &&
+            CountText(twoHandConfig, "\ntwo_hand_smoothing =") == 0,
+        "the numeric strength is the only smoothing key saved; the legacy boolean and the retired transition key are not re-saved");
+    {
+        std::ofstream settings(primary);
+        settings << "two_hand_smoothing = 0\n";
+    }
+    ConfigLoad(primary.c_str());
+    Check(g_config.two_hand_smoothing_strength == 0.0f,
+        "the legacy boolean two_hand_smoothing = 0 migrates to strength 0");
+    {
+        std::ofstream settings(primary);
+        settings << "two_hand_smoothing = 1\n"
+                    "two_hand_smoothing_strength = 12.50\n";
+    }
+    ConfigLoad(primary.c_str());
+    Check(g_config.two_hand_smoothing_strength == 12.5f,
+        "an explicit numeric strength wins over the legacy boolean key");
+    ConfigSave();
+    const std::string strengthConfig = ReadTextFile(primary);
+    Check(CountText(strengthConfig,
+            "\ntwo_hand_smoothing_strength = 12.50") == 1,
+        "an intermediate strength round-trips through the canonical numeric key");
+    {
+        std::ofstream settings(primary);
+        settings << "two_hand_smoothing_strength = 100.00\n";
+    }
+    ConfigLoad(primary.c_str());
+    Check(g_config.two_hand_smoothing_strength ==
+            kTwoHandSmoothingStrengthMaximum,
+        "an out-of-range high strength clamps to 25");
+    {
+        std::ofstream settings(primary);
+        settings << "two_hand_smoothing_strength = -4\n";
+    }
+    ConfigLoad(primary.c_str());
+    Check(g_config.two_hand_smoothing_strength ==
+            kTwoHandSmoothingStrengthMinimum,
+        "an out-of-range negative strength clamps to 0");
+    {
+        std::ofstream settings(primary);
+        settings << "two_hand_smoothing_strength = not-a-number\n"
+                    "persistent_support_grip = 0\n";
+    }
+    ConfigLoad(primary.c_str());
+    Check(g_config.two_hand_smoothing_strength ==
+            kTwoHandSmoothingStrengthDefault,
+        "a malformed strength is ignored and keeps the 0 default");
+    {
+        std::ofstream settings(primary);
+        settings << "two_hand_smoothing_strength = 7.25\n";
+    }
+    ConfigLoad(primary.c_str());
+    Check(g_config.two_hand_smoothing_strength == 7.25f,
+        "an in-range fractional strength loads unchanged");
+    {
+        std::ofstream settings(primary);
+        settings << "two_hand_offhand_influence = 0.75\n";
+    }
+    ConfigLoad(primary.c_str());
+    Check(g_config.two_hand_offhand_influence == 0.75f,
+        "an in-range free two-hand offhand influence loads unchanged");
+    ConfigSave();
+    Check(CountText(ReadTextFile(primary),
+            "\ntwo_hand_offhand_influence = 0.75") == 1,
+        "the offhand influence round-trips through the canonical two-decimal key");
+    {
+        std::ofstream settings(primary);
+        settings << "two_hand_offhand_influence = 1.75\n";
+    }
+    ConfigLoad(primary.c_str());
+    Check(g_config.two_hand_offhand_influence ==
+            kTwoHandOffhandInfluenceMaximum,
+        "an out-of-range high offhand influence clamps to 1");
+    {
+        std::ofstream settings(primary);
+        settings << "two_hand_offhand_influence = -0.4\n";
+    }
+    ConfigLoad(primary.c_str());
+    Check(g_config.two_hand_offhand_influence ==
+            kTwoHandOffhandInfluenceMinimum,
+        "an out-of-range negative offhand influence clamps to 0");
+    {
+        std::ofstream settings(primary);
+        settings << "two_hand_offhand_influence = not-a-number\n";
+    }
+    ConfigLoad(primary.c_str());
+    Check(g_config.two_hand_offhand_influence ==
+            kTwoHandOffhandInfluenceDefault,
+        "a malformed offhand influence is ignored and keeps the 0.5 default");
+    ConfigSave();
+    Check(CountText(ReadTextFile(primary),
+            "\ntwo_hand_offhand_influence = 0.50") == 1,
+        "the clamped offhand influence default round-trips through ConfigSave");
+    {
+        std::ofstream legacySettings(primary);
+        legacySettings << "two_hand_support_grip_pose = 1\n";
+    }
+    ConfigLoad(primary.c_str());
+    Check(g_config.persistent_support_grip &&
+            g_config.two_hand_smoothing_strength ==
+                kTwoHandSmoothingStrengthDefault &&
+            TwoHandTransitionContinuityEnabled(),
+        "older configs with no new keys use defaults and still resolve the fixed continuity without migrating saved settings");
+    g_config.two_hand_smoothing_strength = 0.0f;
+    ConfigSave();
+    ConfigSave();
     g_config.two_hand_support_grip_pose=false;ConfigSave();g_config.two_hand_support_grip_pose=true;
     ConfigLoad(primary.c_str());
     Check(!g_config.two_hand_support_grip_pose,
@@ -14179,7 +14363,7 @@ int main()
           "virtual_stock_hybrid_horizontal_release_m",
           "virtual_stock_proximity_release", "virtual_stock_proximity_full_m",
         "virtual_stock_proximity_release_m",
-        "two_hand_support_grip_pose", "two_hand_toggle", "left_hand_forward_m", "two_hand_zone_right_m",
+        "two_hand_support_grip_pose", "two_hand_toggle", "two_hand_offhand_influence", "left_hand_forward_m", "two_hand_zone_right_m",
         "left_grip_forward_m", "arm_ik", "floating_hands", "world_collision",
         "physical_melee", "gesture_melee", "physical_melee_swing_speed",
         "right_shoulder_drop", "shoulder_level", "body_wip", "weapon_probe",
@@ -18597,6 +18781,43 @@ int main()
           MenuSliderNudge(10,0.3f,10,0.01,1)==10 &&
           MenuSliderNudge(0.3f,0.3f,10,0.01,-1)==0.3f,
         "menu nudges round the shown value and preserve both slider endpoints");
+
+    // Free two-hand offhand influence (W3) F1 display: the stored 0..1
+    // authority is shown as a 0..100 percent label, so the 0.50 default reads
+    // "50%" and never the raw fraction.
+    {
+        const float defaultPercent = MenuSliderPercentFromUnit(
+            kTwoHandOffhandInfluenceDefault);
+        char influenceLabel[16]{};
+        std::snprintf(influenceLabel, sizeof(influenceLabel), "%.0f%%",
+            defaultPercent);
+        Check(defaultPercent == 50.0f &&
+              std::strcmp(influenceLabel, "50%") == 0 &&
+              kTwoHandOffhandInfluenceDefault == 0.50f,
+            "the free two-hand offhand influence default 0.50 displays as 50 percent, never as the raw fraction");
+        Check(MenuSliderPercentFromUnit(0.0f) == 0.0f &&
+              MenuSliderPercentFromUnit(0.25f) == 25.0f &&
+              MenuSliderPercentFromUnit(1.0f) == 100.0f,
+            "offhand influence 0..1 maps onto a 0..100 percent slider");
+        Check(MenuSliderPercentFromUnit(1.5f) == 100.0f &&
+              MenuSliderPercentFromUnit(-0.5f) == 0.0f &&
+              MenuSliderPercentFromUnit(
+                  std::numeric_limits<float>::quiet_NaN()) == 0.0f &&
+              MenuSliderPercentFromUnit(
+                  std::numeric_limits<float>::infinity()) == 0.0f,
+            "an out-of-range or non-finite offhand influence percent display clamps safely");
+        Check(MenuSliderUnitFromPercent(0.0f) == 0.0f &&
+              MenuSliderUnitFromPercent(50.0f) == 0.5f &&
+              MenuSliderUnitFromPercent(100.0f) == 1.0f &&
+              MenuSliderUnitFromPercent(101.0f) == 1.0f &&
+              MenuSliderUnitFromPercent(-1.0f) == 0.0f &&
+              MenuSliderUnitFromPercent(
+                  std::numeric_limits<float>::quiet_NaN()) == 0.0f,
+            "the offhand influence percent slider writes back the exact clamped 0..1 authority");
+        Check(MenuSliderUnitFromPercent(defaultPercent) ==
+                  kTwoHandOffhandInfluenceDefault,
+            "the offhand influence round-trips through the percent slider unchanged");
+    }
 
     // Roomscale uses observed native travel, never teleports the body or
     // consumes a requested step before the engine has actually moved.

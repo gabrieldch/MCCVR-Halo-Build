@@ -1604,7 +1604,7 @@ def add_core_args(ap):
     ap.add_argument('--head-episode-min-excursion-deg', type=float, default=2.0)
     ap.add_argument('--head-episode-min-frames', type=int, default=4)
     ap.add_argument('--horizontal-candidates', default='O_270_425:0.270:0.425,P_300_450:0.300:0.450,Q_320_460:0.320:0.460')
-ANALYSER_VERSION = '6.0.0-standalone'
+ANALYSER_VERSION = '6.3.0-standalone'
 
 def authority_decomposition(rec) -> dict[str, Any]:
     """
@@ -1727,6 +1727,471 @@ def performance_index(rec, times, args) -> dict[str, Any]:
             top.append({'line': f['_line'], 'serial': f.get('prepared_serial'), 'time_s': times[i], 'profile': profile_name(f, rec), 'hotpath_us': us})
     top.sort(key=lambda x: -x['hotpath_us'])
     return {'hotpath_us': stats(hot), 'frame_interval_ratio_to_predicted_period': stats(cad), 'top_hotpath_frames': top[:args.top_performance], 'frame_interval_outliers': outliers[:args.top_performance]}
+
+
+# ---------------------------------------------------------------------------
+# Persistent grip (PG) x Two-Hand Lab: indexed solve-provenance episodes
+# ---------------------------------------------------------------------------
+PG_FAMILY_KEY = 'persistent_support_grip_configured'
+LAB_FAMILY_KEY = 'two_hand_lab_enabled'
+SMOOTHING_FAMILY_KEY = 'two_hand_transition_smoothing_configured'
+SUPPORT_EPOCH_UNKNOWN = 2 ** 64 - 1
+DEFAULT_A_DOT_B_AGREEMENT_FLOOR = 0.35
+LAB_INFLUENCE_EPSILON = 1e-09
+PG_EPISODE_ROW_CAP = 30
+PG_LAB_NON_CLAIMS = (
+    'Episodes are indexed recorded states, never verdicts: an edge does not establish that it caused visible aim motion.',
+    'effective_settings.two_hand_latched false or canonical_aim.two_hand_active false is not a disengaged durable persistent-grip relationship.',
+    'support_force_one_hand true is explicit persistent-grip forcing of that invocation to the one-hand path; false does not mean the solve stayed two-hand.',
+    'support_relationship_readable false is not persistent grip being off; consult persistent_support_grip_configured and persistent_support_grip_applicable for the config knob and title gate.',
+    'support_solve_trusted is the qualification permission of that invocation, not a receipt that the solve consumed support geometry.',
+    'support_solve_serial is a stamped solve serial that normally lags prepared_serial by one; the recorded lag is reported and the two fields are never asserted equal.',
+    'reticle_presented_support_trusted and reticle_presented_support_epoch belong to a different, normally lagged assembly and are never the canonical solve trust.',
+    'support_epoch values are process-local and are compared only between adjacent frames of one capture, never across sessions or captures.',
+    'Same-frame counterfactual control profiles re-solve independently and do not carry the canonical assembly support facts.',
+    'The transition/input smoothing values are recorded amounts and paths, not quality verdicts: two_hand_smoothing_strength (the user amount 0..25 frozen for that serial), two_hand_smoothing_mix (strength/25, the applied wet/dry amount) and two_hand_smoothing_alpha (the filter internal clamp(25*dt, 0, 1) coefficient) are distinct recorded quantities and none of them is a filter speed; two_hand_offhand_influence is the frozen free two-hand product authority, also not a quality verdict.',
+    'The two_hand_smoothing_*_error_* values are raw-to-full-filtered input differences, never solver or presented-aim errors; their magnitude is reported descriptively only.',
+    'prepared_serial versus reticle_presented_serial differences are reported frame counts; the pair is never asserted equal and a recorded difference is not by itself a defect.',
+)
+
+
+def _bool_or_none(value: Any) -> bool | None:
+    return value if isinstance(value, bool) else None
+
+
+def _int_or_none(value: Any) -> int | None:
+    return value if isinstance(value, int) and not isinstance(value, bool) else None
+
+
+def pg_frame_provenance(f: dict[str, Any]) -> dict[str, Any] | None:
+    """Frozen persistent-grip solve provenance of one frame, or None when the
+    additive schema-2 family is absent from that frame. Absence is not a
+    false/zero state and is reported as not recorded."""
+    if PG_FAMILY_KEY not in f:
+        return None
+    return {'configured': _bool_or_none(f.get(PG_FAMILY_KEY)), 'applicable': _bool_or_none(f.get('persistent_support_grip_applicable')), 'readable': _bool_or_none(f.get('support_relationship_readable')), 'engaged': _bool_or_none(f.get('support_relationship_engaged')), 'epoch': _int_or_none(f.get('support_epoch')), 'trusted': _bool_or_none(f.get('support_solve_trusted')), 'force_one_hand': _bool_or_none(f.get('support_force_one_hand')), 'solve_serial': _int_or_none(f.get('support_solve_serial'))}
+
+
+def lab_frame_context(f: dict[str, Any]) -> dict[str, Any] | None:
+    """Two-Hand Lab family of one frame, or None when the family is absent.
+
+    The Lab values are meaningful only while ``two_hand_lab_enabled`` is true:
+    the raw family reads inactive defaults while the Lab does not steer that
+    frame's canonical solve, so non-enabled frames report only the gate."""
+    if LAB_FAMILY_KEY not in f:
+        return None
+    enabled = _bool_or_none(f.get(LAB_FAMILY_KEY))
+    out: dict[str, Any] = {'lab_enabled': enabled}
+    if enabled:
+        out.update({'offhand_influence_requested': fnum(f.get('two_hand_lab_offhand_influence')), 'effective_influence': fnum(f.get('two_hand_lab_effective_influence')), 'anchor_requested': _int_or_none(f.get('two_hand_lab_anchor_requested')), 'anchor_resolved': _int_or_none(f.get('two_hand_lab_anchor_resolved')), 'anchor_fallback': _int_or_none(f.get('two_hand_lab_anchor_fallback')), 'agreement_mode': _int_or_none(f.get('two_hand_lab_agreement_mode')), 'agreement': fnum(f.get('two_hand_lab_agreement')), 'agreement_confidence': fnum(f.get('two_hand_lab_agreement_confidence')), 'temporal_mode': _int_or_none(f.get('two_hand_lab_temporal_mode')), 'temporal_active': _bool_or_none(f.get('two_hand_lab_temporal_active')), 'temporal_error_deg': fnum(f.get('two_hand_lab_temporal_error_deg'))})
+    return out
+
+
+def smoothing_frame_context(f: dict[str, Any]) -> dict[str, Any] | None:
+    """Two-Hand transition/input smoothing family of one frame, or None when the
+    family is absent from that frame. Absence is not a false/zero state.
+
+    ``two_hand_transition_smoothing_configured`` is the family presence marker.
+    ``two_hand_smoothing_strength`` and ``two_hand_smoothing_mix`` are the
+    strength-slider extension of that family: recordings written by the earlier
+    boolean-era candidate carry the booleans, alpha and the error inputs without
+    them, so those two read None (not recorded) instead of a fabricated zero.
+    ``two_hand_smoothing_alpha`` is the filter's internal clamp(25*dt, 0, 1)
+    temporal coefficient and is never the user amount, and the
+    ``two_hand_smoothing_*_error_*`` values are raw-to-full-filtered input
+    differences, never solver or presented-aim errors.
+
+    ``two_hand_offhand_influence`` is the frozen free two-hand (VS-OFF) product
+    offhand directional authority carried beside this family, not a member of
+    it: a recording written before the field existed omits the key and that
+    absence is not a zero authority."""
+    if SMOOTHING_FAMILY_KEY not in f:
+        return None
+    return {'transition_configured': _bool_or_none(f.get(SMOOTHING_FAMILY_KEY)), 'transition_active': _bool_or_none(f.get('two_hand_transition_active')), 'configured': _bool_or_none(f.get('two_hand_smoothing_configured')), 'applied': _bool_or_none(f.get('two_hand_smoothing_applied')), 'offhand_influence': fnum(f.get('two_hand_offhand_influence')), 'strength': fnum(f.get('two_hand_smoothing_strength')), 'mix': fnum(f.get('two_hand_smoothing_mix')), 'alpha': fnum(f.get('two_hand_smoothing_alpha')), 'primary_orientation_error_deg': fnum(f.get('two_hand_smoothing_primary_orientation_error_deg')), 'primary_position_error_m': fnum(f.get('two_hand_smoothing_primary_position_error_m')), 'support_position_error_m': fnum(f.get('two_hand_smoothing_support_position_error_m'))}
+
+
+def persistent_grip_lab_analysis(rec: ParsedRecording, times: list[float | None], args: argparse.Namespace) -> dict[str, Any]:
+    """Indexed persistent-grip relationship/epoch/trust/forcing episodes with
+    the Two-Hand Lab influence context of each event frame, plus the frozen
+    Two-Hand transition/input smoothing values of that capture.
+
+    Every list is an exact line/serial/time index. The PG, Lab and smoothing
+    families are additive: a capture that lacks them reports them as not
+    recorded rather than as false/zero, and epochs are compared only between
+    adjacent frames of this capture."""
+    fs = rec.frames
+    floor = float(getattr(args, 'a_dot_b_agreement_floor', DEFAULT_A_DOT_B_AGREEMENT_FLOOR))
+    pg = [pg_frame_provenance(f) for f in fs]
+    lab = [lab_frame_context(f) for f in fs]
+    smooth = [smoothing_frame_context(f) for f in fs]
+    recorded = any(row is not None for row in pg)
+    lab_recorded = any(row is not None for row in lab)
+    smoothing_recorded = any(row is not None for row in smooth)
+
+    def trace_of(index: int) -> dict[str, Any]:
+        trace = fs[index].get('aim_trace', {})
+        return trace if isinstance(trace, dict) else {}
+
+    def effective_of(index: int) -> dict[str, Any]:
+        eff = fs[index].get('effective_settings', {})
+        return eff if isinstance(eff, dict) else {}
+
+    def canonical_of(index: int) -> dict[str, Any]:
+        canonical = fs[index].get('canonical_aim', {})
+        return canonical if isinstance(canonical, dict) else {}
+
+    def base(index: int, kind: str) -> dict[str, Any]:
+        frame = fs[index]
+        return {'kind': kind, 'line': frame['_line'], 'serial': frame.get('prepared_serial'), 'time_s': times[index], 'profile': profile_name(frame, rec)}
+
+    def pg_detail(row: dict[str, Any] | None) -> dict[str, Any] | None:
+        if row is None:
+            return None
+        return {'configured': row['configured'], 'applicable': row['applicable'], 'readable': row['readable'], 'engaged': row['engaged'], 'epoch': row['epoch'], 'trusted': row['trusted'], 'force_one_hand': row['force_one_hand']}
+
+    def lab_detail(index: int) -> dict[str, Any] | None:
+        row = lab[index]
+        if row is None or not row.get('lab_enabled'):
+            return None
+        return {key: value for key, value in row.items() if key != 'lab_enabled'}
+
+    def run_row(a: int, b: int) -> dict[str, Any]:
+        values = [float(trace_of(i)['a_dot_b']) for i in range(a, b + 1) if finite(trace_of(i).get('a_dot_b'))]
+        rejected = [float(trace_of(i)['b_rejected_agreement']) for i in range(a, b + 1) if finite(trace_of(i).get('b_rejected_agreement'))]
+        return {'start_line': fs[a]['_line'], 'end_line': fs[b]['_line'], 'start_serial': fs[a].get('prepared_serial'), 'end_serial': fs[b].get('prepared_serial'), 'start_time_s': times[a], 'end_time_s': times[b], 'frames': b - a + 1, 'profile': profile_name(fs[a], rec), 'a_dot_b': stats(values), 'b_rejected_agreement': stats(rejected), 'b_accepted_frames': sum(1 for i in range(a, b + 1) if trace_of(i).get('b_accepted') is True), 'b_extreme_rejected_frames': sum(1 for i in range(a, b + 1) if trace_of(i).get('b_extreme_rejected') is True), 'b_steering_retained_frames': sum(1 for i in range(a, b + 1) if trace_of(i).get('b_steering_retained') is True), 'engaged_frames': sum(1 for i in range(a, b + 1) if pg[i] is not None and pg[i]['engaged'] is True) if recorded else None}
+
+    counts = None
+    if recorded:
+        def count_true(key: str) -> int:
+            return sum(1 for row in pg if row is not None and row[key] is True)
+        epochs = collections.Counter(row['epoch'] for row in pg if row is not None and row['epoch'] is not None)
+        counts = {'frames_total': len(fs), 'frames_with_family': sum(1 for row in pg if row is not None), 'configured_true': count_true('configured'), 'applicable_true': count_true('applicable'), 'readable_true': count_true('readable'), 'engaged_true': count_true('engaged'), 'trusted_true': count_true('trusted'), 'force_one_hand_true': count_true('force_one_hand'), 'epoch_zero_frames': epochs.get(0, 0), 'epoch_unreadable_sentinel_frames': epochs.get(SUPPORT_EPOCH_UNKNOWN, 0), 'epoch_values_observed': [{'epoch': epoch, 'sentinel': epoch == SUPPORT_EPOCH_UNKNOWN, 'frames': count} for epoch, count in sorted(epochs.items())]}
+
+    relationship_transitions: list[dict[str, Any]] = []
+    epoch_changes: list[dict[str, Any]] = []
+    trust_loss_transitions: list[dict[str, Any]] = []
+    if recorded:
+        for i in range(1, len(fs)):
+            prev, cur = pg[i - 1], pg[i]
+            if prev is None or cur is None:
+                continue
+            changed = [key for key in ('readable', 'engaged') if prev[key] != cur[key]]
+            if changed:
+                if prev['engaged'] is False and cur['engaged'] is True:
+                    kind = 'relationship_acquire'
+                elif prev['engaged'] is True and cur['engaged'] is False:
+                    kind = 'relationship_release'
+                else:
+                    kind = 'relationship_readability_change'
+                row = base(i, kind)
+                row.update({'changed': changed, 'from': pg_detail(prev), 'to': pg_detail(cur), 'lab': lab_detail(i)})
+                relationship_transitions.append(row)
+            if prev['epoch'] is not None and cur['epoch'] is not None and prev['epoch'] != cur['epoch']:
+                row = base(i, 'epoch_change')
+                row.update({'from_epoch': prev['epoch'], 'to_epoch': cur['epoch'], 'from_unreadable_sentinel': prev['epoch'] == SUPPORT_EPOCH_UNKNOWN, 'to_unreadable_sentinel': cur['epoch'] == SUPPORT_EPOCH_UNKNOWN, 'engaged_before': prev['engaged'], 'engaged_after': cur['engaged']})
+                epoch_changes.append(row)
+            if prev['trusted'] is True and cur['trusted'] is False:
+                row = base(i, 'trust_loss')
+                row.update({'engaged_before': prev['engaged'], 'engaged_after': cur['engaged'], 'epoch_before': prev['epoch'], 'epoch_after': cur['epoch'], 'readable_after': cur['readable'], 'force_one_hand_after': cur['force_one_hand'], 'lab': lab_detail(i)})
+                trust_loss_transitions.append(row)
+
+    force_one_hand_runs: list[dict[str, Any]] = []
+    force_index_runs: list[tuple[int, int]] = []
+    if recorded:
+        force_index_runs = _runs([i for i, row in enumerate(pg) if row is not None and row['force_one_hand'] is True])
+        for a, b in force_index_runs:
+            force_one_hand_runs.append({'start_line': fs[a]['_line'], 'end_line': fs[b]['_line'], 'start_serial': fs[a].get('prepared_serial'), 'end_serial': fs[b].get('prepared_serial'), 'start_time_s': times[a], 'end_time_s': times[b], 'frames': b - a + 1, 'profile': profile_name(fs[a], rec), 'trusted_frames': sum(1 for row in pg[a:b + 1] if row is not None and row['trusted'] is True), 'engaged_frames': sum(1 for row in pg[a:b + 1] if row is not None and row['engaged'] is True), 'epochs': sorted({row['epoch'] for row in pg[a:b + 1] if row is not None and row['epoch'] is not None})})
+
+    two_hand_to_one_hand: list[dict[str, Any]] = []
+    if recorded:
+        for i in range(1, len(fs)):
+            cur = pg[i]
+            if cur is None or cur['engaged'] is not True:
+                continue
+            if _bool_or_none(canonical_of(i - 1).get('two_hand_active')) is True and _bool_or_none(canonical_of(i).get('two_hand_active')) is False:
+                row = base(i, 'two_hand_to_one_hand_while_engaged')
+                row.update({'engaged_after': True, 'trusted_after': cur['trusted'], 'force_one_hand_after': cur['force_one_hand'], 'epoch_after': cur['epoch'], 'two_hand_latched_before': _bool_or_none(effective_of(i - 1).get('two_hand_latched')), 'two_hand_latched_after': _bool_or_none(effective_of(i).get('two_hand_latched')), 'lab': lab_detail(i)})
+                two_hand_to_one_hand.append(row)
+
+    agreement_index_runs = _runs([i for i in range(len(fs)) if finite(trace_of(i).get('a_dot_b')) and float(trace_of(i)['a_dot_b']) < floor])
+    agreement_below_floor_runs = [run_row(a, b) for a, b in agreement_index_runs]
+    steering_index_runs = _runs([i for i in range(len(fs)) if trace_of(i).get('b_steering_retained') is True])
+    b_steering_retained_runs = [run_row(a, b) for a, b in steering_index_runs]
+
+    lab_summary = None
+    if lab_recorded:
+        steering = [i for i, row in enumerate(lab) if row is not None and row.get('lab_enabled')]
+
+        def influence_delta(row: dict[str, Any]) -> float | None:
+            requested = row.get('offhand_influence_requested')
+            effective = row.get('effective_influence')
+            if requested is None or effective is None:
+                return None
+            return float(effective) - float(requested)
+
+        deltas = [delta for delta in (influence_delta(lab[i]) for i in steering) if delta is not None]
+        divergence_rows: list[dict[str, Any]] = []
+        for i in steering:
+            row = lab[i]
+            delta = influence_delta(row)
+            if delta is None or abs(delta) <= LAB_INFLUENCE_EPSILON:
+                continue
+            divergence_rows.append({'line': fs[i]['_line'], 'serial': fs[i].get('prepared_serial'), 'time_s': times[i], 'profile': profile_name(fs[i], rec), 'offhand_influence_requested': row.get('offhand_influence_requested'), 'effective_influence': row.get('effective_influence'), 'effective_minus_requested': delta, 'anchor_requested': row.get('anchor_requested'), 'anchor_resolved': row.get('anchor_resolved'), 'anchor_fallback': row.get('anchor_fallback'), 'agreement_mode': row.get('agreement_mode'), 'agreement': row.get('agreement'), 'agreement_confidence': row.get('agreement_confidence'), 'temporal_mode': row.get('temporal_mode'), 'temporal_active': row.get('temporal_active'), 'temporal_error_deg': row.get('temporal_error_deg')})
+        lab_summary = {'frames_with_family': sum(1 for row in lab if row is not None), 'steering_frames': len(steering), 'requested_vs_effective_divergence_frames': len(divergence_rows), 'effective_minus_requested': stats(deltas), 'frames': divergence_rows[:PG_EPISODE_ROW_CAP], 'frames_omitted': max(0, len(divergence_rows) - PG_EPISODE_ROW_CAP)}
+
+    smoothing_summary = None
+    if smoothing_recorded:
+        family_rows = [row for row in smooth if row is not None]
+        applied_indexes = [i for i, row in enumerate(smooth) if row is not None and row['applied'] is True]
+        strength_values = [row['strength'] for row in family_rows if row['strength'] is not None]
+        offhand_values = [row['offhand_influence'] for row in family_rows if row['offhand_influence'] is not None]
+
+        def family_flag_count(key: str, value: bool) -> int:
+            return sum(1 for row in family_rows if row[key] is value)
+
+        def applied_stats(key: str) -> dict[str, Any] | None:
+            return stats([smooth[i][key] for i in applied_indexes if smooth[i][key] is not None])
+
+        latch_pairs: collections.Counter = collections.Counter()
+        latch_partial_frames = 0
+        for i, row in enumerate(smooth):
+            if row is None:
+                continue
+            latched = _bool_or_none(effective_of(i).get('two_hand_latched'))
+            if row['transition_active'] is None or latched is None:
+                latch_partial_frames += 1
+                continue
+            latch_pairs[(row['transition_active'], latched)] += 1
+
+        pg_applied = [pg[i] for i in applied_indexes]
+        lab_applied = [lab[i] for i in applied_indexes]
+        lab_enabled_applied = [lab[i] for i in applied_indexes if lab[i] is not None and lab[i].get('lab_enabled')]
+
+        def pg_flag_counts(rows: list[dict[str, Any] | None], key: str) -> dict[str, int]:
+            return {'true': sum(1 for row in rows if row is not None and row[key] is True), 'false': sum(1 for row in rows if row is not None and row[key] is False), 'absent': sum(1 for row in rows if row is None or row[key] is None)}
+
+        presented_frames = [fs[i] for i in applied_indexes]
+
+        def presented_flag_counts(key: str) -> dict[str, int]:
+            values = [_bool_or_none(f.get(key)) for f in presented_frames]
+            return {'true': sum(1 for value in values if value is True), 'false': sum(1 for value in values if value is False), 'absent': sum(1 for value in values if value is None)}
+
+        reticle_deltas: collections.Counter = collections.Counter()
+        for f in presented_frames:
+            prepared = _int_or_none(f.get('prepared_serial'))
+            reticle = _int_or_none(f.get('reticle_presented_serial'))
+            if prepared is None or reticle is None:
+                continue
+            reticle_deltas[prepared - reticle] += 1
+
+        smoothing_summary = {
+            'frames_total': len(fs),
+            'frames_with_family': len(family_rows),
+            'transition_configured_true_frames': family_flag_count('transition_configured', True),
+            'transition_active_true_frames': family_flag_count('transition_active', True),
+            'configured_true_frames': family_flag_count('configured', True),
+            'applied_true_frames': len(applied_indexes),
+            'strength_recorded_frames': len(strength_values),
+            'mix_recorded_frames': sum(1 for row in family_rows if row['mix'] is not None),
+            'strength_mix_recorded': bool(strength_values),
+            'offhand_influence_recorded_frames': len(offhand_values),
+            'offhand_influence': stats(offhand_values),
+            'applied': {
+                'frames': len(applied_indexes),
+                'strength': applied_stats('strength'),
+                'mix': applied_stats('mix'),
+                'alpha': applied_stats('alpha'),
+                'primary_orientation_error_deg': applied_stats('primary_orientation_error_deg'),
+                'primary_position_error_m': applied_stats('primary_position_error_m'),
+                'support_position_error_m': applied_stats('support_position_error_m'),
+            },
+            'latch_coincidence': {
+                'frames_compared': sum(latch_pairs.values()),
+                'pairs': {'transition_active_true_latched_true': latch_pairs[(True, True)], 'transition_active_true_latched_false': latch_pairs[(True, False)], 'transition_active_false_latched_true': latch_pairs[(False, True)], 'transition_active_false_latched_false': latch_pairs[(False, False)]},
+                'frames_with_either_absent': latch_partial_frames,
+            },
+            'pg_context_on_applied': {'frames': len(applied_indexes), 'pg_family_frames': sum(1 for row in pg_applied if row is not None), 'engaged': pg_flag_counts(pg_applied, 'engaged'), 'trusted': pg_flag_counts(pg_applied, 'trusted'), 'configured': pg_flag_counts(pg_applied, 'configured')},
+            'lab_context_on_applied': {'frames': len(applied_indexes), 'lab_family_frames': sum(1 for row in lab_applied if row is not None), 'lab_enabled_true': len(lab_enabled_applied), 'effective_influence': stats([row.get('effective_influence') for row in lab_enabled_applied if row.get('effective_influence') is not None]), 'offhand_influence_requested': stats([row.get('offhand_influence_requested') for row in lab_enabled_applied if row.get('offhand_influence_requested') is not None])},
+            'presented_context_on_applied': {'frames': len(applied_indexes), 'recorded': any('presented_aim_valid' in f or 'reticle_presented_valid' in f or 'reticle_presented_serial' in f for f in presented_frames), 'presented_aim_valid': presented_flag_counts('presented_aim_valid'), 'reticle_presented_valid': presented_flag_counts('reticle_presented_valid'), 'prepared_minus_reticle_presented_serial': {'frames_compared': sum(reticle_deltas.values()), 'delta_values': {str(delta): reticle_deltas[delta] for delta in sorted(reticle_deltas)}, 'delta_zero_frames': reticle_deltas.get(0, 0), 'delta_positive_frames': sum(count for delta, count in reticle_deltas.items() if delta > 0), 'delta_negative_frames': sum(count for delta, count in reticle_deltas.items() if delta < 0)}},
+        }
+
+    solve_serial_lag = None
+    if recorded:
+        lag_values = []
+        for i, row in enumerate(pg):
+            if row is None or row['solve_serial'] is None:
+                continue
+            prepared = _int_or_none(fs[i].get('prepared_serial'))
+            if prepared is None:
+                continue
+            lag_values.append(prepared - row['solve_serial'])
+        lag_counter = collections.Counter(lag_values)
+        solve_serial_lag = {'frames_compared': len(lag_values), 'delta_values': {str(key): lag_counter[key] for key in sorted(lag_counter)}, 'min_delta': min(lag_values) if lag_values else None, 'max_delta': max(lag_values) if lag_values else None, 'frames_with_delta_zero': lag_counter.get(0, 0), 'frames_ahead_of_prepared_serial': sum(1 for delta in lag_values if delta < 0)}
+
+    events: list[dict[str, Any]] = []
+    for a, b in agreement_index_runs:
+        for index, kind in ((a, 'a_dot_b_below_floor_begin'), (b, 'a_dot_b_below_floor_end')):
+            row = base(index, kind)
+            row.update({'a_dot_b': fnum(trace_of(index).get('a_dot_b')), 'b_accepted': _bool_or_none(trace_of(index).get('b_accepted')), 'b_extreme_rejected': _bool_or_none(trace_of(index).get('b_extreme_rejected')), 'b_rejected_agreement': fnum(trace_of(index).get('b_rejected_agreement')), 'b_steering_retained': _bool_or_none(trace_of(index).get('b_steering_retained')), 'pg': pg_detail(pg[index]), 'lab': lab_detail(index)})
+            events.append(row)
+    for a, b in steering_index_runs:
+        for index, kind in ((a, 'b_steering_retained_begin'), (b, 'b_steering_retained_end')):
+            row = base(index, kind)
+            row.update({'a_dot_b': fnum(trace_of(index).get('a_dot_b')), 'b_accepted': _bool_or_none(trace_of(index).get('b_accepted')), 'pg': pg_detail(pg[index]), 'lab': lab_detail(index)})
+            events.append(row)
+    if recorded:
+        events.extend(relationship_transitions)
+        events.extend(epoch_changes)
+        events.extend(trust_loss_transitions)
+        events.extend(two_hand_to_one_hand)
+        for a, b in force_index_runs:
+            for index, kind in ((a, 'force_one_hand_begin'), (b, 'force_one_hand_end')):
+                row = base(index, kind)
+                row.update({'pg': pg_detail(pg[index]), 'lab': lab_detail(index)})
+                events.append(row)
+    events.sort(key=lambda row: (row['line'], row['kind']))
+
+    semantics = {
+        'family_scope': 'frozen solve-time persistent-grip provenance of the frame own canonical assembly; never a live re-read of persistent-grip state',
+        'epoch_scope': 'support_epoch is process-local; it is compared only between adjacent frames of this capture, never across sessions or captures',
+        'epoch_sentinel': '18446744073709551615 means the relationship could not be read; epoch 0 means it was readable and coherently disengaged, and an unreadable relationship is not a disengaged one',
+        'trust': 'support_solve_trusted is the qualification permission of that invocation; whether the solve consumed support geometry is a separate, unrecorded narrowing',
+        'forcing': 'support_force_one_hand is explicit persistent-grip forcing of this invocation, distinct from an ordinary two_hand_enabled false which conflates config-off, dual presentation and forcing',
+        'serial_lag': 'support_solve_serial is the stamped solve serial; the observed prepared_serial delta is reported and equality is never asserted',
+        'agreement_floor': 'aim_trace.a_dot_b is the recorded A.B agreement; the floor is the legacy 0.35 threshold disclosed as a parameter',
+        'lab_scope': 'two_hand_lab_* values are reported only while two_hand_lab_enabled is true, because the Lab does not steer the canonical solve otherwise',
+        'latched_versus_relationship': 'effective_settings.two_hand_latched and canonical_aim.two_hand_active are a different layer from the durable persistent-grip relationship and are reported as context only',
+        'episode_shape': 'episodes are maximal runs or adjacent-frame edges over the recorded flags; the structured query lists are never capped, the human-readable tables cap at the disclosed row_cap',
+        'smoothing_scope': 'the two_hand_transition_* / two_hand_smoothing_* family is the frozen transition/input smoothing state of that prepared serial; absence of the family, or of strength/mix inside it, is not recorded and is never coerced to false/zero',
+        'smoothing_strength': 'two_hand_smoothing_strength is the user amount 0..25 (0 = raw/off, 25 = the full fixed speed-25 input filter) frozen for this prepared serial, never a live re-read of the config slider',
+        'smoothing_mix': 'two_hand_smoothing_mix is strength/25: the applied wet/dry amount, never a filter speed',
+        'smoothing_alpha': 'two_hand_smoothing_alpha is the filter internal clamp(25*dt, 0, 1) temporal coefficient and is never the user amount',
+        'smoothing_applied': 'two_hand_smoothing_applied means the eligible free two-hand path of this prepared frame consumed the frozen strength; two_hand_smoothing_configured is strength > 0',
+        'smoothing_errors': 'the two_hand_smoothing_*_error_* values are raw-to-full-filtered input differences in degrees / OpenXR local metres, never solver or presented-aim errors',
+        'offhand_influence': 'two_hand_offhand_influence is the free two-hand (VS-OFF) product offhand directional authority 0..1 frozen for this prepared serial from the frame own assembly (non-finite reads 0, otherwise clamped exactly as the solver consumes it), never a live re-read of the config slider; Virtual Stock solves never read it and a Lab-active solve uses its own two_hand_lab_offhand_influence, and absence of the key in older captures is not a zero authority',
+        'smoothing_latch_coincidence': 'two_hand_transition_smoothing_configured / two_hand_transition_active are the product 200 ms latch-continuity pair: the continuity is fixed-on internal behaviour with no user toggle, while two_hand_transition_smoothing_configured reports the effective truth for the frame (the retired two_hand_transition_smoothing key no longer resolves); the same-frame pair counts against effective_settings.two_hand_latched are descriptive coincidence counts only',
+        'smoothing_presented_lag': 'presented_aim_valid and reticle_presented_valid/reticle_presented_serial belong to the normally lagged present/reticle assembly; the serial difference is reported as frame counts on applied frames and equality is never asserted',
+    }
+    return {
+        'method': 'persistent_grip_lab_episodes',
+        'classification': 'deterministic_derivation',
+        'recorded': recorded,
+        'lab_recorded': lab_recorded,
+        'smoothing_recorded': smoothing_recorded,
+        'parameters': {
+            'a_dot_b_agreement_floor': floor,
+            'lab_influence_epsilon': LAB_INFLUENCE_EPSILON,
+            'row_cap': PG_EPISODE_ROW_CAP,
+        },
+        'counts': counts,
+        'relationship_transitions': relationship_transitions,
+        'epoch_changes': epoch_changes,
+        'trust_loss_transitions': trust_loss_transitions,
+        'force_one_hand_runs': force_one_hand_runs,
+        'two_hand_to_one_hand_while_engaged': two_hand_to_one_hand,
+        'agreement_below_floor_runs': agreement_below_floor_runs,
+        'b_steering_retained_runs': b_steering_retained_runs,
+        'lab': lab_summary,
+        'smoothing': smoothing_summary,
+        'support_solve_serial_lag': solve_serial_lag,
+        'events': events,
+        'semantics': semantics,
+        'non_claims': list(PG_LAB_NON_CLAIMS),
+    }
+
+
+def persistent_grip_lab_markdown(p: dict[str, Any]) -> list[str]:
+    out = ['', '## Persistent grip (PG) \u00d7 Two-Hand Lab indexed episodes', '', 'Deterministic index over recorded frozen persistent-grip solve-time provenance and the existing agreement/steering fields around it. Episodes are line/serial/time indexes, not verdicts.', '']
+    for note in p['non_claims']:
+        out.append(f'- {note}')
+    out.append('')
+    if not p['recorded']:
+        out.append('The persistent-grip family is **not recorded** in this capture: the family keys are absent, which is neither false nor zero, so the PG relationship/epoch/trust/forcing lists below are empty for that reason.')
+        out.append('')
+    else:
+        c = p['counts']
+        epoch_text = ', '.join(f"`{row['epoch']}`" + (' (unreadable sentinel)' if row['sentinel'] else '') + ' x' + str(row['frames']) for row in c['epoch_values_observed']) or 'none'
+        out += [f"Frames with the family: **{c['frames_with_family']}** of {c['frames_total']}. True counts: configured **{c['configured_true']}**, applicable **{c['applicable_true']}**, readable **{c['readable_true']}**, engaged **{c['engaged_true']}**, trusted **{c['trusted_true']}**, force-one-hand **{c['force_one_hand_true']}**.", '', f"Epoch 0 (readable, coherently disengaged) frames: **{c['epoch_zero_frames']}**; unreadable all-ones sentinel frames: **{c['epoch_unreadable_sentinel_frames']}**; epochs observed in this capture: {epoch_text}.", '']
+        lag = p['support_solve_serial_lag']
+        if lag is not None:
+            deltas = ', '.join(f"{key}:{value}" for key, value in sorted(lag['delta_values'].items(), key=lambda item: int(item[0])))
+            out += [f"`prepared_serial` \u2212 `support_solve_serial`: frames compared **{lag['frames_compared']}**; delta frame counts `{deltas or 'none'}`; delta 0 **{lag['frames_with_delta_zero']}**; serial ahead of prepared_serial **{lag['frames_ahead_of_prepared_serial']}**. The two serials are never asserted equal.", '']
+        out += [f"Relationship edges (`support_relationship_readable`/`engaged` changes): **{len(p['relationship_transitions'])}**.", '']
+        if p['relationship_transitions']:
+            out += ['| Kind | Line | Time | Profile | Readable | Engaged | Epoch | Trusted | Force |', '|---|---:|---:|---|---|---|---:|---|---|']
+            for row in p['relationship_transitions'][:PG_EPISODE_ROW_CAP]:
+                a, b = row['from'], row['to']
+                out.append(f"| `{row['kind']}` | {row['line']} | {fmt(row['time_s'])} | `{row['profile']}` | {fmt(a['readable'])}\u2192{fmt(b['readable'])} | {fmt(a['engaged'])}\u2192{fmt(b['engaged'])} | {fmt(a['epoch'])}\u2192{fmt(b['epoch'])} | {fmt(a['trusted'])}\u2192{fmt(b['trusted'])} | {fmt(a['force_one_hand'])}\u2192{fmt(b['force_one_hand'])} |")
+            if len(p['relationship_transitions']) > PG_EPISODE_ROW_CAP:
+                out.append(f"_{len(p['relationship_transitions']) - PG_EPISODE_ROW_CAP} further edge rows omitted from this table._")
+        out += ['', f"Epoch changes (adjacent frames, same capture): **{len(p['epoch_changes'])}**.", '']
+        for row in p['epoch_changes'][:PG_EPISODE_ROW_CAP]:
+            out.append(f"- line {row['line']} ({fmt(row['time_s'])} s, `{row['profile']}`): epoch `{row['from_epoch']}` \u2192 `{row['to_epoch']}`" + (' (unreadable sentinel entered)' if row['to_unreadable_sentinel'] else '') + (' (unreadable sentinel left)' if row['from_unreadable_sentinel'] else '') + f"; engaged {fmt(row['engaged_before'])}\u2192{fmt(row['engaged_after'])}.")
+        out += ['', f"Trusted \u2192 untrusted solve transitions: **{len(p['trust_loss_transitions'])}**; of those still engaged on the transition frame: **{sum(1 for row in p['trust_loss_transitions'] if row['engaged_after'] is True)}**.", '']
+        for row in p['trust_loss_transitions'][:PG_EPISODE_ROW_CAP]:
+            out.append(f"- line {row['line']} ({fmt(row['time_s'])} s, `{row['profile']}`): engaged {fmt(row['engaged_before'])}\u2192{fmt(row['engaged_after'])}, epoch `{fmt(row['epoch_before'])}`\u2192`{fmt(row['epoch_after'])}`, force-one-hand after {fmt(row['force_one_hand_after'])}.")
+        out += ['', f"Two-hand \u2192 one-hand transitions while the durable relationship remained engaged: **{len(p['two_hand_to_one_hand_while_engaged'])}** (the latch is context, not the relationship).", '']
+        for row in p['two_hand_to_one_hand_while_engaged'][:PG_EPISODE_ROW_CAP]:
+            out.append(f"- line {row['line']} ({fmt(row['time_s'])} s, `{row['profile']}`): `canonical_aim.two_hand_active` true\u2192false, engaged {fmt(row['engaged_after'])}, trusted {fmt(row['trusted_after'])}, force-one-hand {fmt(row['force_one_hand_after'])}, `two_hand_latched` {fmt(row['two_hand_latched_before'])}\u2192{fmt(row['two_hand_latched_after'])}.")
+        out += ['', f"Explicit persistent-grip force-one-hand runs: **{len(p['force_one_hand_runs'])}**.", '']
+        if p['force_one_hand_runs']:
+            out += ['| Lines | Time | Frames | Profile | Trusted frames | Engaged frames | Epochs |', '|---|---:|---:|---|---:|---:|---|']
+            for row in p['force_one_hand_runs'][:PG_EPISODE_ROW_CAP]:
+                out.append(f"| {row['start_line']}\u2013{row['end_line']} | {fmt(row['start_time_s'])}\u2013{fmt(row['end_time_s'])} | {row['frames']} | `{row['profile']}` | {row['trusted_frames']} | {row['engaged_frames']} | {', '.join('`' + str(epoch) + '`' for epoch in row['epochs']) or '-'} |")
+    out += ['', f"`aim_trace.a_dot_b` below **{p['parameters']['a_dot_b_agreement_floor']:.3f}** runs: **{len(p['agreement_below_floor_runs'])}** (frames without a finite `a_dot_b` stay missing and are never coerced to zero).", '']
+    if p['agreement_below_floor_runs']:
+        out += ['| Lines | Time | Frames | Profile | A.B | B accepted | B extreme rejected | B rejected agreement | Steering retained frames | Engaged frames |', '|---|---:|---:|---|---|---:|---:|---|---:|---:|']
+        for row in p['agreement_below_floor_runs'][:PG_EPISODE_ROW_CAP]:
+            out.append(f"| {row['start_line']}\u2013{row['end_line']} | {fmt(row['start_time_s'])}\u2013{fmt(row['end_time_s'])} | {row['frames']} | `{row['profile']}` | {fmt_stats(row['a_dot_b'])} | {row['b_accepted_frames']} | {row['b_extreme_rejected_frames']} | {fmt_stats(row['b_rejected_agreement'])} | {row['b_steering_retained_frames']} | {fmt(row['engaged_frames'])} |")
+    out += ['', f"`aim_trace.b_steering_retained` true runs: **{len(p['b_steering_retained_runs'])}**.", '']
+    if p['b_steering_retained_runs']:
+        out += ['| Lines | Time | Frames | Profile | A.B | B accepted | Engaged frames |', '|---|---:|---:|---|---|---:|---:|']
+        for row in p['b_steering_retained_runs'][:PG_EPISODE_ROW_CAP]:
+            out.append(f"| {row['start_line']}\u2013{row['end_line']} | {fmt(row['start_time_s'])}\u2013{fmt(row['end_time_s'])} | {row['frames']} | `{row['profile']}` | {fmt_stats(row['a_dot_b'])} | {row['b_accepted_frames']} | {fmt(row['engaged_frames'])} |")
+    lab = p['lab']
+    out += ['']
+    if lab is None:
+        out.append('The Two-Hand Lab family is **not recorded** in this capture: the Lab keys are absent, which is neither false nor zero, so no requested-versus-effective influence comparison is available.')
+    else:
+        epsilon = p['parameters']['lab_influence_epsilon']
+        out += [f"Two-Hand Lab: **{lab['steering_frames']}** frames with `two_hand_lab_enabled` true (only those carry meaningful Lab values; `{lab['frames_with_family']}` frames carry the family); **{lab['requested_vs_effective_divergence_frames']}** steering frames have an effective influence different from the requested influence (epsilon {epsilon:g}).", '', f"effective \u2212 requested influence on steering frames: {fmt_stats(lab['effective_minus_requested'])}", '']
+        if lab['frames']:
+            out += ['| Line | Time | Profile | Requested | Effective | Effective − requested | Anchor req/res (fallback) | Agreement mode/value/confidence | Temporal mode/active/error |', '|---:|---:|---|---:|---:|---:|---|---|---|']
+            for row in lab['frames']:
+                out.append(f"| {row['line']} | {fmt(row['time_s'])} | `{row['profile']}` | {fmt(row['offhand_influence_requested'])} | {fmt(row['effective_influence'])} | {fmt(row['effective_minus_requested'])} | {row['anchor_requested']}/{row['anchor_resolved']} ({row['anchor_fallback']}) | {row['agreement_mode']} / {fmt(row['agreement'])} / {fmt(row['agreement_confidence'])} | {row['temporal_mode']} / {fmt(row['temporal_active'])} / {fmt(row['temporal_error_deg'])} |")
+            if lab['frames_omitted']:
+                out.append(f"_{lab['frames_omitted']} further divergence rows omitted from this table._")
+    smooth = p['smoothing']
+    out += ['', '## Two-Hand transition/input smoothing values', '']
+    if smooth is None:
+        out.append('The Two-Hand transition/input smoothing family is **not recorded** in this capture: `two_hand_transition_smoothing_configured` and the rest of the family keys are absent, which is neither false nor zero, so no smoothing counts or distributions are available.')
+    else:
+        applied = smooth['applied']
+        out += [f"Frames with the family: **{smooth['frames_with_family']}** of {smooth['frames_total']}. True counts: `two_hand_transition_smoothing_configured` **{smooth['transition_configured_true_frames']}**, `two_hand_transition_active` **{smooth['transition_active_true_frames']}**, `two_hand_smoothing_configured` **{smooth['configured_true_frames']}**, `two_hand_smoothing_applied` **{smooth['applied_true_frames']}**.", '', f"Smoothing-applied frames: **{applied['frames']}**.", '']
+        if smooth['strength_mix_recorded']:
+            out += [f"`two_hand_smoothing_strength` (the user amount 0..25, frozen for that prepared serial) is recorded on **{smooth['strength_recorded_frames']}** family frames; on the applied frames it reads {fmt_stats(applied['strength'])}.", f"`two_hand_smoothing_mix` (= strength/25; the applied wet/dry amount, never a filter speed) on the applied frames: {fmt_stats(applied['mix'])}.", '']
+        else:
+            out += ['`two_hand_smoothing_strength` and `two_hand_smoothing_mix` are **not recorded** in this capture: the family is present but was written by the boolean-era recorder that carries only the booleans, `two_hand_smoothing_alpha` and the error inputs, so there is no strength or mix distribution and absence is not a zero strength.', '']
+        if smooth['offhand_influence_recorded_frames']:
+            out += [f"`two_hand_offhand_influence` (the free two-hand product offhand directional authority 0..1, frozen for that prepared serial from the frame's own assembly; Virtual Stock solves never read it) is recorded on **{smooth['offhand_influence_recorded_frames']}** family frames: {fmt_stats(smooth['offhand_influence'])}.", '']
+        else:
+            out += ['`two_hand_offhand_influence` is **not recorded** in this capture (written before the field existed); absence is not a zero authority.', '']
+        out += [f"`two_hand_smoothing_alpha` on the applied frames (the filter internal clamp(25*dt, 0, 1) temporal coefficient, never the user amount): {fmt_stats(applied['alpha'])}.", '', f"Raw-to-full-filtered input differences on the applied frames (degrees / OpenXR local metres; never solver or presented-aim errors): primary orientation {fmt_stats(applied['primary_orientation_error_deg'])}; primary position {fmt_stats(applied['primary_position_error_m'])}; support position {fmt_stats(applied['support_position_error_m'])}.", '']
+        latch = smooth['latch_coincidence']
+        pairs = latch['pairs']
+        out += [f"Same-frame `two_hand_transition_active` versus `effective_settings.two_hand_latched` pairs where both are recorded: (true,true) **{pairs['transition_active_true_latched_true']}**, (true,false) **{pairs['transition_active_true_latched_false']}**, (false,true) **{pairs['transition_active_false_latched_true']}**, (false,false) **{pairs['transition_active_false_latched_false']}**; frames with either field absent **{latch['frames_with_either_absent']}**. These are coincidence counts, not a continuity verdict.", '']
+        pgc = smooth['pg_context_on_applied']
+        labc = smooth['lab_context_on_applied']
+        out += [f"Context on the applied frames: persistent-grip family present **{pgc['pg_family_frames']}** of {pgc['frames']} (engaged true/false/absent {pgc['engaged']['true']}/{pgc['engaged']['false']}/{pgc['engaged']['absent']}, trusted {pgc['trusted']['true']}/{pgc['trusted']['false']}/{pgc['trusted']['absent']}); Two-Hand Lab family present **{labc['lab_family_frames']}** with `two_hand_lab_enabled` true **{labc['lab_enabled_true']}**, effective influence {fmt_stats(labc['effective_influence'])} on those enabled frames.", '']
+        presc = smooth['presented_context_on_applied']
+        delta = presc['prepared_minus_reticle_presented_serial']
+        deltas = ', '.join(f"{key}:{value}" for key, value in sorted(delta['delta_values'].items(), key=lambda item: int(item[0]))) or 'none'
+        if presc['recorded']:
+            out += [f"Present/reticle context on the applied frames: `presented_aim_valid` true/false/absent {presc['presented_aim_valid']['true']}/{presc['presented_aim_valid']['false']}/{presc['presented_aim_valid']['absent']}; `reticle_presented_valid` {presc['reticle_presented_valid']['true']}/{presc['reticle_presented_valid']['false']}/{presc['reticle_presented_valid']['absent']}; `prepared_serial` \u2212 `reticle_presented_serial` frame counts `{deltas}` over {delta['frames_compared']} compared frames. The two serials are never asserted equal.", '']
+        else:
+            out += ['The present/reticle fields (`presented_aim_valid`, `reticle_presented_valid`, `reticle_presented_serial`) are **not recorded** on the applied frames of this capture, so no present/reticle lag context is available.', '']
+    out += ['', f"Merged event index: **{len(p['events'])}** indexed episodes (query `pg-lab-events`). Epochs are never compared across captures, so multi-capture consolidation deliberately carries no PG/Lab episode table.", '']
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -2353,11 +2818,469 @@ def run_v52_provenance_self_test() -> int:
     return 0
 
 
+def run_persistent_grip_lab_self_test() -> int:
+    passed: list[str] = []
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        mapping = [{'id': 0, 'name': 'Custom', 'role': 'custom',
+            'uses_custom_settings': True}]
+
+        def pg_frame(serial: int, **fields: Any) -> dict[str, Any]:
+            frame = _fixture_frame(serial, 0, 'Custom')
+            frame['schema_version'] = 2
+            frame.update({'persistent_support_grip_configured': True,
+                'persistent_support_grip_applicable': True,
+                'support_relationship_readable': True,
+                'support_relationship_engaged': False,
+                'support_epoch': 0, 'support_solve_trusted': False,
+                'support_force_one_hand': False,
+                'support_solve_serial': serial - 1})
+            frame.update(fields)
+            return frame
+
+        def write_recording(path: Path,
+            frames: list[dict[str, Any]]) -> ParsedRecording:
+            rows: list[Any] = [_fixture_session(2, mapping)] + frames + [{
+                'type': 'session_end', 'schema_version': 2,
+                'clean_stop': True, 'producer_calls': len(frames),
+                'duplicate_serial_suppressed': 0, 'enqueued': len(frames),
+                'written': len(frames), 'dropped_queue_full': 0}]
+            path.write_text('\n'.join(
+                json.dumps(row, sort_keys=True) for row in rows) + '\n',
+                encoding='utf-8')
+            return parse_jsonl(path)
+
+        lab_enabled = {'two_hand_lab_enabled': True,
+            'two_hand_lab_anchor_fallback': 0}
+        f1 = pg_frame(1)
+        f2 = pg_frame(2, support_relationship_engaged=True, support_epoch=7,
+            support_solve_trusted=True)
+        f3 = pg_frame(3, support_relationship_engaged=True, support_epoch=9,
+            support_solve_trusted=True)
+        f4 = pg_frame(4, support_relationship_engaged=True, support_epoch=9)
+        f5 = pg_frame(5, support_relationship_engaged=True, support_epoch=9,
+            support_force_one_hand=True)
+        f6 = pg_frame(6, support_relationship_engaged=True, support_epoch=9,
+            **lab_enabled, two_hand_lab_offhand_influence=0.6,
+            two_hand_lab_effective_influence=0.45,
+            two_hand_lab_anchor_requested=1, two_hand_lab_anchor_resolved=1,
+            two_hand_lab_agreement_mode=1, two_hand_lab_agreement=0.9,
+            two_hand_lab_agreement_confidence=0.8,
+            two_hand_lab_temporal_mode=1, two_hand_lab_temporal_active=True,
+            two_hand_lab_temporal_error_deg=1.5)
+        f6['aim_trace'].update({'a_dot_b': 0.2, 'b_accepted': False,
+            'b_extreme_rejected': False, 'b_rejected_agreement': 0.2,
+            'b_steering_retained': True})
+        f7 = pg_frame(7, support_relationship_engaged=True, support_epoch=9,
+            **lab_enabled, two_hand_lab_offhand_influence=0.35,
+            two_hand_lab_effective_influence=0.35,
+            two_hand_lab_anchor_requested=2, two_hand_lab_anchor_resolved=2,
+            two_hand_lab_agreement_mode=0, two_hand_lab_agreement=0.5,
+            two_hand_lab_agreement_confidence=1.0,
+            two_hand_lab_temporal_mode=0, two_hand_lab_temporal_active=False,
+            two_hand_lab_temporal_error_deg=0.0)
+        f7['aim_trace'].update({'a_dot_b': 0.1, 'b_accepted': False,
+            'b_extreme_rejected': False, 'b_rejected_agreement': 0.1,
+            'b_steering_retained': False})
+        f7['canonical_aim']['two_hand_active'] = False
+        f8 = pg_frame(8, support_relationship_engaged=False, support_epoch=0)
+        f9 = pg_frame(9, support_relationship_readable=False,
+            support_relationship_engaged=False,
+            support_epoch=SUPPORT_EPOCH_UNKNOWN,
+            support_force_one_hand=True)
+
+        src = root / 'persistent-grip-lab.jsonl'
+        rec = write_recording(src,
+            [f1, f2, f3, f4, f5, f6, f7, f8, f9])
+        args = _fixture_cli_args(str(src))
+        p = persistent_grip_lab_analysis(rec, frame_times(rec), args)
+        assert p['recorded'] is True and p['lab_recorded'] is True
+        passed.append('persistent-grip and Two-Hand Lab families detected')
+
+        c = p['counts']
+        assert c['frames_with_family'] == 9 and c['readable_true'] == 8
+        assert c['engaged_true'] == 6 and c['trusted_true'] == 2
+        assert c['force_one_hand_true'] == 2 and c['configured_true'] == 9
+        assert c['epoch_zero_frames'] == 2
+        assert c['epoch_unreadable_sentinel_frames'] == 1
+        passed.append('family true-counts and epoch sentinel accounting')
+
+        assert [row['kind'] for row in p['relationship_transitions']] == [
+            'relationship_acquire', 'relationship_release',
+            'relationship_readability_change']
+        acquire = p['relationship_transitions'][0]
+        assert acquire['line'] == 3
+        assert acquire['from']['engaged'] is False
+        assert acquire['to']['engaged'] is True
+        release = p['relationship_transitions'][1]
+        assert release['line'] == 9 and release['to']['engaged'] is False
+        passed.append('relationship acquire/release/readability edges')
+
+        epoch_rows = p['epoch_changes']
+        assert [row['line'] for row in epoch_rows] == [3, 4, 9, 10]
+        assert (epoch_rows[0]['from_epoch'], epoch_rows[0]['to_epoch']) == (0, 7)
+        assert (epoch_rows[1]['from_epoch'], epoch_rows[1]['to_epoch']) == (7, 9)
+        assert (epoch_rows[2]['from_epoch'], epoch_rows[2]['to_epoch']) == (9, 0)
+        assert (epoch_rows[3]['from_epoch'], epoch_rows[3]['to_epoch']) == (
+            0, SUPPORT_EPOCH_UNKNOWN)
+        assert epoch_rows[3]['to_unreadable_sentinel'] is True
+        assert epoch_rows[3]['from_unreadable_sentinel'] is False
+        assert all(row['from_unreadable_sentinel'] is False
+            for row in epoch_rows[:3])
+        passed.append('epoch change and all-ones unreadable sentinel transitions')
+
+        assert len(p['trust_loss_transitions']) == 1
+        trust = p['trust_loss_transitions'][0]
+        assert trust['line'] == 5 and trust['engaged_after'] is True
+        assert trust['epoch_after'] == 9
+        passed.append('engaged to untrusted solve transition')
+
+        assert [row['start_line'] for row in p['force_one_hand_runs']] == [6, 10]
+        assert p['force_one_hand_runs'][0]['frames'] == 1
+        assert p['force_one_hand_runs'][0]['engaged_frames'] == 1
+        passed.append('explicit forced one-hand runs')
+
+        assert len(p['agreement_below_floor_runs']) == 1
+        run = p['agreement_below_floor_runs'][0]
+        assert (run['start_line'], run['end_line'], run['frames']) == (7, 8, 2)
+        assert run['a_dot_b']['n'] == 2
+        assert abs(run['a_dot_b']['min'] - 0.1) < 1e-12
+        assert run['b_accepted_frames'] == 0
+        assert run['b_extreme_rejected_frames'] == 0
+        assert run['b_steering_retained_frames'] == 1
+        assert run['b_rejected_agreement']['n'] == 2
+        assert len(p['b_steering_retained_runs']) == 1
+        assert p['b_steering_retained_runs'][0]['start_line'] == 7
+        passed.append('a_dot_b below floor runs with B context and retained steering')
+
+        assert len(p['two_hand_to_one_hand_while_engaged']) == 1
+        two = p['two_hand_to_one_hand_while_engaged'][0]
+        assert two['line'] == 8 and two['engaged_after'] is True
+        assert two['two_hand_latched_before'] is True
+        assert two['two_hand_latched_after'] is True
+        passed.append('two-hand to one-hand while engaged; latch stays context')
+
+        lab = p['lab']
+        assert lab['steering_frames'] == 2
+        assert lab['requested_vs_effective_divergence_frames'] == 1
+        assert lab['frames'][0]['line'] == 7
+        assert abs(lab['frames'][0]['effective_minus_requested'] + 0.15) < 1e-09
+        assert lab['frames'][0]['anchor_requested'] == 1
+        assert abs(lab['frames'][0]['agreement'] - 0.9) < 1e-12
+        assert lab['frames'][0]['temporal_active'] is True
+        assert lab['effective_minus_requested']['n'] == 2
+        passed.append('Lab requested versus effective influence around the event')
+
+        lag = p['support_solve_serial_lag']
+        assert lag['delta_values'] == {'1': 9}
+        assert lag['frames_with_delta_zero'] == 0
+        passed.append('prepared_serial minus support_solve_serial lag distribution')
+
+        event_kinds = [row['kind'] for row in p['events']]
+        for kind in ('relationship_acquire', 'relationship_release',
+                'relationship_readability_change', 'epoch_change', 'trust_loss',
+                'two_hand_to_one_hand_while_engaged', 'force_one_hand_begin',
+                'force_one_hand_end', 'a_dot_b_below_floor_begin',
+                'a_dot_b_below_floor_end', 'b_steering_retained_begin',
+                'b_steering_retained_end'):
+            assert kind in event_kinds, kind
+        lines = [row['line'] for row in p['events']]
+        assert lines == sorted(lines)
+        below_begin = next(row for row in p['events']
+            if row['kind'] == 'a_dot_b_below_floor_begin')
+        assert below_begin['lab'] is not None
+        assert abs(below_begin['lab']['effective_influence'] - 0.45) < 1e-12
+        assert below_begin['pg']['engaged'] is True
+        assert below_begin['b_steering_retained'] is True
+        passed.append('merged event index carries per-frame PG and Lab context')
+
+        def markdown_section(text: str, heading: str) -> str:
+            start = text.index(heading)
+            end = text.find('\n## ', start + 1)
+            return text[start:end if end != -1 else len(text)]
+
+        markdown = '\n'.join(persistent_grip_lab_markdown(p))
+        assert 'never verdicts' in markdown and 'a_dot_b' in markdown
+        assert 'support_solve_serial' in markdown
+        assert 'not recorded' not in markdown_section(markdown,
+            '## Persistent grip (PG) \u00d7 Two-Hand Lab indexed episodes')
+        assert p['smoothing_recorded'] is False and p['smoothing'] is None
+        assert 'not recorded' in markdown_section(markdown,
+            '## Two-Hand transition/input smoothing values')
+        assert 'persistent_grip_lab_episodes' in json_text(p)
+        passed.append('section markdown caveats and JSON serialization')
+
+        result = analyse_v5(rec, args)
+        presets = query_result(result, 'list')
+        assert 'pg-lab' in presets and 'pg-lab-events' in presets
+        assert query_result(result, 'pg-lab')['recorded'] is True
+        assert isinstance(query_result(result, 'pg-lab-events'), list)
+        passed.append('query presets expose the structured section and events')
+
+        # Transition/input smoothing: slider-era shapes, boolean-era absence of
+        # strength/mix, and a frame that lacks the whole family. The base builder
+        # deliberately carries no strength/mix (the boolean-era write shape); the
+        # slider frames add them.
+        def smoothing_frame(serial: int, **fields: Any) -> dict[str, Any]:
+            frame = _fixture_frame(serial, 0, 'Custom')
+            frame['schema_version'] = 2
+            frame.update({'two_hand_transition_smoothing_configured': True,
+                'two_hand_transition_active': True,
+                'two_hand_smoothing_configured': True,
+                'two_hand_smoothing_applied': True,
+                'two_hand_smoothing_alpha': 0.25,
+                'two_hand_smoothing_primary_orientation_error_deg': 12.0,
+                'two_hand_smoothing_primary_position_error_m': 0.02,
+                'two_hand_smoothing_support_position_error_m': 0.03})
+            frame.update(fields)
+            return frame
+
+        def pg_smoothing_frame(serial: int, engaged: bool, trusted: bool,
+                **fields: Any) -> dict[str, Any]:
+            return smoothing_frame(serial,
+                persistent_support_grip_configured=True,
+                persistent_support_grip_applicable=True,
+                support_relationship_readable=True,
+                support_relationship_engaged=engaged, support_epoch=3,
+                support_solve_trusted=trusted, support_force_one_hand=False,
+                support_solve_serial=serial - 1, **fields)
+
+        lab_full = {'two_hand_lab_enabled': True}
+        s1 = pg_smoothing_frame(1, True, True, **lab_full,
+            two_hand_smoothing_strength=12.5, two_hand_smoothing_mix=0.5,
+            two_hand_smoothing_alpha=0.25,
+            two_hand_smoothing_primary_orientation_error_deg=12.0,
+            two_hand_smoothing_primary_position_error_m=0.02,
+            two_hand_smoothing_support_position_error_m=0.03,
+            two_hand_offhand_influence=0.5,
+            two_hand_lab_offhand_influence=0.5,
+            two_hand_lab_effective_influence=0.45,
+            presented_aim_valid=True, reticle_presented_valid=True,
+            reticle_presented_serial=0)
+        s2 = pg_smoothing_frame(2, True, True, **lab_full,
+            two_hand_smoothing_strength=25.0, two_hand_smoothing_mix=1.0,
+            two_hand_smoothing_alpha=0.5,
+            two_hand_smoothing_primary_orientation_error_deg=8.0,
+            two_hand_smoothing_primary_position_error_m=0.01,
+            two_hand_smoothing_support_position_error_m=0.02,
+            two_hand_offhand_influence=0.75,
+            two_hand_lab_offhand_influence=0.6,
+            two_hand_lab_effective_influence=0.6,
+            presented_aim_valid=True, reticle_presented_valid=True,
+            reticle_presented_serial=2)
+        s3 = smoothing_frame(3,
+            two_hand_transition_smoothing_configured=False,
+            two_hand_transition_active=False,
+            two_hand_smoothing_configured=False,
+            two_hand_smoothing_applied=False,
+            two_hand_smoothing_strength=0.0, two_hand_smoothing_mix=0.0,
+            two_hand_smoothing_alpha=1.0,
+            two_hand_smoothing_primary_orientation_error_deg=0.0,
+            two_hand_smoothing_primary_position_error_m=0.0,
+            two_hand_smoothing_support_position_error_m=0.0,
+            presented_aim_valid=False, reticle_presented_valid=False,
+            reticle_presented_serial=0)
+        s3['effective_settings']['two_hand_latched'] = False
+        s4 = pg_smoothing_frame(4, True, False,
+            two_hand_smoothing_alpha=0.75,
+            two_hand_smoothing_primary_orientation_error_deg=5.0,
+            two_hand_smoothing_primary_position_error_m=0.005,
+            two_hand_smoothing_support_position_error_m=0.001,
+            presented_aim_valid=True, reticle_presented_valid=True,
+            reticle_presented_serial=3)
+        s5 = smoothing_frame(5, two_hand_smoothing_applied=False,
+            two_hand_smoothing_alpha=0.1,
+            two_hand_smoothing_primary_orientation_error_deg=0.5,
+            two_hand_smoothing_primary_position_error_m=0.001,
+            two_hand_smoothing_support_position_error_m=0.002,
+            presented_aim_valid=False, reticle_presented_valid=False,
+            reticle_presented_serial=4)
+        s6 = _fixture_frame(6, 0, 'Custom')
+        s6['schema_version'] = 2
+        s7 = smoothing_frame(7, two_hand_transition_active=False,
+            two_hand_smoothing_strength=12.5, two_hand_smoothing_mix=0.5,
+            two_hand_smoothing_alpha=0.9,
+            two_hand_smoothing_primary_orientation_error_deg=20.0,
+            two_hand_smoothing_primary_position_error_m=0.03,
+            two_hand_smoothing_support_position_error_m=0.04,
+            **lab_full, two_hand_lab_offhand_influence=0.4,
+            two_hand_offhand_influence=1.0,
+            two_hand_lab_effective_influence=0.3,
+            presented_aim_valid=True, reticle_presented_valid=True,
+            reticle_presented_serial=5)
+        s7['effective_settings']['two_hand_latched'] = False
+        smoothing_src = root / 'two-hand-smoothing.jsonl'
+        smoothing_rec = write_recording(smoothing_src, [s1, s2, s3, s4, s5, s6, s7])
+        smoothing_args = _fixture_cli_args(str(smoothing_src))
+        smoothing_result = persistent_grip_lab_analysis(
+            smoothing_rec, frame_times(smoothing_rec), smoothing_args)
+        assert smoothing_result['smoothing_recorded'] is True
+        ss = smoothing_result['smoothing']
+        passed.append('smoothing family detected per frame with an absent-family frame')
+
+        c1, c2, c3 = (smoothing_frame_context(s1), smoothing_frame_context(s2),
+            smoothing_frame_context(s3))
+        assert c1['strength'] == 12.5 and abs(c1['mix'] - 0.5) < 1e-12
+        assert c2['strength'] == 25.0 and abs(c2['mix'] - 1.0) < 1e-12
+        assert c3['strength'] == 0.0 and c3['mix'] == 0.0
+        assert c3['configured'] is False and c3['applied'] is False
+        assert smoothing_frame_context(s6) is None
+        assert smoothing_frame_context(s5)['strength'] is None
+        passed.append('slider shapes 12.5/0.5, 25.0/1.0, 0.0/0.0 and absent strength')
+
+        # Free two-hand offhand authority rides beside the family and is
+        # presence-tolerant: s1/s2/s7 record it, s3/s4/s5 predate it.
+        assert c1['offhand_influence'] == 0.5
+        assert c2['offhand_influence'] == 0.75
+        assert c3['offhand_influence'] is None
+        assert ss['offhand_influence_recorded_frames'] == 3
+        assert ss['offhand_influence']['n'] == 3
+        assert ss['offhand_influence']['min'] == 0.5
+        assert ss['offhand_influence']['p50'] == 0.75
+        assert ss['offhand_influence']['max'] == 1.0
+        passed.append('offhand influence recorded with an absent-key frame')
+
+        assert ss['frames_with_family'] == 6 and ss['frames_total'] == 7
+        assert (ss['transition_configured_true_frames'],
+            ss['transition_active_true_frames']) == (5, 4)
+        assert (ss['configured_true_frames'], ss['applied_true_frames']) == (5, 4)
+        assert ss['strength_mix_recorded'] is True
+        assert (ss['strength_recorded_frames'], ss['mix_recorded_frames']) == (4, 4)
+        applied = ss['applied']
+        assert applied['frames'] == 4
+        assert applied['strength']['n'] == 3
+        assert applied['strength']['min'] == 12.5
+        assert applied['strength']['p50'] == 12.5
+        assert applied['strength']['max'] == 25.0
+        assert abs(applied['strength']['mean'] - 50.0 / 3.0) < 1e-09
+        assert applied['mix']['n'] == 3
+        assert abs(applied['mix']['min'] - 0.5) < 1e-12
+        assert abs(applied['mix']['max'] - 1.0) < 1e-12
+        assert applied['alpha']['n'] == 4
+        assert abs(applied['alpha']['min'] - 0.25) < 1e-12
+        assert abs(applied['alpha']['p50'] - 0.625) < 1e-12
+        assert abs(applied['alpha']['max'] - 0.9) < 1e-12
+        assert applied['primary_orientation_error_deg']['n'] == 4
+        assert applied['primary_orientation_error_deg']['max'] == 20.0
+        assert applied['primary_position_error_m']['min'] == 0.005
+        assert applied['primary_position_error_m']['max'] == 0.03
+        assert applied['support_position_error_m']['min'] == 0.001
+        assert applied['support_position_error_m']['max'] == 0.04
+        passed.append('applied-frame strength/mix/alpha/error distributions')
+
+        assert applied['alpha']['max'] != applied['mix']['max']
+        assert applied['alpha']['max'] <= 1.0
+        assert applied['alpha']['p50'] != applied['strength']['p50']
+        latch = ss['latch_coincidence']
+        assert latch['frames_compared'] == 6
+        assert latch['pairs'] == {
+            'transition_active_true_latched_true': 4,
+            'transition_active_true_latched_false': 0,
+            'transition_active_false_latched_true': 0,
+            'transition_active_false_latched_false': 2}
+        assert latch['frames_with_either_absent'] == 0
+        passed.append('alpha never conflated with mix or strength; latch pair counts')
+
+        pgc = ss['pg_context_on_applied']
+        assert pgc['pg_family_frames'] == 3
+        assert pgc['engaged'] == {'true': 3, 'false': 0, 'absent': 1}
+        assert pgc['trusted'] == {'true': 2, 'false': 1, 'absent': 1}
+        labc = ss['lab_context_on_applied']
+        assert labc['lab_family_frames'] == 3 and labc['lab_enabled_true'] == 3
+        assert labc['effective_influence']['n'] == 3
+        assert abs(labc['effective_influence']['min'] - 0.3) < 1e-12
+        assert abs(labc['effective_influence']['max'] - 0.6) < 1e-12
+        assert abs(labc['offhand_influence_requested']['min'] - 0.4) < 1e-12
+        presc = ss['presented_context_on_applied']
+        assert presc['recorded'] is True
+        assert presc['presented_aim_valid'] == {'true': 4, 'false': 0, 'absent': 0}
+        assert presc['reticle_presented_valid']['true'] == 4
+        delta = presc['prepared_minus_reticle_presented_serial']
+        assert delta['frames_compared'] == 4 and delta['delta_values'] == {'0': 1, '1': 2, '2': 1}
+        assert delta['delta_zero_frames'] == 1
+        assert delta['delta_positive_frames'] == 3
+        assert delta['delta_negative_frames'] == 0
+        passed.append('PG, Lab and presented/reticle context on applied frames')
+
+        smoothing_md = '\n'.join(persistent_grip_lab_markdown(smoothing_result))
+        s_sect = markdown_section(smoothing_md,
+            '## Two-Hand transition/input smoothing values')
+        assert 'not recorded' not in s_sect
+        assert 'Smoothing-applied frames: **4**' in s_sect
+        assert '12.500' in s_sect and '25.000' in s_sect
+        assert 'two_hand_smoothing_alpha' in s_sect
+        assert 'two_hand_offhand_influence' in s_sect and '0.500' in s_sect
+        assert json_text(smoothing_result)
+        passed.append('smoothing section markdown for slider-era recordings')
+
+        boolean_frames = [smoothing_frame(1, two_hand_smoothing_alpha=0.2),
+            smoothing_frame(2, two_hand_smoothing_alpha=0.8)]
+        boolean_src = root / 'boolean-era-smoothing.jsonl'
+        boolean_rec = write_recording(boolean_src, boolean_frames)
+        boolean_args = _fixture_cli_args(str(boolean_src))
+        boolean = persistent_grip_lab_analysis(
+            boolean_rec, frame_times(boolean_rec), boolean_args)
+        assert boolean['smoothing_recorded'] is True
+        bs = boolean['smoothing']
+        assert bs['frames_with_family'] == 2 and bs['applied_true_frames'] == 2
+        assert bs['strength_mix_recorded'] is False
+        assert (bs['strength_recorded_frames'], bs['mix_recorded_frames']) == (0, 0)
+        assert bs['offhand_influence_recorded_frames'] == 0
+        assert bs['offhand_influence'] is None
+        assert bs['applied']['strength'] is None and bs['applied']['mix'] is None
+        assert bs['applied']['alpha']['n'] == 2
+        assert abs(bs['applied']['alpha']['max'] - 0.8) < 1e-12
+        assert bs['presented_context_on_applied']['recorded'] is False
+        assert bs['presented_context_on_applied']['presented_aim_valid'] == {
+            'true': 0, 'false': 0, 'absent': 2}
+        boolean_md = '\n'.join(persistent_grip_lab_markdown(boolean))
+        b_sect = markdown_section(boolean_md,
+            '## Two-Hand transition/input smoothing values')
+        assert 'not recorded' in b_sect and 'boolean-era' in b_sect
+        assert 'Smoothing-applied frames: **2**' in b_sect
+        assert 'alpha' in b_sect
+        passed.append('boolean-era family stays analysable with strength not recorded')
+
+        legacy_frames = [_fixture_frame(1, 0, 'Custom'),
+            _fixture_frame(2, 0, 'Custom')]
+        for frame in legacy_frames:
+            frame['schema_version'] = 2
+        legacy_src = root / 'legacy-without-family.jsonl'
+        legacy_rec = write_recording(legacy_src, legacy_frames)
+        legacy_args = _fixture_cli_args(str(legacy_src))
+        legacy = persistent_grip_lab_analysis(
+            legacy_rec, frame_times(legacy_rec), legacy_args)
+        assert legacy['recorded'] is False and legacy['lab_recorded'] is False
+        assert legacy['smoothing_recorded'] is False and legacy['smoothing'] is None
+        assert legacy['counts'] is None and legacy['lab'] is None
+        assert legacy['support_solve_serial_lag'] is None
+        assert legacy['events'] == [] and legacy['relationship_transitions'] == []
+        assert legacy['epoch_changes'] == []
+        assert legacy['trust_loss_transitions'] == []
+        legacy_md = '\n'.join(persistent_grip_lab_markdown(legacy))
+        assert 'not recorded' in legacy_md
+        legacy_sect = markdown_section(legacy_md,
+            '## Two-Hand transition/input smoothing values')
+        assert 'not recorded' in legacy_sect
+        assert 'two_hand_transition_smoothing_configured' in legacy_sect
+        legacy_result = analyse_v5(legacy_rec, legacy_args)
+        assert query_result(legacy_result, 'pg-lab')['recorded'] is False
+        passed.append('old-style recording without the family stays not recorded')
+
+    print(f'MCCVR analyser persistent-grip/lab self-test: {len(passed)} checks passed')
+    for x in passed:
+        print('  PASS', x)
+    return 0
+
+
 def self_test_v4() -> int:
     rc = _self_test_v4_v51()
     if rc:
         return rc
     rc = run_v52_provenance_self_test()
+    if rc:
+        return rc
+    rc = run_persistent_grip_lab_self_test()
     if rc:
         return rc
     return run_sidecar_self_test()
@@ -2367,13 +3290,13 @@ def analyse_v5(rec, args, annotations=None):
     times = frame_times(rec)
     r['analysis_metadata']['analyser_version'] = ANALYSER_VERSION
     r['analysis_metadata']['analyser_sha256'] = sha256_file(Path(__file__))
-    r['v5'] = {'authority_decomposition': authority_decomposition(rec), 'transition_timeline': transition_timeline(rec, times), 'performance_index': performance_index(rec, times, args)}
+    r['v5'] = {'authority_decomposition': authority_decomposition(rec), 'transition_timeline': transition_timeline(rec, times), 'performance_index': performance_index(rec, times, args), 'persistent_grip_lab': persistent_grip_lab_analysis(rec, times, args)}
     return r
 
 def query_result(r, query):
     v4r = r['v4']
     v5 = r['v5']
-    mapping = {'profile-provenance': {'profile_mapping_fingerprint': r['analysis_metadata'].get('profile_mapping_fingerprint'), 'temporary_profile_identities': r.get('temporary_profile_identities', []), 'temporary_profile_name_collisions': r.get('temporary_profile_name_collisions', [])}, 'profile-changes': r['profile_segments'], 'settings': v4r['setting_sweeps'], 'grip-held-aim-inactive': v4r['state_pose_mismatches']['aim_inactive_while_grip_latch_held'], 'latch-release-while-grip-held': v4r['state_pose_mismatches']['grip_latch']['latch_released_while_grip_held'], 'b-boundary': v4r['b_boundary']['events'], 'b-chatter': v4r['b_boundary']['chatter_episodes'], 'w-transitions': v4r['w_transitions'], 'head-yaw': r['head_yaw_episodes'], 'horizontal-reach': v4r['horizontal_reach_episodes'], 'low-held-retention': v4r['low_held_retention'], 'steady-jumps': r['aim_jumps']['steady_state_top'], 'all-jumps': r['aim_jumps']['all_top'], 'singularity': v4r['geometry_indexes'], 'control-oracle': v4r['control_oracles'], 'authority': v5['authority_decomposition'], 'transitions': v5['transition_timeline'], 'performance': v5['performance_index'], 'events': v4r['other_record_inventory']}
+    mapping = {'profile-provenance': {'profile_mapping_fingerprint': r['analysis_metadata'].get('profile_mapping_fingerprint'), 'temporary_profile_identities': r.get('temporary_profile_identities', []), 'temporary_profile_name_collisions': r.get('temporary_profile_name_collisions', [])}, 'profile-changes': r['profile_segments'], 'settings': v4r['setting_sweeps'], 'grip-held-aim-inactive': v4r['state_pose_mismatches']['aim_inactive_while_grip_latch_held'], 'latch-release-while-grip-held': v4r['state_pose_mismatches']['grip_latch']['latch_released_while_grip_held'], 'b-boundary': v4r['b_boundary']['events'], 'b-chatter': v4r['b_boundary']['chatter_episodes'], 'w-transitions': v4r['w_transitions'], 'head-yaw': r['head_yaw_episodes'], 'horizontal-reach': v4r['horizontal_reach_episodes'], 'low-held-retention': v4r['low_held_retention'], 'steady-jumps': r['aim_jumps']['steady_state_top'], 'all-jumps': r['aim_jumps']['all_top'], 'singularity': v4r['geometry_indexes'], 'control-oracle': v4r['control_oracles'], 'authority': v5['authority_decomposition'], 'transitions': v5['transition_timeline'], 'performance': v5['performance_index'], 'pg-lab': v5['persistent_grip_lab'], 'pg-lab-events': v5['persistent_grip_lab']['events'], 'events': v4r['other_record_inventory']}
     if query == 'list':
         return sorted(mapping)
     if query not in mapping:
@@ -2390,7 +3313,9 @@ def md_v5(r, args):
     out += ['', '## Recorder/per-frame performance index', '', f"Hot path: {fmt_stats(perf['hotpath_us'], 2)} µs", '', f"Prepared-frame interval / predicted period: {fmt_stats(perf['frame_interval_ratio_to_predicted_period'], 3)}", '', '| Line | Time | Profile | Hot-path µs |', '|---:|---:|---|---:|']
     for x in perf['top_hotpath_frames']:
         out.append(f"| {x['line']} | {fmt(x['time_s'])} | `{x['profile']}` | {x['hotpath_us']:.2f} |")
-    out += ['', '## General transition timeline summary', '', f"Indexed semantic/validity/state transitions: **{len(r['v5']['transition_timeline'])}**.", '', 'Use `--query transitions` for the deterministic line/serial/time index.', '', '## Query presets', '', '`profile-provenance`, `profile-changes`, `settings`, `grip-held-aim-inactive`, `latch-release-while-grip-held`, `b-boundary`, `b-chatter`, `w-transitions`, `head-yaw`, `horizontal-reach`, `low-held-retention`, `steady-jumps`, `all-jumps`, `singularity`, `control-oracle`, `authority`, `transitions`, `performance`, `events`.', '']
+    out += ['', '## General transition timeline summary', '', f"Indexed semantic/validity/state transitions: **{len(r['v5']['transition_timeline'])}**.", '', 'Use `--query transitions` for the deterministic line/serial/time index.', '']
+    out += persistent_grip_lab_markdown(r['v5']['persistent_grip_lab'])
+    out += ['', '## Query presets', '', '`profile-provenance`, `profile-changes`, `settings`, `grip-held-aim-inactive`, `latch-release-while-grip-held`, `b-boundary`, `b-chatter`, `w-transitions`, `head-yaw`, `horizontal-reach`, `low-held-retention`, `steady-jumps`, `all-jumps`, `singularity`, `control-oracle`, `authority`, `transitions`, `performance`, `pg-lab`, `pg-lab-events`, `events`.', '']
     return '\n'.join(out)
 
 def add_args(ap):
@@ -2406,6 +3331,8 @@ def add_args(ap):
     ap.add_argument('--reach-episode-min-frames', type=int, default=4)
     ap.add_argument('--low-held-below-head-m', type=float, default=0.35)
     ap.add_argument('--setting-sweep-gap-s', type=float, default=1.0)
+    ap.add_argument('--a-dot-b-agreement-floor', type=float,
+                    default=DEFAULT_A_DOT_B_AGREEMENT_FLOOR)
     ap.add_argument('--top-performance', type=int, default=20)
     ap.add_argument('--frame-interval-warn-ratio', type=float, default=1.5)
     ap.add_argument('--weapon-order', action='store_true',
@@ -2435,7 +3362,7 @@ MANIFEST_SCHEMA_VERSION = 1
 DIAGNOSTICS_SCHEMA_VERSION = 1
 GENERATOR_NAME = 'analyse_mccvr_telemetry'
 TELEMETRY_AI_GUIDE_FILENAME = 'TELEMETRY_AI_GUIDE.md'
-GUIDE_REVISION = 1
+GUIDE_REVISION = 4
 HASH_BASIS_EXACT_INPUT_FILE_BYTES = 'exact_input_file_bytes'
 MAX_STRUCTURAL_RUNS = 1000
 _MISSING = object()
@@ -2500,6 +3427,76 @@ parameters, classifications, raw input paths and raw locators are included so th
 derived output can be reproduced or falsified. Per-frame derived row dumps are omitted
 by default; pass `--include-debug-derived-rows` to include them.
 
+## Persistent-grip and Two-Hand Lab provenance
+
+Newer captures carry frozen solve-time persistent-grip provenance on each frame
+(`persistent_support_grip_configured`, `persistent_support_grip_applicable`,
+`support_relationship_readable`, `support_relationship_engaged`, `support_epoch`,
+`support_solve_trusted`, `support_force_one_hand`, `support_solve_serial`) plus a
+Two-Hand Lab family (`two_hand_lab_*`). Older captures simply lack these keys:
+absence is not false or zero, and the diagnostics report "not recorded" instead of
+inventing a state.
+
+- `support_epoch` is process-local. Compare it only between adjacent frames of one
+  capture, never across captures or sessions. Epoch 0 means the relationship was
+  readable and coherently disengaged; 18446744073709551615 means it could not be
+  read, which is a different thing.
+- `support_solve_trusted` is the qualification permission of that invocation, not
+  proof the solve consumed support geometry. `support_force_one_hand` is explicit
+  persistent-grip forcing, not an ordinary two-hand setting being off.
+- `support_solve_serial` is a stamped solve serial that normally lags
+  `prepared_serial`; never assert the two are equal.
+- `reticle_presented_support_trusted` / `reticle_presented_support_epoch` belong to
+  the reticle's own, normally lagged assembly and are never the canonical solve trust.
+- The Two-Hand Lab values are meaningful only while `two_hand_lab_enabled` is true.
+- Same-frame counterfactual control profiles re-solve independently and do not carry
+  the canonical assembly support facts.
+
+The diagnostics index these as episodes (method `persistent_grip_lab_episodes`,
+query presets `pg-lab` and `pg-lab-events`). Episodes are recorded-state indexes:
+they do not establish causality, a disengaged relationship, or that a solve consumed
+support geometry.
+
+## Two-Hand transition/input smoothing values
+
+Newer captures also carry the per-frame transition/input smoothing family
+(`two_hand_transition_smoothing_configured`, `two_hand_transition_active`,
+`two_hand_smoothing_configured`, `two_hand_smoothing_applied`,
+`two_hand_smoothing_alpha`, `two_hand_smoothing_*_error_*`) and, in
+strength-slider captures, `two_hand_smoothing_strength` and
+`two_hand_smoothing_mix`, plus the free two-hand product setting
+`two_hand_offhand_influence`. The family is gated on the presence of
+`two_hand_transition_smoothing_configured`; a capture may lack the whole family.
+
+- `two_hand_smoothing_strength` is the user amount in 0..25 (0 = raw/off, 25 = the
+  full fixed speed-25 input filter) frozen for that prepared serial. It is never a
+  live re-read of the config slider.
+- `two_hand_smoothing_mix` is strength/25: the applied wet/dry amount, never a
+  filter speed. `two_hand_smoothing_alpha` is the filter's internal
+  clamp(25*dt, 0, 1) temporal coefficient, never the user amount.
+- `two_hand_smoothing_applied` means the eligible free two-hand path of that prepared
+  frame consumed the frozen strength; `two_hand_smoothing_configured` is strength > 0.
+- `two_hand_offhand_influence` is the free two-hand product offhand directional
+  authority in 0..1, frozen for that prepared serial from the frame's own assembly
+  (Virtual Stock solves never read it, and a Lab-active solve uses its own
+  `two_hand_lab_offhand_influence`). A capture that predates the field simply lacks
+  the key: absence is not a zero authority.
+- The `two_hand_smoothing_*_error_*` values are raw-to-full-filtered input
+  differences (degrees / OpenXR local metres), never solver or presented-aim errors.
+- Boolean-era recordings carry the family without strength/mix: absence is not zero
+  or false, and the diagnostics report "not recorded" rather than a value.
+- `two_hand_transition_smoothing_configured` / `two_hand_transition_active` are the
+  product 200 ms latch-continuity pair. The continuity itself is fixed-on internal
+  product behaviour with no user toggle (the retired `two_hand_transition_smoothing`
+  key no longer resolves), while `two_hand_transition_smoothing_configured` reports
+  the effective truth for the frame; `effective_settings.two_hand_latched` is the
+  effective latch and is reported as context only.
+
+The diagnostics summarise these values (strength/mix, offhand influence, alpha,
+error distributions and latch coincidence) inside method
+`persistent_grip_lab_episodes`. The summaries are descriptive recorded-value
+counts; they do not establish a smoothing effect, a direction, or a preference.
+
 ## Raw retrieval
 
 The analyser can return original raw records without reinterpretation:
@@ -2548,7 +3545,7 @@ SIGNAL_DEFINITIONS = {
     'primary': {'description': 'semantic primary aim pose after MCC handedness routing', 'bindings': [{'telemetry_schema_versions': [1, 2], 'raw_path': 'semantic_primary_aim', 'validity_path': 'semantic_primary_aim_valid'}]},
     'primary_forward': {'description': 'semantic primary forward vector', 'bindings': [{'telemetry_schema_versions': [1, 2], 'raw_path': 'semantic_primary_forward', 'validity_path': 'semantic_primary_aim_valid'}]},
     'support': {'description': 'semantic support aim pose', 'bindings': [{'telemetry_schema_versions': [1, 2], 'raw_path': 'semantic_support_aim', 'validity_path': 'semantic_support_aim_valid'}]},
-    'support_endpoint': {'description': 'effective semantic support endpoint selected for the two-hand solve; it may be sourced from the support aim position or from the position-only grip-action endpoint, and support_endpoint_used_grip records which source was selected', 'bindings': [{'telemetry_schema_versions': [1, 2], 'raw_path': 'semantic_support_endpoint', 'validity_path': 'semantic_support_endpoint_valid'}]},
+    'support_endpoint': {'description': 'effective semantic support endpoint selected for the Virtual Stock support path and for the Two-Hand Lab Production anchor pass-through; it may be sourced from the support aim position or from the position-only grip-action endpoint, and support_endpoint_used_grip records which source was selected. It is not the consumed free two-hand product geometry: with Virtual Stock off (and the Lab inactive) the two-hand solve consumes the fixed primary-Grip -> support-Grip positional pair reported by support_grip_position / semantic_primary_grip_position, so this field is provenance for the VS/Lab paths rather than a VS-off consumption receipt', 'bindings': [{'telemetry_schema_versions': [1, 2], 'raw_path': 'semantic_support_endpoint', 'validity_path': 'semantic_support_endpoint_valid'}]},
     'grip': {'description': 'semantic support grip after handedness routing (schema-1/2: routed pad.gripL)', 'bindings': [{'telemetry_schema_versions': [1, 2], 'raw_path': 'pad.gripL'}]},
     'primary_grip': {'description': 'semantic primary grip (schema-1/2: routed pad.gripR)', 'bindings': [{'telemetry_schema_versions': [1, 2], 'raw_path': 'pad.gripR'}]},
     'support_grip_position': {'description': 'position-only support grip locate', 'bindings': [{'telemetry_schema_versions': [1, 2], 'raw_path': 'support_grip_position', 'validity_path': 'support_grip_valid'}]},
@@ -2954,6 +3951,36 @@ DIAGNOSTIC_METHOD_CATALOG = {
             'w_effective/horizontal_reach_m/aim_jump_deg': 'the same statistics definitions used by profile_summaries and aim_jumps, restricted to the interval',
         },
     },
+    'persistent_grip_lab_episodes': {
+        'classification': 'deterministic_derivation',
+        'description': 'Indexed persistent-grip relationship/epoch/trust/forcing episodes plus Two-Hand Lab requested-versus-effective influence at those event frames, plus the per-capture Two-Hand transition/input smoothing value counts and distributions.',
+        'raw_inputs': ['persistent_support_grip_configured', 'persistent_support_grip_applicable', 'support_relationship_readable', 'support_relationship_engaged', 'support_epoch', 'support_solve_trusted', 'support_force_one_hand', 'support_solve_serial', 'aim_trace.a_dot_b', 'aim_trace.b_accepted', 'aim_trace.b_extreme_rejected', 'aim_trace.b_rejected_agreement', 'aim_trace.b_steering_retained', 'canonical_aim.two_hand_active', 'effective_settings.two_hand_latched', 'two_hand_lab_*', 'two_hand_offhand_influence', 'two_hand_transition_smoothing_configured', 'two_hand_transition_active', 'two_hand_smoothing_configured', 'two_hand_smoothing_applied', 'two_hand_smoothing_strength', 'two_hand_smoothing_mix', 'two_hand_smoothing_alpha', 'two_hand_smoothing_primary_orientation_error_deg', 'two_hand_smoothing_primary_position_error_m', 'two_hand_smoothing_support_position_error_m', 'presented_aim_valid', 'reticle_presented_valid', 'reticle_presented_serial'],
+        'validity_requirements': ['the persistent-grip, two-hand-lab and transition/input smoothing families are additive schema-2 families; a key that is absent stays missing (reported as not recorded) and is never coerced to false/zero', 'a_dot_b episodes use only frames with a finite recorded aim_trace.a_dot_b', 'the smoothing family is gated on the presence of its marker two_hand_transition_smoothing_configured per frame; two_hand_smoothing_strength/two_hand_smoothing_mix are a later strength-slider extension, so boolean-era frames carry the same family without them and report them as not recorded rather than zero', 'the present/reticle fields are reported only on smoothing-applied frames and only when the capture actually records them'],
+        'inclusion': 'adjacent parsed frame pairs that emit a row: support_relationship_readable/engaged changes (relationship_transitions), support_epoch differences (epoch_changes), support_solve_trusted losses true->false (trust_loss_transitions; a false->true trust gain intentionally emits no row) and canonical_aim.two_hand_active losses true->false while engaged (two_hand_to_one_hand_while_engaged); plus maximal runs of frames whose support_force_one_hand is true, whose aim_trace.a_dot_b is below a_dot_b_agreement_floor, or whose aim_trace.b_steering_retained is true; plus every frame carrying the transition/input smoothing marker for the smoothing counts and the two_hand_smoothing_applied frames for its distributions',
+        'exclusion': 'frames or captures without the family (reported as not recorded); frames without a finite a_dot_b are excluded from the floor index; support_epoch is compared only between adjacent frames of one capture; absent smoothing strength/mix and absent present/reticle fields are excluded from their distributions instead of being read as zero',
+        'parameters': ['a_dot_b_agreement_floor'],
+        'reports_derived_metric': True,
+        'not_a_claim': 'Episodes are recorded-state indexes; they establish neither causality nor a disengaged relationship, PG being off, or a solve having consumed support geometry. The smoothing values are recorded amounts and paths, not a smoothness or quality verdict.',
+        'metric_definitions': {
+            'relationship_transitions': 'adjacent-frame edges of support_relationship_readable/support_relationship_engaged, classified acquire (engaged false->true), release (true->false) or readability change',
+            'epoch_changes': 'adjacent-frame support_epoch differences within one capture, flagging the all-ones unreadable sentinel on either side',
+            'trust_loss_transitions': 'adjacent frames where support_solve_trusted is true then false, with the engaged state on both sides',
+            'force_one_hand_runs': 'maximal runs with support_force_one_hand true, with trusted/engaged frame counts and the epochs observed in the run',
+            'agreement_below_floor_runs': 'maximal runs with a finite aim_trace.a_dot_b < a_dot_b_agreement_floor, reporting a_dot_b and b_rejected_agreement statistics plus b_accepted/b_extreme_rejected/b_steering_retained frame counts',
+            'b_steering_retained_runs': 'maximal runs with aim_trace.b_steering_retained true',
+            'two_hand_to_one_hand_while_engaged': 'adjacent frames where canonical_aim.two_hand_active is true then false while support_relationship_engaged is true on the second frame (the latch is context, not the relationship)',
+            'lab_requested_vs_effective': 'two_hand_lab_offhand_influence versus two_hand_lab_effective_influence on frames where two_hand_lab_enabled is true; the other Lab values are reported only under that gate',
+            'support_solve_serial_lag': 'distribution of prepared_serial - support_solve_serial within the capture; the pair is never asserted equal',
+            'two_hand_smoothing_counts': 'per-capture frame counts of the recorded transition/input smoothing family booleans: two_hand_transition_smoothing_configured, two_hand_transition_active, two_hand_smoothing_configured and two_hand_smoothing_applied',
+            'two_hand_smoothing_strength_mix': 'statistics of two_hand_smoothing_strength (the user amount 0..25, 0 = raw/off, 25 = the full fixed speed-25 input filter, frozen for that prepared serial) and two_hand_smoothing_mix (= strength/25, the applied wet/dry amount and never a filter speed) over the two_hand_smoothing_applied frames only',
+            'two_hand_smoothing_alpha': 'statistics of two_hand_smoothing_alpha (the filter internal clamp(25*dt, 0, 1) temporal coefficient, never the user amount) over the two_hand_smoothing_applied frames',
+            'two_hand_smoothing_errors': 'statistics of two_hand_smoothing_primary_orientation_error_deg, two_hand_smoothing_primary_position_error_m and two_hand_smoothing_support_position_error_m (raw-to-full-filtered input differences in degrees / OpenXR local metres, never solver or presented-aim errors) over the two_hand_smoothing_applied frames',
+            'two_hand_offhand_influence': 'statistics of two_hand_offhand_influence (the free two-hand product offhand directional authority 0..1, frozen for that prepared serial from the frame own assembly; never read by Virtual Stock solves) over the family frames that record it; absence is reported as not recorded, never as a zero authority',
+            'two_hand_smoothing_latch_coincidence': 'same-frame pair counts of two_hand_transition_active against effective_settings.two_hand_latched, counted only where both are recorded; descriptive coincidence counts, never a continuity verdict',
+            'two_hand_smoothing_context': 'context on the two_hand_smoothing_applied frames: persistent-grip engaged/trusted/configured counts, Two-Hand Lab effective/requested influence statistics while two_hand_lab_enabled is true, and presented_aim_valid / reticle_presented_valid / prepared_serial - reticle_presented_serial frame counts when those fields are recorded',
+            'events': 'merged chronological index of the episodes above, with each event frame own persistent-grip and Lab context',
+        },
+    },
 }
 for _catalog_entry in DIAGNOSTIC_METHOD_CATALOG.values():
     _catalog_entry.setdefault('supported_telemetry_schema_versions', [1, 2])
@@ -3023,6 +4050,7 @@ DIAGNOSTIC_PARAMETER_KEYS = (
     'reach_episode_min_delta_m', 'reach_episode_min_frames',
     'low_held_below_head_m', 'setting_sweep_gap_s', 'top_performance',
     'frame_interval_warn_ratio', 'include_debug_derived_rows',
+    'a_dot_b_agreement_floor',
 )
 
 
@@ -4388,6 +5416,7 @@ def run_sidecar_self_test() -> int:
         endpoint_definition = doc['signal_definitions']['support_endpoint']['description']
         assert 'effective semantic support endpoint' in endpoint_definition
         assert 'support_endpoint_used_grip' in endpoint_definition
+        assert 'not the consumed free two-hand product geometry' in endpoint_definition
         assert 'support grip endpoint position' not in endpoint_definition
         assert 'position-only' in doc['signal_definitions'][
             'support_grip_position']['description']
@@ -4400,7 +5429,8 @@ def run_sidecar_self_test() -> int:
             'horizontal_rear_release', 'horizontal_offline_candidates',
             'horizontal_reach_episodes', 'low_held_retention',
             'authority_decomposition', 'transition_timeline',
-            'performance_index', 'temporary_profile_provenance', 'annotations')
+            'performance_index', 'temporary_profile_provenance',
+            'persistent_grip_lab_episodes', 'annotations')
         for name, entry in doc['methods'].items():
             assert entry['classification'] in DIAGNOSTIC_CLASSIFICATIONS, name
             assert entry.get('raw_inputs'), name
@@ -4587,7 +5617,10 @@ def run_sidecar_self_test() -> int:
         guide = guide_text()
         for phrase in ('evidentiary source', 'not proof of absence',
                 'Validity flags are authoritative', 'prepare', '--raw-window-serial',
-                'establishes a conclusion'):
+                'establishes a conclusion', 'support_solve_serial',
+                'pg-lab-events', 'process-local',
+                'two_hand_smoothing_strength', 'two_hand_smoothing_alpha',
+                'two_hand_offhand_influence', 'no user toggle'):
             assert phrase in guide, phrase
         assert guide == guide_text()
         if os.name == 'nt':

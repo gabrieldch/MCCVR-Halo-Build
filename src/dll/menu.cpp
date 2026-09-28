@@ -20,6 +20,7 @@
 #include "d3d11_hook.h"
 #include "window_resize.h"
 #include "telemetry_recorder.h"
+#include "two_hand_lab_runtime.h"
 #include "../common/log.h"
 #include "../common/config.h"
 #include "../common/weapon_interaction_logic.h"
@@ -176,6 +177,7 @@ namespace
         Cat_Vehicles,
         Cat_WeaponAim,
         Cat_VirtualStockLab,
+        Cat_TwoHandLab,
         Cat_Crosshair,
         Cat_BodyHands,
         Cat_Picture,
@@ -207,6 +209,7 @@ namespace
         {"Vehicles",      "First-person driving: sit in the seat instead of floating behind the vehicle."},
         {"Weapon & Aim",  "Gun placement, per-title calibration, muzzle alignment, and two-handed aiming."},
         {"Virtual Stock Lab", "Experimental virtual shoulder aiming and proximity release."},
+        {"Two-Handed Lab", "Experimental two-hand anchor, authority and damping rig (runtime-only)."},
         {"Crosshair",     "The floating reticle that shows where the weapon really shoots."},
         {"Body & Hands",  "Arms, shoulders, and how much of Chief you can see."},
         {"Picture",       "Render resolution, sharpening, anti-aliasing and brightness."},
@@ -541,6 +544,11 @@ namespace
             // Virtual Stock Lab is intentionally excluded from normal navigation;
             // product controls live in Weapon & Aim.
             if (i == Cat_VirtualStockLab)
+                continue;
+            // Two-Handed Lab is runtime-only experimental infrastructure hidden
+            // the same way: no normal navigation entry. Its page block and state
+            // stay wired below; product two-hand controls live in Weapon & Aim.
+            if (i == Cat_TwoHandLab)
                 continue;
             const bool selected = g_activeCategory == i;
             if (ImGui::Selectable(kCategories[i].label, selected))
@@ -1296,11 +1304,62 @@ namespace
         if (g_config.two_handed_aim)
         {
             ImGui::Indent();
+            ImGui::TextDisabled("Put your support hand on the front of the gun, click/hold its GRIP.\n"
+                                "Engages only when your hand is on the barrel line.");
+            ImGui::Text("Grip mode");
             if (ImGui::RadioButton("Toggle (click grip)", g_config.two_hand_toggle))
             { g_config.two_hand_toggle = true; changed = true; }
             ImGui::SameLine();
             if (ImGui::RadioButton("Hold grip", !g_config.two_hand_toggle))
             { g_config.two_hand_toggle = false; changed = true; }
+            ImGui::Spacing();
+            changed |= ImGui::Checkbox("Persistent support grip",
+                &g_config.persistent_support_grip);
+            ImGui::TextDisabled(
+                "Keeps the support hand attached after a valid grab even when it leaves the original grab area.\n"
+                "Hold mode: releasing the grip button ends it. Toggle mode: the toggle press ends it.\n"
+                "Also ends on an explicit release, or when the weapon, title or life state changes.");
+            ImGui::Indent();
+            ImGui::BeginDisabled(!g_config.persistent_support_grip);
+            changed |= ImGui::Checkbox("Switched weapons already two-handed",
+                &g_config.two_hand_switch_inherit);
+            ImGui::EndDisabled();
+            ImGui::TextDisabled(
+                "Needs Persistent support grip: switching weapons while you hold the grip\n"
+                "gives you the new weapon two-handed immediately.\n"
+                "Off: grip the new weapon normally (no need to release the grip button).");
+            ImGui::Unindent();
+            ImGui::Spacing();
+            changed |= ImGui::Checkbox("Reduce Support-Hand Rotation",
+                &g_config.two_hand_support_grip_pose);
+            ImGui::TextDisabled(
+                "Virtual Stock only: anchors the stock aim line to your support hand's grip position\n"
+                "instead of its aim point. Free two-handed aim always uses both grip positions.");
+            ImGui::Spacing();
+            float offhandInfluencePercent = MenuSliderPercentFromUnit(
+                g_config.two_hand_offhand_influence);
+            if (vr_menu::SliderFloat("Offhand influence",
+                    &offhandInfluencePercent, 0.0f, 100.0f, "%.0f%%",
+                    ImGuiSliderFlags_None))
+            {
+                g_config.two_hand_offhand_influence =
+                    MenuSliderUnitFromPercent(offhandInfluencePercent);
+                changed = true;
+            }
+            ImGui::TextDisabled(
+                "How strongly support-hand position steers free two-hand aim.\n"
+                "0%% = primary-hand orientation only; 100%% = full two-hand positional steering.\n"
+                "Applies when Virtual Stock is off.");
+            changed |= vr_menu::SliderFloat("Two-Hand Smoothing",
+                &g_config.two_hand_smoothing_strength,
+                kTwoHandSmoothingStrengthMinimum,
+                kTwoHandSmoothingStrengthMaximum, "%.0f");
+            ImGui::TextDisabled(
+                "Reduces small tracking jitter in free two-hand aim.\n"
+                "0 = off; higher values apply more smoothing.\n"
+                "Applies when Virtual Stock is off.");
+            ImGui::Spacing();
+            ImGui::Text("Grip and grab-zone calibration");
             changed |= vr_menu::SliderFloat("Left hand forward offset (m)",
                                           &g_config.left_hand_forward_m,
                                           -0.15f, 0.30f, "%.3f");
@@ -1315,14 +1374,6 @@ namespace
             ImGui::TextDisabled("Moves the support-hand grab sample forward from the tracked controller toward the visible palm.");
             ImGui::Unindent();
         }
-        ImGui::TextDisabled("Put your support hand on the front of the gun, click/hold its GRIP.\n"
-                            "Engages only when your hand is on the barrel line.");
-
-        changed |= ImGui::Checkbox("Reduce Support-Hand Rotation",
-            &g_config.two_hand_support_grip_pose);
-        ImGui::TextDisabled(
-            "Reduces how much twisting your support hand affects two-handed aim.\n"
-            "Support-hand position still helps steer the weapon.");
 #include "virtual_stock_menu.inl"
 
         ImGui::Spacing();
@@ -1935,6 +1986,7 @@ namespace
                 g_config = Config{};
                 ConfigSave();
                 LOG("config: reset to defaults from the menu");
+                two_hand_lab_runtime::ResetSettings();
                 g_resetArmed = false;
             }
             else
@@ -1949,8 +2001,14 @@ namespace
                 g_resetArmed = false;
         }
         ImGui::TextDisabled("Puts every setting back to the value halomccvr.cfg lists as its\n"
-                            "default, including your weapon calibration. Resolution needs a\n"
+                            "default, including your weapon calibration. The runtime Two-Handed\n"
+                            "Lab is also reset and disabled. Resolution needs a\n"
                             "game restart; everything else applies immediately.");
+        }
+
+        if (g_activeCategory == Cat_TwoHandLab)
+        {
+#include "two_hand_lab_menu.inl"
         }
 
         ImGui::PopTextWrapPos();

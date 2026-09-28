@@ -480,6 +480,34 @@ if(BUILD_TESTING)
     target_include_directories(halomccvr_virtual_stock_tests PRIVATE src/common)
     target_compile_definitions(halomccvr_virtual_stock_tests PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
     add_test(NAME halomccvr_virtual_stock_tests COMMAND halomccvr_virtual_stock_tests)
+    # Two-Handed Lab tranche 1: dependency-light PURE anchor/authority/damping
+    # logic. Header-only; no runtime integration yet.
+    add_executable(halomccvr_two_hand_lab_tests tests/two_hand_lab_logic_tests.cpp)
+    target_include_directories(halomccvr_two_hand_lab_tests PRIVATE src/common)
+    target_compile_definitions(halomccvr_two_hand_lab_tests PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+    add_test(NAME halomccvr_two_hand_lab_tests COMMAND halomccvr_two_hand_lab_tests)
+    # Persistent support grip (T4 foundation): pure policy headers only, no
+    # runtime wiring yet. Title-aware owner identity, tri-state evidence,
+    # durable relationship/writer policy, pending-acquisition freshness and
+    # the presented-ray qualification rules. The suite links the existing
+    # header-only hold/admission helpers so the acquisition-order case steps
+    # the production equation.
+    add_executable(halomccvr_support_grip_logic_tests
+        tests/support_grip_logic_tests.cpp src/common/input_logic.cpp)
+    target_include_directories(halomccvr_support_grip_logic_tests PRIVATE src/common)
+    target_compile_definitions(halomccvr_support_grip_logic_tests PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+    add_test(NAME halomccvr_support_grip_logic_tests COMMAND halomccvr_support_grip_logic_tests)
+    # Support-grab acquisition predicate: acquisition zone independent of the
+    # support wrist orientation.
+    add_executable(halomccvr_support_grab_tests tests/support_grab_tests.cpp)
+    target_include_directories(halomccvr_support_grab_tests PRIVATE src/common)
+    target_compile_definitions(halomccvr_support_grab_tests PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+    add_test(NAME halomccvr_support_grab_tests COMMAND halomccvr_support_grab_tests)
+    # Halo 4 on-foot owner-evidence fallback: stage decision plus the per-pair
+    # finalization policy (A003).
+    add_executable(halomccvr_halo4_owner_evidence_tests tests/halo4_owner_evidence_tests.cpp)
+    target_compile_definitions(halomccvr_halo4_owner_evidence_tests PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+    add_test(NAME halomccvr_halo4_owner_evidence_tests COMMAND halomccvr_halo4_owner_evidence_tests)
     # Pure grab/release aim-continuity state machine (fixed 200 ms smoothstep
     # for both directions) shared by Standard and Plus Virtual Stock.
     # Header-only and dependency-free, so it gets its own deterministic
@@ -517,13 +545,38 @@ if(BUILD_TESTING)
     add_test(NAME halomccvr_virtual_stock_aim_continuity_live_tests
         COMMAND halomccvr_virtual_stock_aim_continuity_live_tests)
     # Source-consistency guard for the aim-continuity invalidation topology:
-    # the layer must be invalidated on exactly its eight exceptional lifecycle
-    # paths (definition plus eight call sites) and never by the routine
+    # the layer must be invalidated on exactly its nine exceptional lifecycle
+    # paths (definition plus nine call sites) and never by the routine
     # prepared-frame retire (ResetPreparedFrame). Python stdlib only; the
     # --self-test mode exercises the checker logic on synthetic sources.
     add_test(NAME halomccvr_aim_continuity_lifecycle_guard
         COMMAND "${Python3_EXECUTABLE}" -O
             "${CMAKE_CURRENT_SOURCE_DIR}/tools/check_aim_continuity_lifecycle.py"
+            --self-test)
+    # Source-consistency guard for the Two-Handed Lab patch wiring: the Lab is
+    # hidden from normal sidebar navigation exactly like the Virtual Stock Lab
+    # (no Advanced doorway, no Back button) while its page block and test
+    # suites stay registered, presets are complete deterministic builder
+    # states, the global reset also resets the Lab while the Virtual Stock
+    # reset never touches it, and the status line uses numerical wording.
+    # Python stdlib only; the --self-test mode exercises the checker logic on
+    # synthetic sources and then checks the real tree.
+    add_test(NAME halomccvr_two_hand_lab_patch_guard
+        COMMAND "${Python3_EXECUTABLE}" -O
+            "${CMAKE_CURRENT_SOURCE_DIR}/tools/check_two_hand_lab_patch.py"
+            --self-test)
+    # Source-consistency guard for the persistent support grip port: the
+    # config key stays default-off with its parse/save branches, the
+    # applicability predicate is consulted by both the durable writer and the
+    # assembly qualification, the PG-off latch branch keeps its base stores
+    # verbatim, the reticle reseed and the owner-break invalidation pair stay
+    # single, no donor leftover or retired sway symbol enters the new paths,
+    # and the acquisition predicate stays gated behind the feature. Python
+    # stdlib only; the --self-test mode exercises the checker logic on
+    # synthetic sources and then checks the real tree.
+    add_test(NAME halomccvr_persistent_support_grip_guard
+        COMMAND "${Python3_EXECUTABLE}" -O
+            "${CMAKE_CURRENT_SOURCE_DIR}/tools/check_persistent_support_grip.py"
             --self-test)
     set(HALOMCCVR_HAPTICS_FIXTURE "${HALOMCCVR_GENERATED_DIR}/haptics_runtime_functions.inl")
     add_custom_command(OUTPUT "${HALOMCCVR_HAPTICS_FIXTURE}"
@@ -597,7 +650,7 @@ if(BUILD_TESTING)
     add_executable(halomccvr_grip_pose_capture_tests tests/grip_pose_capture_tests.cpp
         "${HALOMCCVR_GRIP_POSE_CAPTURE_FIXTURE}")
     target_include_directories(halomccvr_grip_pose_capture_tests PRIVATE
-        "${HALOMCCVR_GENERATED_DIR}" "${openxr_SOURCE_DIR}/include")
+        "${HALOMCCVR_GENERATED_DIR}" "${openxr_SOURCE_DIR}/include" src/common)
     target_compile_definitions(halomccvr_grip_pose_capture_tests PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
     add_test(NAME halomccvr_grip_pose_capture_tests COMMAND halomccvr_grip_pose_capture_tests)
     set(HALOMCCVR_AIM_POSE_FIXTURE "${HALOMCCVR_GENERATED_DIR}/aim_pose_functions.inl")
@@ -617,10 +670,29 @@ if(BUILD_TESTING)
         "${HALOMCCVR_GENERATED_DIR}" "${openxr_SOURCE_DIR}/include" src/common)
     target_compile_definitions(halomccvr_aim_pose_tests PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
     add_test(NAME halomccvr_aim_pose_tests COMMAND halomccvr_aim_pose_tests)
+    # Two-Handed Lab tranche 2A: live VS-off solver integration (runtime
+    # settings snapshot, anchor matrix, offhand influence, soft agreement,
+    # single-source D/S, diagnostics) against the same generated aim fixture.
+    add_executable(halomccvr_two_hand_lab_solver_tests
+        tests/two_hand_lab_solver_tests.cpp "${HALOMCCVR_AIM_POSE_FIXTURE}")
+    target_include_directories(halomccvr_two_hand_lab_solver_tests PRIVATE
+        "${HALOMCCVR_GENERATED_DIR}" "${openxr_SOURCE_DIR}/include" src/common)
+    target_compile_definitions(halomccvr_two_hand_lab_solver_tests PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+    add_test(NAME halomccvr_two_hand_lab_solver_tests COMMAND halomccvr_two_hand_lab_solver_tests)
+    # Two-Handed Lab tranche 2B: live temporal experiment modes (production
+    # fragment against the generated aim fixture) — Continuity200ms latch
+    # law, constant/adaptive damping, mode exclusivity, resets, fail-open.
+    add_executable(halomccvr_two_hand_lab_temporal_tests
+        tests/two_hand_lab_temporal_tests.cpp "${HALOMCCVR_AIM_POSE_FIXTURE}")
+    target_include_directories(halomccvr_two_hand_lab_temporal_tests PRIVATE
+        "${HALOMCCVR_GENERATED_DIR}" "${openxr_SOURCE_DIR}/include" src/common)
+    target_compile_definitions(halomccvr_two_hand_lab_temporal_tests PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+    add_test(NAME halomccvr_two_hand_lab_temporal_tests COMMAND halomccvr_two_hand_lab_temporal_tests)
     set(HALOMCCVR_TELEMETRY_TEST_JSONL
         "${HALOMCCVR_GENERATED_DIR}/telemetry_recorder_test.jsonl")
     add_executable(halomccvr_telemetry_tests
         tests/telemetry_recorder_tests.cpp
+        "${HALOMCCVR_AIM_POSE_FIXTURE}"
         src/dll/telemetry_recorder.cpp
         src/common/log.cpp)
     set(HALOMCCVR_TELEMETRY_ANALYSER_SOURCE
@@ -643,7 +715,7 @@ if(BUILD_TESTING)
     add_dependencies(halomccvr_telemetry_tests
         halomccvr_telemetry_analyser_smoke_stage)
     target_include_directories(halomccvr_telemetry_tests PRIVATE
-        "${openxr_SOURCE_DIR}/include" src/common src/dll)
+        "${HALOMCCVR_GENERATED_DIR}" "${openxr_SOURCE_DIR}/include" src/common src/dll)
     target_compile_definitions(halomccvr_telemetry_tests PRIVATE
         UNICODE _UNICODE NOMINMAX WIN32_LEAN_AND_MEAN
         HALOMCCVR_TELEMETRY_TESTING

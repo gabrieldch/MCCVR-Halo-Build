@@ -551,8 +551,8 @@ try {
     $analyserHash =
         (Get-FileHash -LiteralPath $analyserPath -Algorithm SHA256).Hash
     $expectedAnalyserHash =
-        '73945DB9971D63B0F688EFFCBCB433B266C262800757291E8CE8ACB896B4D722'
-    if ($analyserSource.Length -ne 312031 -or
+        '053CF61671BE281551B89A459E0611490F29D0FFD00387B43668043793BAE5B4'
+    if ($analyserSource.Length -ne 395283 -or
             $analyserSourceHash -cne $expectedAnalyserHash -or
             $analyser.Length -ne $analyserSource.Length -or
             $analyserHash -cne $analyserSourceHash) {

@@ -1,12 +1,14 @@
 #include <Windows.h>
 #include <openxr/openxr.h>
 #include "../src/common/virtual_stock_logic.h"
+#include "../src/common/two_hand_input_smoothing.h"
 #include "../src/common/virtual_stock_test_profiles.h"
 #include "../src/dll/aim_pose_trace.h"
 #include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <iterator>
+#include <limits>
 
 namespace
 {
@@ -358,6 +360,13 @@ void TestHybridHorizontalReleaseComposition()
         inputs.right.position = {horizontalReach, 0.0f, 0.0f};
         inputs.supportPosition = {
             horizontalReach + 0.15f, 0.0f, -1.0f};
+        // The product VS-off pair is the fixed Grip -> Grip line when both grip
+        // samples are usable and the aim-position pair otherwise (W2). This
+        // fixture carries no grip sample, so keep the support AIM point on the
+        // production support endpoint - exactly what the assembly produces when
+        // the selected endpoint is not a grip sample - so the free solve below
+        // is the same aim-line pair the reference compares against.
+        inputs.left.position = inputs.supportPosition;
         inputs.headPosition = {0.0f, 0.0f, 0.0f};
         inputs.headOrientation = {0.0f, 0.0f, 0.0f, 1.0f};
         return inputs;
@@ -586,6 +595,736 @@ void TestHybridDiagnosticState()
         "A fresh Hybrid diagnostic state resets to Normal");
 }
 
+void TestTwoHandInputSmoothing()
+{
+    using two_hand_input_smoothing::Advance;
+    using two_hand_input_smoothing::Reset;
+    using two_hand_input_smoothing::Sample;
+    using virtual_stock::Point3;
+    using virtual_stock::Quat4;
+    two_hand_input_smoothing::State state{};
+    Sample raw{};
+    raw.primaryOrientation = Quat4{0.0f, 0.0f, 0.0f, 1.0f};
+    raw.primaryGripValid = true;
+    raw.supportGripValid = true;
+
+    const auto seed = Advance(state, 1, 0.01f, raw);
+    Check(seed.valid && seed.advanced && Near(seed.alpha, 0.25f) &&
+            seed.filtered.primaryOrientation.w == raw.primaryOrientation.w &&
+            seed.filtered.primaryAimPosition.x == raw.primaryAimPosition.x &&
+            seed.filtered.supportAimPosition.x == raw.supportAimPosition.x,
+        "first active prepared frame seeds every filtered input exactly raw");
+
+    Sample moved = raw;
+    moved.primaryOrientation = Quat4{0.0f, 1.0f, 0.0f, 0.0f};
+    moved.primaryAimPosition = Point3{4.0f, 0.0f, 0.0f};
+    moved.supportAimPosition = Point3{2.0f, 0.0f, -2.0f};
+    moved.primaryGripPosition = Point3{0.4f, 0.0f, 0.0f};
+    moved.supportGripPosition = Point3{0.0f, 0.0f, -0.4f};
+    const auto filtered = Advance(state, 2, 0.01f, moved);
+    const Quat4 expectedRotation = virtual_stock::SlerpQuat4Shortest(
+        raw.primaryOrientation, moved.primaryOrientation, 0.25f);
+    Check(filtered.valid && filtered.advanced && Near(filtered.alpha, 0.25f) &&
+            Near(filtered.filtered.primaryAimPosition.x, 1.0f) &&
+            Near(filtered.filtered.supportAimPosition.x, 0.5f) &&
+            Near(filtered.filtered.primaryGripPosition.x, 0.1f) &&
+            Near(filtered.filtered.supportGripPosition.z, -0.1f) &&
+            Near(virtual_stock::Quat4AngleDegrees(
+                filtered.filtered.primaryOrientation, expectedRotation), 0.0f,
+                0.01f),
+        "speed-25 applies alpha=clamp(25*dt,0,1) to positions and quaternion SLERP");
+    const Sample beforeDuplicate = filtered.filtered;
+    Sample duplicateTarget = moved;
+    duplicateTarget.primaryAimPosition = Point3{-20.0f, 0.0f, 0.0f};
+    const auto duplicate = Advance(state, 2, 0.04f, duplicateTarget);
+    Check(duplicate.valid && !duplicate.advanced &&
+            Near(state.primaryAimPosition.x,
+                beforeDuplicate.primaryAimPosition.x) &&
+            Near(state.primaryAimPosition.z,
+                beforeDuplicate.primaryAimPosition.z),
+        "a duplicate prepared serial cannot advance filter history twice");
+    const auto invalidDt = Advance(state, 3, 0.0f, moved);
+    Check(!invalidDt.valid && !invalidDt.advanced &&
+            state.lastPreparedSerial == 2,
+        "non-positive dt fails open without consuming the prepared serial");
+
+    Reset(state);
+    const auto yaw = [](float degrees) {
+        const float radians = degrees * 0.008726646259971648f;
+        return Quat4{0.0f, std::sin(radians), 0.0f, std::cos(radians)};
+    };
+    Sample arcStart = raw;
+    arcStart.primaryOrientation = yaw(170.0f);
+    Check(Advance(state, 1, 0.01f, arcStart).advanced,
+        "shortest-arc fixture seeds its initial quaternion");
+    Sample arcEnd = arcStart;
+    arcEnd.primaryOrientation = yaw(-170.0f);
+    const auto arcMid = Advance(state, 2, 0.02f, arcEnd);
+    Check(arcMid.valid && arcMid.advanced &&
+            Near(virtual_stock::Quat4AngleDegrees(
+                arcMid.filtered.primaryOrientation,
+                Quat4{0.0f, 1.0f, 0.0f, 0.0f}), 0.0f, 0.1f),
+        "quaternion smoothing takes the 20-degree shortest arc across the sign boundary");
+    Reset(state);
+    const auto fullResponse = Advance(state, 1, 1.0f, moved);
+    Check(fullResponse.valid && fullResponse.advanced &&
+            fullResponse.alpha == 1.0f &&
+            Near(fullResponse.filtered.primaryAimPosition.x,
+                moved.primaryAimPosition.x),
+        "alpha clamps to one when dt is at least 40 ms");
+
+    const two_hand_input_smoothing::PublicationIdentity identity{
+        17, 23, 4, 9, true, false};
+    Check(two_hand_input_smoothing::SamePublicationIdentity(identity, identity),
+        "a filtered publication is accepted for its exact frozen identity");
+    auto changedIdentity = identity;
+    changedIdentity.preparedSerial++;
+    Check(!two_hand_input_smoothing::SamePublicationIdentity(
+            identity, changedIdentity),
+        "a filtered publication fails open for another prepared serial");
+    changedIdentity = identity;
+    changedIdentity.contactSpaceEpoch++;
+    Check(!two_hand_input_smoothing::SamePublicationIdentity(
+            identity, changedIdentity),
+        "a filtered publication fails open after a contact-space epoch change");
+    changedIdentity = identity;
+    changedIdentity.title++;
+    Check(!two_hand_input_smoothing::SamePublicationIdentity(
+            identity, changedIdentity),
+        "a filtered publication fails open for another active title");
+    changedIdentity = identity;
+    changedIdentity.titleGeneration++;
+    Check(!two_hand_input_smoothing::SamePublicationIdentity(
+            identity, changedIdentity),
+        "a filtered publication fails open after title-generation replacement");
+    changedIdentity = identity;
+    changedIdentity.leftHanded = false;
+    Check(!two_hand_input_smoothing::SamePublicationIdentity(
+            identity, changedIdentity),
+        "a filtered publication fails open after handedness changes");
+    changedIdentity = identity;
+    changedIdentity.supportEndpointUsedGrip = true;
+    Check(!two_hand_input_smoothing::SamePublicationIdentity(
+            identity, changedIdentity),
+        "a filtered publication fails open when the support endpoint source changes");
+    changedIdentity = identity;
+    changedIdentity.preparedSerial = 0;
+    Check(!two_hand_input_smoothing::SamePublicationIdentity(
+            changedIdentity, changedIdentity),
+        "serial zero never qualifies as a filtered publication identity");
+
+    Reset(state);
+    Sample bad = raw;
+    bad.supportAimPosition.x = std::numeric_limits<float>::quiet_NaN();
+    Check(!Advance(state, 1, 0.01f, bad).valid && !state.initialized,
+        "non-finite input fails open and is never retained");
+    const float largest = std::numeric_limits<float>::max();
+    Sample extreme = raw;
+    extreme.primaryAimPosition.x = -largest;
+    Check(Advance(state, 1, 0.01f, extreme).advanced,
+        "finite extreme input can seed without arithmetic");
+    extreme.primaryAimPosition.x = largest;
+    const auto overflow = Advance(state, 2, 0.02f, extreme);
+    Check(overflow.valid && !overflow.advanced && !state.initialized &&
+            overflow.filtered.primaryAimPosition.x == largest,
+        "non-finite interpolation falls back to raw and clears bad history");
+
+    AimPoseInputs rawInputs = EquivalenceInputs();
+    rawInputs.virtualStockEnabled = false;
+    rawInputs.twoHandLabEnabled = false;
+    rawInputs.primaryGripValid = true;
+    rawInputs.primaryGripPosition = {0.12f, 0.08f, 0.02f};
+    rawInputs.supportGripValid = true;
+    rawInputs.supportGripPosition = {0.40f, 0.08f, -0.76f};
+    const AimPoseResult rawTwoHand = ComputeAimPose(rawInputs);
+    AimPoseInputs filteredInputs = rawInputs;
+    filteredInputs.twoHandSmoothingGeometryValid = true;
+    filteredInputs.twoHandSmoothedPrimaryOrientation =
+        {0.0f, 0.04f, 0.0f, 0.9991997f};
+    filteredInputs.twoHandSmoothedPrimaryAimPosition = {0.25f, 0.08f, 0.02f};
+    filteredInputs.twoHandSmoothedSupportAimPosition = {0.36f, 0.08f, -0.78f};
+    filteredInputs.twoHandSmoothedPrimaryGripValid = true;
+    filteredInputs.twoHandSmoothedPrimaryGripPosition = {0.27f, 0.08f, 0.02f};
+    filteredInputs.twoHandSmoothedSupportGripValid = true;
+    filteredInputs.twoHandSmoothedSupportGripPosition = {0.38f, 0.08f, -0.80f};
+    const AimPoseResult filteredTwoHand = ComputeAimPose(filteredInputs);
+    Check(rawTwoHand.valid && rawTwoHand.twoHandActive &&
+            filteredTwoHand.valid && filteredTwoHand.twoHandActive &&
+            SamePosition(filteredTwoHand.pose.position,
+                rawInputs.right.position) &&
+            !Near(AimForward(filteredTwoHand).x, AimForward(rawTwoHand).x,
+                1.0e-4f),
+        "VS-OFF two-hand solve consumes filtered geometry but keeps raw weapon/base position");
+
+    AimPoseInputs oneHand = filteredInputs;
+    oneHand.twoHandLatched = false;
+    AimPoseInputs rawOneHand = rawInputs;
+    rawOneHand.twoHandLatched = false;
+    Check(ExactAimResult(ComputeAimPose(oneHand), ComputeAimPose(rawOneHand)),
+        "one-handed aiming ignores prepared smoother copies exactly");
+
+    AimPoseInputs stockOn = filteredInputs;
+    stockOn.virtualStockEnabled = true;
+    AimPoseInputs stockOnRaw = rawInputs;
+    stockOnRaw.virtualStockEnabled = true;
+    Check(ExactAimResult(ComputeAimPose(stockOn), ComputeAimPose(stockOnRaw)),
+        "Virtual Stock output is identical with smoothing input copies present or absent");
+
+    AimPoseInputs labGG = filteredInputs;
+    labGG.twoHandLabEnabled = true;
+    labGG.twoHandLabAnchor = 4;
+    labGG.twoHandLabOffhandInfluence = 1.0f;
+    AimPoseTrace labTrace{};
+    const AimPoseResult labResult = ComputeAimPose(labGG, &labTrace);
+    Check(labResult.valid && labTrace.labValid && labTrace.lab.pivotsValid &&
+            Near(labTrace.lab.primaryPivot.x,
+                labGG.twoHandSmoothedPrimaryGripPosition.x) &&
+            Near(labTrace.lab.supportPivot.z,
+                labGG.twoHandSmoothedSupportGripPosition.z),
+        "Lab GG pivots consume the same filtered Grip copies as the production solve");
+
+    // (a) Acquisition/admission is raw: the prepared smoother copies exist only
+    // for an already-acquired two-hand hold. vr.cpp applies them only when
+    // inputs.twoHandLatched is set (ApplyPreparedTwoHandInputSmoothing), and
+    // the grip-zone admission itself consumes the raw captured grips, so a
+    // frame that has not acquired the hold must solve bit-identically with
+    // hostile smoother copies present.
+    const auto withHostileCopies = [](AimPoseInputs inputs) {
+        inputs.twoHandSmoothingGeometryValid = true;
+        inputs.twoHandSmoothedPrimaryOrientation =
+            {0.0f, 0.0998334f, 0.0f, 0.9950042f};
+        inputs.twoHandSmoothedPrimaryAimPosition = {9.0f, 9.0f, 9.0f};
+        inputs.twoHandSmoothedSupportAimPosition = {-9.0f, -9.0f, -9.0f};
+        inputs.twoHandSmoothedPrimaryGripValid = true;
+        inputs.twoHandSmoothedPrimaryGripPosition = {9.0f, 9.0f, 9.0f};
+        inputs.twoHandSmoothedSupportGripValid = true;
+        inputs.twoHandSmoothedSupportGripPosition = {-9.0f, -9.0f, -9.0f};
+        return inputs;
+    };
+    {
+        AimPoseInputs unacquired = rawInputs;
+        unacquired.twoHandLatched = false;
+        Check(ExactAimResult(ComputeAimPose(withHostileCopies(unacquired)),
+                ComputeAimPose(unacquired)),
+            "an unacquired latch solves exactly as raw, so smoother state cannot admit or steer acquisition");
+
+        AimPoseInputs supportMissing = rawInputs;
+        supportMissing.leftValid = false;
+        Check(ExactAimResult(ComputeAimPose(withHostileCopies(supportMissing)),
+                ComputeAimPose(supportMissing)),
+            "a frame without the support acquisition stays raw despite smoother copies");
+
+        AimPoseInputs twoHandOff = rawInputs;
+        twoHandOff.twoHandEnabled = false;
+        Check(ExactAimResult(ComputeAimPose(withHostileCopies(twoHandOff)),
+                ComputeAimPose(twoHandOff)),
+            "a disabled two-hand path ignores smoother copies entirely");
+    }
+
+    // (d) Smoothing OFF preserves the current output: with the consumption flag
+    // false the consumer must ignore whatever the smoothed copies hold, so the
+    // OFF frame is the pre-feature raw solve bit-for-bit, while the ON frame is
+    // a real differential against it.
+    {
+        AimPoseInputs smoothingOff = rawInputs;
+        smoothingOff.twoHandSmoothingGeometryValid = false;
+        smoothingOff.twoHandSmoothedPrimaryOrientation =
+            {std::numeric_limits<float>::quiet_NaN(),
+                std::numeric_limits<float>::quiet_NaN(),
+                std::numeric_limits<float>::quiet_NaN(),
+                std::numeric_limits<float>::quiet_NaN()};
+        smoothingOff.twoHandSmoothedPrimaryAimPosition = {
+            std::numeric_limits<float>::infinity(), 0.0f, 0.0f};
+        smoothingOff.twoHandSmoothedSupportAimPosition = {
+            0.0f, -std::numeric_limits<float>::infinity(), 0.0f};
+        smoothingOff.twoHandSmoothedPrimaryGripValid = true;
+        smoothingOff.twoHandSmoothedPrimaryGripPosition = {
+            std::numeric_limits<float>::quiet_NaN(), 0.0f, 0.0f};
+        smoothingOff.twoHandSmoothedSupportGripValid = true;
+        smoothingOff.twoHandSmoothedSupportGripPosition = {
+            0.0f, 0.0f, std::numeric_limits<float>::quiet_NaN()};
+        const AimPoseResult offResult = ComputeAimPose(smoothingOff);
+        Check(ExactAimResult(offResult, rawTwoHand),
+            "smoothing off consumes no smoothed copy and preserves the raw output exactly");
+        Check(!ExactAimResult(ComputeAimPose(filteredInputs), offResult),
+            "smoothing on is a real presentation differential against smoothing off");
+    }
+
+    // (f) Layer lifecycle reset fails open: the vr.cpp wiring resets
+    // layer.filter via two_hand_input_smoothing::Reset on a title/generation/
+    // contact-space-epoch change and on a handedness swap, so no filtered
+    // geometry may blend across the identity boundary and the packet published
+    // for the previous identity stays rejected.
+    {
+        two_hand_input_smoothing::State layer{};
+        Sample first = raw;
+        first.primaryOrientation = Quat4{0.0f, 0.0f, 0.0f, 1.0f};
+        first.primaryAimPosition = {0.0f, 0.0f, 0.0f};
+        first.supportAimPosition = {0.0f, 0.0f, 0.0f};
+        Check(Advance(layer, 1, 0.01f, first).advanced,
+            "the lifecycle fixture seeds its filter history");
+        Sample movedSample = first;
+        movedSample.primaryOrientation = Quat4{0.0f, 0.1305262f, 0.0f, 0.9914449f};
+        movedSample.primaryAimPosition = {1.0f, 0.0f, 0.0f};
+        movedSample.supportAimPosition = {0.5f, 0.0f, 0.0f};
+        const auto blended = Advance(layer, 2, 0.01f, movedSample);
+        Check(blended.advanced &&
+                blended.filtered.primaryAimPosition.x !=
+                    movedSample.primaryAimPosition.x,
+            "the lifecycle fixture has retained filtered history before the change");
+
+        Reset(layer); // the epoch/title/handedness reset the wiring performs
+        Sample afterChange = movedSample;
+        afterChange.primaryOrientation = Quat4{0.0f, 0.2588190f, 0.0f, 0.9659258f};
+        afterChange.primaryAimPosition = {5.0f, 0.0f, 0.0f};
+        afterChange.supportAimPosition = {4.0f, 0.0f, 0.0f};
+        const auto reseeded = Advance(layer, 3, 0.01f, afterChange);
+        Check(reseeded.valid && reseeded.advanced &&
+                Near(reseeded.alpha, 0.25f) &&
+                reseeded.filtered.primaryAimPosition.x ==
+                    afterChange.primaryAimPosition.x &&
+                reseeded.filtered.supportAimPosition.x ==
+                    afterChange.supportAimPosition.x &&
+                reseeded.filtered.primaryOrientation.w ==
+                    afterChange.primaryOrientation.w,
+            "the first advance after a lifecycle reset is exactly the new raw sample");
+        const auto afterResetPacket = Advance(layer, 4, 0.01f, afterChange);
+        Check(afterResetPacket.valid &&
+                afterResetPacket.filtered.primaryAimPosition.x ==
+                    afterChange.primaryAimPosition.x,
+            "history after the lifecycle reset belongs only to the new identity");
+
+        const two_hand_input_smoothing::PublicationIdentity oldIdentity{
+            2, 9, 3, 7, true, false};
+        auto changedEpoch = oldIdentity;
+        changedEpoch.contactSpaceEpoch = 10;
+        Check(!two_hand_input_smoothing::SamePublicationIdentity(
+                oldIdentity, changedEpoch),
+            "a pre-change filtered packet is rejected after the contact-space epoch moves");
+        auto changedHandedness = oldIdentity;
+        changedHandedness.leftHanded = false;
+        Check(!two_hand_input_smoothing::SamePublicationIdentity(
+                oldIdentity, changedHandedness),
+            "a pre-change filtered packet is rejected after the handedness swap");
+    }
+}
+
+// The 0..25 Two-Hand Smoothing strength is a wet/dry mix over the UNCHANGED
+// fixed speed-25 filter: 0 is raw exactly (and never advances the filter), 25
+// is the previous candidate's full filter output bit-for-bit, and intermediate
+// values stay between the two with no extra lag. The filter's own history
+// never depends on the strength and never receives the mixed output back.
+void TestTwoHandInputSmoothingStrength()
+{
+    using two_hand_input_smoothing::Advance;
+    using two_hand_input_smoothing::Reset;
+    using two_hand_input_smoothing::Sample;
+    using virtual_stock::Point3;
+    using virtual_stock::Quat4;
+
+    const auto yaw = [](float degrees) {
+        const float radians = degrees * 0.008726646259971648f;
+        return Quat4{0.0f, std::sin(radians), 0.0f, std::cos(radians)};
+    };
+    const auto SameSample = [](const Sample& a, const Sample& b) {
+        return a.primaryOrientation.x == b.primaryOrientation.x &&
+            a.primaryOrientation.y == b.primaryOrientation.y &&
+            a.primaryOrientation.z == b.primaryOrientation.z &&
+            a.primaryOrientation.w == b.primaryOrientation.w &&
+            a.primaryAimPosition.x == b.primaryAimPosition.x &&
+            a.primaryAimPosition.y == b.primaryAimPosition.y &&
+            a.primaryAimPosition.z == b.primaryAimPosition.z &&
+            a.supportAimPosition.x == b.supportAimPosition.x &&
+            a.supportAimPosition.y == b.supportAimPosition.y &&
+            a.supportAimPosition.z == b.supportAimPosition.z &&
+            a.primaryGripValid == b.primaryGripValid &&
+            a.primaryGripPosition.x == b.primaryGripPosition.x &&
+            a.primaryGripPosition.y == b.primaryGripPosition.y &&
+            a.primaryGripPosition.z == b.primaryGripPosition.z &&
+            a.supportGripValid == b.supportGripValid &&
+            a.supportGripPosition.x == b.supportGripPosition.x &&
+            a.supportGripPosition.y == b.supportGripPosition.y &&
+            a.supportGripPosition.z == b.supportGripPosition.z;
+    };
+    const auto SameState = [](const two_hand_input_smoothing::State& a,
+                              const two_hand_input_smoothing::State& b) {
+        return a.initialized == b.initialized &&
+            a.lastPreparedSerial == b.lastPreparedSerial &&
+            a.primaryGripValid == b.primaryGripValid &&
+            a.supportGripValid == b.supportGripValid &&
+            a.primaryOrientation.x == b.primaryOrientation.x &&
+            a.primaryOrientation.y == b.primaryOrientation.y &&
+            a.primaryOrientation.z == b.primaryOrientation.z &&
+            a.primaryOrientation.w == b.primaryOrientation.w &&
+            a.primaryAimPosition.x == b.primaryAimPosition.x &&
+            a.primaryAimPosition.y == b.primaryAimPosition.y &&
+            a.primaryAimPosition.z == b.primaryAimPosition.z &&
+            a.supportAimPosition.x == b.supportAimPosition.x &&
+            a.supportAimPosition.y == b.supportAimPosition.y &&
+            a.supportAimPosition.z == b.supportAimPosition.z &&
+            a.primaryGripPosition.x == b.primaryGripPosition.x &&
+            a.primaryGripPosition.y == b.primaryGripPosition.y &&
+            a.primaryGripPosition.z == b.primaryGripPosition.z &&
+            a.supportGripPosition.x == b.supportGripPosition.x &&
+            a.supportGripPosition.y == b.supportGripPosition.y &&
+            a.supportGripPosition.z == b.supportGripPosition.z;
+    };
+    const auto distance = [](Point3 a, Point3 b) {
+        const float dx = a.x - b.x;
+        const float dy = a.y - b.y;
+        const float dz = a.z - b.z;
+        return std::sqrt(dx * dx + dy * dy + dz * dz);
+    };
+    const auto angle = [](Quat4 a, Quat4 b) {
+        return virtual_stock::Quat4AngleDegrees(a, b);
+    };
+
+    Sample raw{};
+    raw.primaryOrientation = Quat4{0.0f, 0.0f, 0.0f, 1.0f};
+    raw.primaryGripValid = true;
+    raw.supportGripValid = true;
+
+    // --- Endpoint 0: the exact previous "smoothing off" path. The fixed
+    // filter is not consumed, not advanced, and the packet reports 0 strength.
+    {
+        two_hand_input_smoothing::State state{};
+        Sample moved = raw;
+        moved.primaryOrientation = yaw(12.0f);
+        moved.primaryAimPosition = Point3{4.0f, 0.0f, -1.0f};
+        const auto off = Advance(state, 1, 0.01f, moved, 0.0f);
+        Check(!off.valid && !off.advanced && off.alpha == 0.0f &&
+                off.strength == 0.0f && off.mix == 0.0f &&
+                !state.initialized && state.lastPreparedSerial == 0,
+            "strength 0 is inactive: no filtered packet and no filter advance");
+        Check(off.mixed.primaryAimPosition.x == moved.primaryAimPosition.x &&
+                off.mixed.primaryAimPosition.z == moved.primaryAimPosition.z &&
+                off.mixed.primaryOrientation.w == moved.primaryOrientation.w,
+            "strength 0 emits the raw sample untouched");
+        Check(!Advance(state, 2, 0.01f, moved, -3.0f).valid &&
+                !Advance(state, 2, 0.01f, moved,
+                    std::numeric_limits<float>::quiet_NaN()).valid &&
+                !Advance(state, 2, 0.01f, moved,
+                    std::numeric_limits<float>::infinity()).valid &&
+                !state.initialized,
+            "negative and non-finite strengths read as off and never advance");
+        const auto clampedHigh = Advance(state, 2, 0.01f, moved, 100.0f);
+        Check(clampedHigh.valid && clampedHigh.advanced &&
+                clampedHigh.strength ==
+                    two_hand_input_smoothing::kStrengthMaximum &&
+                clampedHigh.mix == 1.0f,
+            "strength above 25 clamps to the full filter, not beyond it");
+    }
+
+    // --- Endpoint 25 is the previous candidate's full filter output exactly,
+    // including the retained history that produced it.
+    {
+        Sample first = raw;
+        first.primaryOrientation = yaw(3.0f);
+        first.primaryAimPosition = Point3{0.15f, 1.30f, -0.25f};
+        first.supportAimPosition = Point3{0.10f, 1.29f, -0.60f};
+        first.primaryGripPosition = Point3{0.16f, 1.30f, -0.25f};
+        first.supportGripPosition = Point3{0.11f, 1.29f, -0.61f};
+        Sample second = first;
+        second.primaryOrientation = yaw(9.0f);
+        second.primaryAimPosition = Point3{0.30f, 1.31f, -0.28f};
+        second.supportAimPosition = Point3{0.14f, 1.28f, -0.66f};
+        second.primaryGripPosition = Point3{0.31f, 1.31f, -0.28f};
+        second.supportGripPosition = Point3{0.15f, 1.28f, -0.67f};
+
+        two_hand_input_smoothing::State defaultStrength{};
+        two_hand_input_smoothing::State explicitFull{};
+        const auto seedDefault = Advance(defaultStrength, 1, 0.01f, first);
+        const auto seedExplicit = Advance(explicitFull, 1, 0.01f, first, 25.0f);
+        Check(seedDefault.advanced && seedExplicit.advanced &&
+                SameSample(seedDefault.filtered, seedExplicit.filtered) &&
+                SameSample(seedDefault.mixed, seedExplicit.mixed) &&
+                SameSample(seedDefault.mixed, seedDefault.filtered),
+            "the default strength is the full 25 filter and its 1.0 mix returns the filtered sample itself");
+        const auto movedDefault = Advance(defaultStrength, 2, 0.01f, second);
+        const auto movedExplicit = Advance(explicitFull, 2, 0.01f, second, 25.0f);
+        Check(movedDefault.advanced && movedExplicit.advanced &&
+                SameSample(movedDefault.raw, movedExplicit.raw) &&
+                SameSample(movedDefault.filtered, movedExplicit.filtered) &&
+                SameSample(movedDefault.mixed, movedExplicit.filtered) &&
+                movedDefault.alpha == movedExplicit.alpha &&
+                SameState(defaultStrength, explicitFull),
+            "strength 25 reproduces the pre-slider full smoothing result and history bit-for-bit");
+        Check(movedDefault.filtered.primaryAimPosition.x !=
+                second.primaryAimPosition.x &&
+                movedDefault.filtered.primaryOrientation.w !=
+                second.primaryOrientation.w,
+            "the endpoint fixture really lags raw motion, so the equality above is not vacuous");
+    }
+
+    // --- Identical-history endpoints/intermediates: one history (advanced at
+    // full strength) is copied per strength so the only difference is the mix.
+    two_hand_input_smoothing::State history{};
+    Sample last = raw;
+    for (int index = 0; index < 6; ++index)
+    {
+        Sample step = raw;
+        step.primaryOrientation = yaw(3.0f * static_cast<float>(index));
+        step.primaryAimPosition = Point3{0.05f * index, 1.30f,
+            -0.20f - 0.01f * index};
+        step.supportAimPosition = Point3{0.02f * index, 1.29f,
+            -0.55f - 0.01f * index};
+        step.primaryGripPosition = Point3{0.06f * index, 1.30f,
+            -0.21f - 0.01f * index};
+        step.supportGripPosition = Point3{0.03f * index, 1.29f,
+            -0.56f - 0.01f * index};
+        last = step;
+        const auto advanced = Advance(history,
+            static_cast<uint64_t>(index) + 7, 0.01f, step);
+        if (index < 5)
+            Check(advanced.advanced && advanced.mixed.primaryAimPosition.x ==
+                    advanced.filtered.primaryAimPosition.x,
+                "the endpoint history advances fully under the default strength");
+    }
+    const auto mixAt = [&](float strength) {
+        two_hand_input_smoothing::State copy = history;
+        return Advance(copy, 13, 0.01f, last, strength);
+    };
+    const auto at5 = mixAt(5.0f);
+    const auto at125 = mixAt(12.5f);
+    const auto at20 = mixAt(20.0f);
+    const auto atFull = mixAt(25.0f);
+    Check(at5.valid && at5.advanced && at125.advanced && at20.advanced &&
+            atFull.advanced && Near(at5.mix, 0.2f) &&
+            Near(at125.mix, 0.5f) && Near(at20.mix, 0.8f) &&
+            atFull.mix == 1.0f,
+        "intermediate strengths report mix = strength/25");
+    Check(atFull.mixed.primaryAimPosition.x ==
+            atFull.filtered.primaryAimPosition.x &&
+            atFull.mixed.primaryAimPosition.x !=
+                atFull.raw.primaryAimPosition.x,
+        "only strength 25 reproduces the full filtered position exactly");
+
+    const auto rawToMixed = [&](const two_hand_input_smoothing::Result& r) {
+        return distance(r.raw.primaryAimPosition, r.mixed.primaryAimPosition);
+    };
+    const auto filteredToMixed = [&](const two_hand_input_smoothing::Result& r) {
+        return distance(r.filtered.primaryAimPosition,
+            r.mixed.primaryAimPosition);
+    };
+    const float fullDeviation = distance(atFull.raw.primaryAimPosition,
+        atFull.filtered.primaryAimPosition);
+    Check(fullDeviation > 0.0f &&
+            rawToMixed(at5) > 0.0f && rawToMixed(at125) > 0.0f &&
+            rawToMixed(at20) > 0.0f,
+        "the shared-strength fixture has real filter deviation to blend");
+    Check(rawToMixed(at5) < rawToMixed(at125) &&
+            rawToMixed(at125) < rawToMixed(at20) &&
+            rawToMixed(at20) < fullDeviation &&
+            rawToMixed(at5) <= fullDeviation + 1.0e-6f &&
+            rawToMixed(at20) <= fullDeviation + 1.0e-6f,
+        "increasing strength monotonically moves the applied position toward the full filter and never past it");
+    Check(filteredToMixed(at5) > filteredToMixed(at125) &&
+            filteredToMixed(at125) > filteredToMixed(at20) &&
+            filteredToMixed(at20) >= 0.0f,
+        "increasing strength monotonically closes the distance to the full filtered position");
+    Check(Near(rawToMixed(at5), 0.2f * fullDeviation, 1.0e-5f) &&
+            Near(rawToMixed(at125), 0.5f * fullDeviation, 1.0e-5f) &&
+            Near(rawToMixed(at20), 0.8f * fullDeviation, 1.0e-5f),
+        "the applied position offset is exactly mix x the full-filter offset, so the slider is a wet/dry amount and never a slower filter");
+    for (const two_hand_input_smoothing::Result* partial :
+        {&at5, &at125, &at20})
+    {
+        Check(angle(partial->raw.primaryOrientation,
+                    partial->mixed.primaryOrientation) <=
+                angle(partial->raw.primaryOrientation,
+                    partial->filtered.primaryOrientation) + 1.0e-3f,
+            "a partial strength never adds more rotational lag than the full filter");
+        Check(distance(partial->raw.supportAimPosition,
+                    partial->mixed.supportAimPosition) <=
+                distance(partial->raw.supportAimPosition,
+                    partial->filtered.supportAimPosition) + 1.0e-6f,
+            "a partial strength never adds more support-position lag than the full filter");
+    }
+    Check(distance(at125.raw.primaryGripPosition,
+                at125.mixed.primaryGripPosition) > 0.0f &&
+            distance(at125.raw.primaryGripPosition,
+                at125.mixed.primaryGripPosition) <
+                distance(at125.raw.primaryGripPosition,
+                    at125.filtered.primaryGripPosition),
+        "grip copies blend by the same mix and stay short of the full filter");
+
+    // --- Filter independence: the retained history is identical no matter what
+    // strength each frame used, and the mixed output is never fed back.
+    {
+        two_hand_input_smoothing::State partialHistory{};
+        two_hand_input_smoothing::State fullHistory{};
+        int differingFrames = 0;
+        for (int index = 0; index < 6; ++index)
+        {
+            Sample step = raw;
+            step.primaryOrientation = yaw(2.0f * static_cast<float>(index));
+            step.primaryAimPosition = Point3{0.04f * index, 1.30f,
+                -0.15f - 0.02f * index};
+            step.supportAimPosition = Point3{0.01f * index, 1.29f,
+                -0.50f - 0.02f * index};
+            const uint64_t serial = static_cast<uint64_t>(index) + 40;
+            const auto partial = Advance(partialHistory, serial, 0.01f, step,
+                6.0f);
+            const auto full = Advance(fullHistory, serial, 0.01f, step, 25.0f);
+            Check(partial.advanced && full.advanced,
+                "both strengths advance the shared filter history");
+            // The first frame reseeds both filters exactly raw, so the two
+            // strengths agree there; every frame with real filtered deviation
+            // must differ.
+            if (index > 0)
+            {
+                Check(!SameSample(partial.mixed, full.mixed),
+                    "the strength genuinely changes what consumers receive");
+                if (!SameSample(partial.mixed, full.mixed))
+                    ++differingFrames;
+            }
+        }
+        Check(differingFrames > 0,
+            "the strength genuinely changes what consumers receive");
+        Check(SameState(partialHistory, fullHistory),
+            "the fixed filter history advances identically for every strength: the mixed output is never fed back");
+    }
+
+    // --- A strength change on an already-advanced serial cannot advance the
+    // filter a second time, and cannot rewrite the frozen result.
+    {
+        two_hand_input_smoothing::State state{};
+        Sample step = raw;
+        step.primaryAimPosition = Point3{1.0f, 0.0f, 0.0f};
+        const auto first = Advance(state, 60, 0.01f, step, 5.0f);
+        const two_hand_input_smoothing::State snapshot = state;
+        Sample other = step;
+        other.primaryAimPosition = Point3{-9.0f, 0.0f, 0.0f};
+        const auto repeat = Advance(state, 60, 0.04f, other, 25.0f);
+        Check(first.advanced && !repeat.advanced && SameState(state, snapshot) &&
+                repeat.mix == 1.0f &&
+                repeat.filtered.primaryAimPosition.x ==
+                    first.filtered.primaryAimPosition.x,
+            "changing the strength for the same prepared serial never re-advances or rewrites filter history");
+    }
+
+    // --- Stateful lifecycle at partial strength: the first active frame still
+    // reseeds exactly raw (so the mix is raw too), and invalid input fails open
+    // without touching history.
+    {
+        two_hand_input_smoothing::State state{};
+        Sample moved = raw;
+        moved.primaryOrientation = yaw(11.0f);
+        moved.primaryAimPosition = Point3{3.0f, 0.0f, 0.0f};
+        const auto reseed = Advance(state, 1, 0.01f, moved, 12.5f);
+        Check(reseed.valid && reseed.advanced && reseed.mix == 0.5f &&
+                SameSample(reseed.filtered, moved) &&
+                SameSample(reseed.mixed, moved),
+            "the first active frame at a partial strength still reseeds and emits exactly raw");
+        Sample bad = moved;
+        bad.supportAimPosition.x = std::numeric_limits<float>::quiet_NaN();
+        const auto failed = Advance(state, 2, 0.01f, bad, 12.5f);
+        Check(!failed.valid && !failed.advanced && state.lastPreparedSerial == 1,
+            "a non-finite frame at a partial strength fails open with no advance");
+        const auto overflowSeed = Advance(state, 3, 0.01f, moved, 12.5f);
+        Check(overflowSeed.valid && overflowSeed.advanced,
+            "the filter resumes from its last good history after a failed frame");
+    }
+
+    // --- Orientation: shortest-arc blending across the hemisphere/sign
+    // boundary must never take the long way around.
+    {
+        two_hand_input_smoothing::State state{};
+        const auto arcSeed = Advance(state, 1, 0.01f, [&] {
+            Sample s = raw;
+            s.primaryOrientation = yaw(170.0f);
+            return s;
+        }(), 12.5f);
+        Check(arcSeed.advanced, "the partial-strength arc fixture seeds 170 degrees");
+        Sample arcEnd = raw;
+        arcEnd.primaryOrientation = yaw(-170.0f);
+        const auto arc = Advance(state, 2, 0.02f, arcEnd, 12.5f);
+        // The filter's alpha=0.5 step from 170 degrees toward -170 degrees takes
+        // the 20-degree short arc to 180 degrees; the raw<->filtered blend then
+        // sits halfway between -170 and 180, i.e. at 185 degrees (-175). A
+        // long-way interpolation would land near -20 (filter) or -95 (blend).
+        Check(arc.valid && arc.advanced &&
+                Near(angle(arc.filtered.primaryOrientation, yaw(180.0f)), 0.0f,
+                    0.1f) &&
+                Near(angle(arc.mixed.primaryOrientation, yaw(-175.0f)), 0.0f,
+                    0.1f) &&
+                Near(angle(arc.raw.primaryOrientation,
+                        arc.mixed.primaryOrientation), 5.0f, 0.1f) &&
+                Near(angle(arc.raw.primaryOrientation,
+                        arc.filtered.primaryOrientation), 10.0f, 0.1f),
+            "partial strength blends along the 20-degree shortest arc instead of the long way");
+        Check(angle(arc.raw.primaryOrientation, arc.mixed.primaryOrientation) <=
+                angle(arc.raw.primaryOrientation,
+                    arc.filtered.primaryOrientation) + 1.0e-3f,
+            "the partial-strength arc deviation stays inside the full-filter arc");
+
+        Sample a = raw;
+        a.primaryOrientation = yaw(37.0f);
+        Sample flipped = a;
+        flipped.primaryOrientation = Quat4{-yaw(37.0f).x, -yaw(37.0f).y,
+            -yaw(37.0f).z, -yaw(37.0f).w};
+        const Sample hemisphere =
+            two_hand_input_smoothing::BlendByMix(a, flipped, 0.5f);
+        Check(virtual_stock::Quat4AngleDegrees(a.primaryOrientation,
+                hemisphere.primaryOrientation) <= 0.01f,
+            "a sign-flipped (same-rotation) filtered quaternion blends without a 360-degree excursion");
+    }
+
+    // --- Consumer isolation: the strength changes only the already-existing
+    // filtered directional input copies reaching the VS-OFF free two-hand
+    // solve. Virtual Stock Standard (centre) and Plus are untouched at both
+    // endpoints, and the weapon/base position stays raw.
+    {
+        AimPoseInputs rawInputs = EquivalenceInputs();
+        rawInputs.virtualStockEnabled = false;
+        rawInputs.twoHandLabEnabled = false;
+        rawInputs.primaryGripValid = true;
+        rawInputs.primaryGripPosition = {0.12f, 0.08f, 0.02f};
+        rawInputs.supportGripValid = true;
+        rawInputs.supportGripPosition = {0.40f, 0.08f, -0.76f};
+        const AimPoseResult zeroStrength = ComputeAimPose(rawInputs);
+        AimPoseInputs fullStrength = rawInputs;
+        fullStrength.twoHandSmoothingGeometryValid = true;
+        fullStrength.twoHandSmoothedPrimaryOrientation =
+            {0.0f, 0.04f, 0.0f, 0.9991997f};
+        fullStrength.twoHandSmoothedPrimaryAimPosition = {0.25f, 0.08f, 0.02f};
+        fullStrength.twoHandSmoothedSupportAimPosition = {0.36f, 0.08f, -0.78f};
+        fullStrength.twoHandSmoothedPrimaryGripValid = true;
+        fullStrength.twoHandSmoothedPrimaryGripPosition = {0.27f, 0.08f, 0.02f};
+        fullStrength.twoHandSmoothedSupportGripValid = true;
+        fullStrength.twoHandSmoothedSupportGripPosition = {0.38f, 0.08f, -0.80f};
+        const AimPoseResult fullSmoothed = ComputeAimPose(fullStrength);
+        Check(zeroStrength.valid && fullSmoothed.valid &&
+                !Near(AimForward(fullSmoothed).x, AimForward(zeroStrength).x,
+                    1.0e-4f) &&
+                SamePosition(fullSmoothed.pose.position,
+                    rawInputs.right.position) &&
+                SamePosition(zeroStrength.pose.position,
+                    rawInputs.right.position),
+            "the slider endpoints are a real VS-OFF two-hand differential while the base position stays raw");
+
+        for (int rearReference : {0, 3})
+        {
+            AimPoseInputs stockZero = rawInputs;
+            stockZero.virtualStockEnabled = true;
+            stockZero.virtualStockRearReference = rearReference;
+            AimPoseInputs stockFull = fullStrength;
+            stockFull.virtualStockEnabled = true;
+            stockFull.virtualStockRearReference = rearReference;
+            Check(ExactAimResult(ComputeAimPose(stockZero), ComputeAimPose(stockFull)),
+                "Virtual Stock output is bit-identical at smoothing strength 0 and 25");
+        }
+
+        AimPoseInputs oneHandZero = rawInputs;
+        oneHandZero.twoHandLatched = false;
+        AimPoseInputs oneHandFull = fullStrength;
+        oneHandFull.twoHandLatched = false;
+        Check(ExactAimResult(ComputeAimPose(oneHandZero),
+                ComputeAimPose(oneHandFull)),
+            "one-handed aiming ignores the strength-mixed copies exactly");
+    }
+}
+
 void CheckFixedStockEquivalence(
     int fixedReference, int hybridAdsReference, bool leftHanded,
     const char* message)
@@ -811,6 +1550,591 @@ void TestAimTraceObservationalEquivalence()
             kVirtualStockExperimentProfileFirstId));
     CheckTraceEquivalence(inputs,
         "Null and non-null traces are exactly equivalent for horizontal-release aim");
+}
+
+// T13 corrective: retained support steering for a qualified persistent-grip
+// invocation on the VS-off legacy path. The fixture geometry puts the
+// primary -> support agreement at ~0.310, i.e. below the legacy 0.35 floor.
+AimPoseInputs RetainedLegacyInputs()
+{
+    AimPoseInputs inputs{};
+    inputs.rightValid = true;
+    inputs.right.orientation = {0.0f, 0.0f, 0.0f, 1.0f};
+    inputs.right.position = {0.0f, 0.0f, 0.0f};
+    inputs.leftValid = true;
+    inputs.left.orientation = {0.0f, 0.0f, 0.0f, 1.0f};
+    inputs.left.position = {0.95f, 0.0f, -0.31f};
+    inputs.supportPosition = {0.95f, 0.0f, -0.31f};
+    inputs.twoHandEnabled = true;
+    inputs.twoHandLatched = true;
+    inputs.virtualStockEnabled = false;
+    inputs.twoHandToggle = false;
+    inputs.gunYawDeg = 0.0f;
+    inputs.gunPitchDeg = 0.0f;
+    inputs.gunRollDeg = 0.0f;
+    return inputs;
+}
+
+void TestPersistentGripRetainedSteering()
+{
+    AimPoseInputs inputs = RetainedLegacyInputs();
+    const float supportLength = std::sqrt(
+        0.95f * 0.95f + 0.31f * 0.31f);
+    const virtual_stock::Point3 expectedSupportDirection{
+        0.95f / supportLength, 0.0f, -0.31f / supportLength};
+    const float expectedAgreement = -expectedSupportDirection.z;
+    Check(expectedAgreement < 0.35f && expectedAgreement > 0.30f,
+        "the retained-steering fixture crosses the legacy floor");
+
+    // Unretained (PG off / untrusted / disengaged): the pre-fix behaviour is
+    // byte-identical - the floor rejects and the solve stays one-hand.
+    AimPoseTrace unretainedTrace{};
+    const AimPoseResult unretained = ComputeAimPose(inputs, &unretainedTrace);
+    Check(unretained.valid && !unretained.twoHandActive &&
+            unretained.rejectedExtreme &&
+            Near(unretained.rejectedAgreement, expectedAgreement, 1.0e-4f) &&
+            SameQuaternion(unretained.pose.orientation,
+                inputs.right.orientation),
+        "an unretained sub-floor invocation keeps the exact one-hand pose");
+    Check(unretainedTrace.path == AimSolverPath::LegacyTwoHand &&
+            unretainedTrace.bAttempted && !unretainedTrace.bAccepted &&
+            unretainedTrace.bExtremeRejected &&
+            !unretainedTrace.bSteeringRetained &&
+            Near(unretainedTrace.bRejectedAgreement, expectedAgreement,
+                1.0e-4f) &&
+            unretainedTrace.exactAEndpointSelected &&
+            Near(unretainedTrace.bAgreement, expectedAgreement, 1.0e-4f),
+        "the unretained trace reports the rejection with its floor agreement");
+
+    // Retained (engaged + trusted persistent grip, Virtual Stock off): the
+    // solve keeps the support-derived orientation instead of the one-hand
+    // fallback, and the receipt says support geometry steered the pose.
+    inputs.supportSteeringRetained = true;
+    inputs.supportMayConsume = true;
+    AimPoseTrace retainedTrace{};
+    const AimPoseResult retained = ComputeAimPose(inputs, &retainedTrace);
+    Check(retained.valid && retained.twoHandActive &&
+            !retained.rejectedExtreme && retained.supportTrusted,
+        "a retained invocation keeps two-hand support authority");
+    Check(SamePosition(retained.pose.position, inputs.right.position),
+        "retained steering never moves the primary base position");
+    Check(Near(AimForward(retained).x, expectedSupportDirection.x, 1.0e-4f) &&
+            Near(AimForward(retained).y, expectedSupportDirection.y, 1.0e-4f) &&
+            Near(AimForward(retained).z, expectedSupportDirection.z, 1.0e-4f),
+        "retained steering resolves onto the exact legacy support direction");
+    Check(retainedTrace.path == AimSolverPath::LegacyTwoHand &&
+            retainedTrace.bAttempted && retainedTrace.bAccepted &&
+            retainedTrace.bSteeringRetained &&
+            !retainedTrace.bExtremeRejected &&
+            retainedTrace.bRejectedAgreement == 0.0f &&
+            !retainedTrace.exactAEndpointSelected &&
+            retainedTrace.orientationRebuildAttempted &&
+            retainedTrace.orientationRebuildSucceeded &&
+            Near(retainedTrace.bAgreement, expectedAgreement, 1.0e-4f) &&
+            Near(retainedTrace.bAgreement, unretainedTrace.bAgreement, 1.0e-6f),
+        "the retained trace reports acceptance, the crossed floor agreement "
+        "and a rebuilt orientation");
+
+    // The retention input cannot leak into the Virtual Stock path: with VS on
+    // and no usable stock ray the legacy fallback keeps its floor.
+    AimPoseInputs stockFallback = RetainedLegacyInputs();
+    stockFallback.virtualStockEnabled = true;
+    stockFallback.virtualStockStrength = 1.0f;
+    stockFallback.virtualStockRearHeightM = 0.0f;
+    stockFallback.virtualStockRearReference = 0;
+    stockFallback.supportSteeringRetained = true;
+    stockFallback.supportMayConsume = true;
+    AimPoseTrace stockFallbackTrace{};
+    const AimPoseResult stockFallbackResult =
+        ComputeAimPose(stockFallback, &stockFallbackTrace);
+    Check(stockFallbackResult.valid && !stockFallbackResult.twoHandActive &&
+            stockFallbackResult.rejectedExtreme &&
+            !stockFallbackTrace.bAccepted &&
+            !stockFallbackTrace.bSteeringRetained &&
+            stockFallbackTrace.bExtremeRejected,
+        "the retention input never changes a Virtual Stock invocation");
+}
+
+// Free two-hand production geometry (W2). With Virtual Stock OFF and the hold
+// latched, the positional B line is primary Grip position -> support Grip
+// position ("GG"). The pair is a fixed product rule: no Virtual Stock knob and
+// no "Reduce Support-Hand Rotation" selection may change it, the orientation
+// and roll baseline stays the primary Aim controller, the weapon base position
+// stays the raw primary position, and the aim-position pair is the only
+// fallback when a required grip sample is missing or unusable.
+void TestFixedGripProductionGeometry()
+{
+    const auto base = []() {
+        AimPoseInputs inputs{};
+        inputs.rightValid = true;
+        // 12-degree pitch so the primary quaternion cannot be mistaken for the
+        // identity.
+        inputs.right.orientation = {0.1045285f, 0.0f, 0.0f, 0.9945219f};
+        inputs.right.position = {0.18f, 1.31f, -0.24f};
+        inputs.leftValid = true;
+        inputs.left.orientation = {0.0f, 0.0f, 0.0f, 1.0f};
+        inputs.left.position = {0.02f, 1.29f, -0.58f};
+        inputs.supportPosition = inputs.left.position;
+        inputs.twoHandEnabled = true;
+        inputs.twoHandLatched = true;
+        inputs.twoHandLabEnabled = false;
+        inputs.virtualStockEnabled = false;
+        inputs.twoHandToggle = false;
+        inputs.primaryGripValid = true;
+        inputs.primaryGripPosition = {0.13f, 1.30f, -0.20f};
+        inputs.supportGripValid = true;
+        inputs.supportGripPosition = {0.05f, 1.30f, -0.62f};
+        return inputs;
+    };
+    const auto normalize = [](const XrVector3f& value) {
+        const float length = std::sqrt(
+            value.x * value.x + value.y * value.y + value.z * value.z);
+        return XrVector3f{
+            value.x / length, value.y / length, value.z / length};
+    };
+    const auto directionBetween = [&normalize](
+        const XrVector3f& from, const XrVector3f& to) {
+        return normalize(
+            XrVector3f{to.x - from.x, to.y - from.y, to.z - from.z});
+    };
+    // Independent roll reference: the primary controller's own up vector,
+    // orthogonalized against the aim direction (never the support controller
+    // and never the headset).
+    const auto rollReference = [&normalize](
+        const XrQuaternionf& primaryOrientation, const XrVector3f& forward) {
+        const XrVector3f up = Rotate(primaryOrientation, {0.0f, 1.0f, 0.0f});
+        const float along = up.x * forward.x + up.y * forward.y +
+            up.z * forward.z;
+        return normalize(XrVector3f{
+            up.x - along * forward.x, up.y - along * forward.y,
+            up.z - along * forward.z});
+    };
+
+    const AimPoseInputs gg = base();
+    const XrVector3f ggForward = directionBetween(
+        gg.primaryGripPosition, gg.supportGripPosition);
+    AimPoseTrace ggTrace{};
+    const AimPoseResult result = ComputeAimPose(gg, &ggTrace);
+    Check(result.valid && result.twoHandActive &&
+            ggTrace.path == AimSolverPath::LegacyTwoHand,
+        "the VS-OFF two-hand solve steers with the fixed Grip pair");
+    Check(Near(AimForward(result).x, ggForward.x, 1.0e-4f) &&
+            Near(AimForward(result).y, ggForward.y, 1.0e-4f) &&
+            Near(AimForward(result).z, ggForward.z, 1.0e-4f),
+        "the VS-OFF product direction is primary Grip -> support Grip");
+    Check(SamePosition(Rotate(result.pose.orientation, {0.0f, 1.0f, 0.0f}),
+            rollReference(gg.right.orientation, ggForward)),
+        "the orientation/roll baseline stays the primary Aim controller");
+    Check(SamePosition(result.pose.position, gg.right.position),
+        "the weapon/base position stays the raw primary position");
+
+    // Positional pivots only: neither the primary AIM position nor the support
+    // AIM position may enter the direction.
+    {
+        AimPoseInputs movedPrimaryAim = gg;
+        movedPrimaryAim.right.position = {-0.42f, 1.05f, 0.33f};
+        const AimPoseResult moved = ComputeAimPose(movedPrimaryAim);
+        Check(moved.valid && moved.twoHandActive &&
+                SamePosition(moved.pose.position,
+                    movedPrimaryAim.right.position) &&
+                SamePosition(AimForward(moved), AimForward(result)),
+            "the primary Aim position moves the base position only, never the GG direction");
+        AimPoseInputs movedSupportAim = gg;
+        movedSupportAim.left.position = {0.55f, 1.02f, -1.10f};
+        movedSupportAim.supportPosition = {0.55f, 1.02f, -1.10f};
+        const AimPoseResult movedSupport = ComputeAimPose(movedSupportAim);
+        Check(movedSupport.valid && movedSupport.twoHandActive &&
+                SamePosition(AimForward(movedSupport), AimForward(result)),
+            "the support Aim position no longer steers the VS-OFF product line");
+        AimPoseInputs rotatedSupport = gg;
+        rotatedSupport.left.orientation = {0.5f, 0.5f, 0.5f, 0.5f};
+        const AimPoseResult rotated = ComputeAimPose(rotatedSupport);
+        Check(ExactAimResult(rotated, result),
+            "support-controller rotation keeps no GG authority");
+    }
+
+    // Reduce Support-Hand Rotation is not an input of the fixed pair: both
+    // states of its support-endpoint selection solve exactly the same.
+    {
+        AimPoseInputs rsrOn = gg;
+        rsrOn.supportGripPoseEnabled = true;
+        rsrOn.supportEndpointUsedGrip = true;
+        rsrOn.supportPosition = gg.supportGripPosition;
+        AimPoseInputs rsrOff = gg;
+        rsrOff.supportGripPoseEnabled = false;
+        rsrOff.supportEndpointUsedGrip = false;
+        rsrOff.supportPosition = gg.left.position;
+        Check(ExactAimResult(ComputeAimPose(rsrOn), ComputeAimPose(rsrOff)) &&
+                ExactAimResult(ComputeAimPose(rsrOn), result),
+            "the RSR endpoint selection cannot change the fixed GG solve");
+        // The differential is real: the aim-line pair is a different geometry.
+        AimPoseInputs aimLine = gg;
+        aimLine.primaryGripValid = false;
+        aimLine.supportGripValid = false;
+        Check(!ExactAimResult(ComputeAimPose(aimLine), result),
+            "the aim-position line is a real differential against GG");
+    }
+
+    // Grip fallbacks: a missing or non-finite required grip resolves to the
+    // exact aim-position geometry (the pre-GG product pair), never a mixed
+    // pair and never a fabricated position.
+    {
+        AimPoseInputs aimOnly = gg;
+        aimOnly.primaryGripValid = false;
+        aimOnly.supportGripValid = false;
+        const AimPoseResult expected = ComputeAimPose(aimOnly);
+        Check(expected.valid && expected.twoHandActive,
+            "the aim-position fallback still steers");
+        AimPoseInputs missingSupportGrip = gg;
+        missingSupportGrip.supportGripValid = false;
+        AimPoseInputs missingPrimaryGrip = gg;
+        missingPrimaryGrip.primaryGripValid = false;
+        AimPoseInputs nanSupportGrip = gg;
+        nanSupportGrip.supportGripPosition.x =
+            std::numeric_limits<float>::quiet_NaN();
+        AimPoseInputs infPrimaryGrip = gg;
+        infPrimaryGrip.primaryGripPosition.y =
+            std::numeric_limits<float>::infinity();
+        const AimPoseResult fallbacks[] = {
+            ComputeAimPose(missingSupportGrip),
+            ComputeAimPose(missingPrimaryGrip),
+            ComputeAimPose(nanSupportGrip),
+            ComputeAimPose(infPrimaryGrip)};
+        for (const AimPoseResult& fallback : fallbacks)
+        {
+            Check(ExactAimResult(fallback, expected) && fallback.valid &&
+                    std::isfinite(fallback.pose.position.x) &&
+                    std::isfinite(fallback.pose.position.y) &&
+                    std::isfinite(fallback.pose.position.z) &&
+                    std::isfinite(fallback.pose.orientation.x) &&
+                    std::isfinite(fallback.pose.orientation.y) &&
+                    std::isfinite(fallback.pose.orientation.z) &&
+                    std::isfinite(fallback.pose.orientation.w),
+                "an unusable required grip falls back to the exact aim-position pair");
+        }
+    }
+
+    // Prepared-serial smoothed copies: when this solve carries them, the pair
+    // comes from the smoothed grips (never a mix of smoothed and raw), and the
+    // roll baseline is the smoothed primary orientation.
+    {
+        AimPoseInputs smoothed = gg;
+        smoothed.twoHandSmoothingGeometryValid = true;
+        smoothed.twoHandSmoothedPrimaryOrientation = gg.right.orientation;
+        smoothed.twoHandSmoothedPrimaryAimPosition = {-0.31f, 1.28f, -0.19f};
+        smoothed.twoHandSmoothedSupportAimPosition = {0.11f, 1.30f, -0.55f};
+        smoothed.twoHandSmoothedPrimaryGripValid = true;
+        smoothed.twoHandSmoothedPrimaryGripPosition = {0.10f, 1.30f, -0.18f};
+        smoothed.twoHandSmoothedSupportGripValid = true;
+        smoothed.twoHandSmoothedSupportGripPosition = {0.07f, 1.30f, -0.66f};
+        const AimPoseResult smoothedResult = ComputeAimPose(smoothed);
+        const XrVector3f smoothedForward = directionBetween(
+            smoothed.twoHandSmoothedPrimaryGripPosition,
+            smoothed.twoHandSmoothedSupportGripPosition);
+        Check(smoothedResult.valid && smoothedResult.twoHandActive &&
+                !ExactAimResult(smoothedResult, result) &&
+                Near(AimForward(smoothedResult).x, smoothedForward.x, 1.0e-4f) &&
+                Near(AimForward(smoothedResult).y, smoothedForward.y, 1.0e-4f) &&
+                Near(AimForward(smoothedResult).z, smoothedForward.z, 1.0e-4f) &&
+                SamePosition(smoothedResult.pose.position, gg.right.position),
+            "the smoothed grip copies, not the raw pair, define the smoothed GG solve");
+        Check(SamePosition(
+                Rotate(smoothedResult.pose.orientation, {0.0f, 1.0f, 0.0f}),
+                rollReference(smoothed.twoHandSmoothedPrimaryOrientation,
+                    smoothedForward)),
+            "the smoothed primary orientation stays the roll baseline");
+
+        AimPoseInputs smoothedSupportMissing = smoothed;
+        smoothedSupportMissing.twoHandSmoothedSupportGripValid = false;
+        AimPoseInputs smoothedAimOnly = smoothed;
+        smoothedAimOnly.twoHandSmoothedPrimaryGripValid = false;
+        smoothedAimOnly.twoHandSmoothedSupportGripValid = false;
+        Check(ExactAimResult(ComputeAimPose(smoothedSupportMissing),
+                ComputeAimPose(smoothedAimOnly)),
+            "an unusable smoothed grip falls back to the smoothed aim pair, never the raw grip");
+    }
+
+    // Virtual Stock keeps the Reduce Support-Hand Rotation endpoint: the stock
+    // ray still resolves head -> selected support endpoint on both settings.
+    {
+        AimPoseInputs stock = gg;
+        stock.virtualStockEnabled = true;
+        stock.virtualStockStrength = 1.0f;
+        stock.virtualStockRearHeightM = 0.0f;
+        stock.virtualStockRearReference = 0;
+        stock.virtualStockProximityRelease = false;
+        stock.headValid = true;
+        stock.headPosition = {0.0f, 1.60f, 0.0f};
+        stock.headOrientation = {0.0f, 0.0f, 0.0f, 1.0f};
+        AimPoseInputs aimEndpoint = stock;
+        aimEndpoint.supportGripPoseEnabled = false;
+        aimEndpoint.supportEndpointUsedGrip = false;
+        aimEndpoint.supportPosition = stock.left.position;
+        AimPoseInputs gripEndpoint = stock;
+        gripEndpoint.supportGripPoseEnabled = true;
+        gripEndpoint.supportEndpointUsedGrip = true;
+        gripEndpoint.supportPosition = stock.supportGripPosition;
+        const AimPoseResult aimEndpointResult = ComputeAimPose(aimEndpoint);
+        const AimPoseResult gripEndpointResult = ComputeAimPose(gripEndpoint);
+        const XrVector3f aimStock = directionBetween(
+            aimEndpoint.headPosition, aimEndpoint.left.position);
+        const XrVector3f gripStock = directionBetween(
+            gripEndpoint.headPosition, gripEndpoint.supportGripPosition);
+        Check(aimEndpointResult.valid && gripEndpointResult.valid &&
+                aimEndpointResult.twoHandActive &&
+                gripEndpointResult.twoHandActive &&
+                !ExactAimResult(aimEndpointResult, gripEndpointResult),
+            "Virtual Stock still consumes the RSR support endpoint");
+        Check(Near(AimForward(aimEndpointResult).x, aimStock.x, 1.0e-4f) &&
+                Near(AimForward(aimEndpointResult).y, aimStock.y, 1.0e-4f) &&
+                Near(AimForward(aimEndpointResult).z, aimStock.z, 1.0e-4f) &&
+                Near(AimForward(gripEndpointResult).x, gripStock.x, 1.0e-4f) &&
+                Near(AimForward(gripEndpointResult).y, gripStock.y, 1.0e-4f) &&
+                Near(AimForward(gripEndpointResult).z, gripStock.z, 1.0e-4f),
+            "the Virtual Stock ray still resolves head -> the selected support endpoint");
+    }
+}
+
+// Free two-hand offhand influence (W3). With Virtual Stock OFF and the hold
+// latched, twoHandOffhandInfluence selects the DIRECTIONAL AUTHORITY of the
+// accepted support direction: 0 keeps the exact primary orientation with no
+// positional rebuild, 1 keeps the pre-W3 full accepted-B presentation, and an
+// intermediate value blends primary direction -> accepted B through the same
+// tested TryBlendDirectionAuthority the Lab consumes. Acceptance, the active
+// two-hand relationship and the base pose never depend on it.
+void TestFreeTwoHandOffhandInfluence()
+{
+    const auto base = []() {
+        AimPoseInputs inputs{};
+        inputs.rightValid = true;
+        // 12-degree pitch so the primary quaternion cannot be mistaken for the
+        // identity.
+        inputs.right.orientation = {0.1045285f, 0.0f, 0.0f, 0.9945219f};
+        inputs.right.position = {0.18f, 1.31f, -0.24f};
+        inputs.leftValid = true;
+        inputs.left.orientation = {0.0f, 0.0f, 0.0f, 1.0f};
+        inputs.left.position = {0.02f, 1.29f, -0.58f};
+        inputs.supportPosition = inputs.left.position;
+        inputs.twoHandEnabled = true;
+        inputs.twoHandLatched = true;
+        inputs.virtualStockEnabled = false;
+        inputs.primaryGripValid = true;
+        inputs.primaryGripPosition = {0.13f, 1.30f, -0.20f};
+        inputs.supportGripValid = true;
+        inputs.supportGripPosition = {0.05f, 1.30f, -0.62f};
+        return inputs;
+    };
+    const auto normalize = [](const XrVector3f& value) {
+        const float length = std::sqrt(
+            value.x * value.x + value.y * value.y + value.z * value.z);
+        return XrVector3f{
+            value.x / length, value.y / length, value.z / length};
+    };
+    const auto dot = [](const XrVector3f& a, const XrVector3f& b) {
+        return a.x * b.x + a.y * b.y + a.z * b.z;
+    };
+    const auto directionBetween = [&normalize](
+        const XrVector3f& from, const XrVector3f& to) {
+        return normalize(
+            XrVector3f{to.x - from.x, to.y - from.y, to.z - from.z});
+    };
+
+    const AimPoseInputs fullInputs = base();
+    AimPoseTrace fullTrace{};
+    const AimPoseResult full = ComputeAimPose(fullInputs, &fullTrace);
+    const XrVector3f primaryForward = normalize(
+        Rotate(fullInputs.right.orientation, {0.0f, 0.0f, -1.0f}));
+    const XrVector3f acceptedB = directionBetween(
+        fullInputs.primaryGripPosition, fullInputs.supportGripPosition);
+    Check(full.valid && full.twoHandActive &&
+            fullTrace.path == AimSolverPath::LegacyTwoHand &&
+            fullTrace.bAccepted && fullTrace.orientationRebuildSucceeded &&
+            !fullTrace.exactAEndpointSelected &&
+            Near(AimForward(full).x, acceptedB.x, 1.0e-4f) &&
+            Near(AimForward(full).y, acceptedB.y, 1.0e-4f) &&
+            Near(AimForward(full).z, acceptedB.z, 1.0e-4f),
+        "100% authority rebuilds onto the exact accepted support direction");
+    Check(!SamePosition(primaryForward, acceptedB),
+        "the primary direction and accepted B are a real differential");
+    Check(fullInputs.twoHandOffhandInfluence == 1.0f &&
+            ExactAimResult(ComputeAimPose(base()), full),
+        "an unstamped influence keeps the pre-W3 full accepted-B behaviour exactly");
+
+    // 0%: primary Aim-orientation authority only. The accepted B relationship
+    // stays active (authority is not the logical hold) and no positional
+    // rebuild happens, so the presented orientation is the exact primary
+    // quaternion.
+    AimPoseInputs zeroInputs = base();
+    zeroInputs.twoHandOffhandInfluence = 0.0f;
+    AimPoseTrace zeroTrace{};
+    const AimPoseResult zero = ComputeAimPose(zeroInputs, &zeroTrace);
+    Check(zero.valid && zero.twoHandActive && zero.updateTwoHandActivity &&
+            SameQuaternion(zero.pose.orientation, zeroInputs.right.orientation),
+        "0% presents the exact primary orientation");
+    Check(!zeroTrace.orientationRebuildAttempted &&
+            zeroTrace.exactAEndpointSelected && zeroTrace.bAttempted &&
+            zeroTrace.bAccepted &&
+            SamePosition(AimForward(zero), primaryForward),
+        "0% keeps accepted B active with no positional rebuild");
+    Check(zero.valid == full.valid &&
+            zero.updateTwoHandActivity == full.updateTwoHandActivity &&
+            zero.twoHandActive == full.twoHandActive &&
+            zero.rejectedExtreme == full.rejectedExtreme &&
+            zero.rejectedAgreement == full.rejectedAgreement &&
+            SamePosition(zero.pose.position, full.pose.position) &&
+            zeroTrace.path == fullTrace.path &&
+            zeroTrace.bAccepted == fullTrace.bAccepted,
+        "zero authority changes the presented orientation only: relationship, "
+        "acceptance, rejection and base pose are identical");
+    Check(!SameQuaternion(zero.pose.orientation, full.pose.orientation, 1.0e-4f),
+        "0% and 100% present genuinely different orientations");
+
+    // The product default (0.50) is the tuned A<->B blend and must sit strictly
+    // between the two endpoints.
+    Check(kTwoHandOffhandInfluenceDefault == 0.5f,
+        "the free two-hand offhand influence default is exactly half authority");
+    AimPoseInputs halfInputs = base();
+    halfInputs.twoHandOffhandInfluence = kTwoHandOffhandInfluenceDefault;
+    AimPoseTrace halfTrace{};
+    const AimPoseResult half = ComputeAimPose(halfInputs, &halfTrace);
+    const XrVector3f expectedHalf = normalize(XrVector3f{
+        primaryForward.x * 0.5f + acceptedB.x * 0.5f,
+        primaryForward.y * 0.5f + acceptedB.y * 0.5f,
+        primaryForward.z * 0.5f + acceptedB.z * 0.5f});
+    Check(Near(AimForward(half).x, expectedHalf.x, 1.0e-4f) &&
+            Near(AimForward(half).y, expectedHalf.y, 1.0e-4f) &&
+            Near(AimForward(half).z, expectedHalf.z, 1.0e-4f),
+        "50% presents the tested half-and-half primary -> accepted-B blend");
+    Check(dot(AimForward(half), acceptedB) >
+                  dot(primaryForward, acceptedB) + 1.0e-4f &&
+            dot(AimForward(half), acceptedB) < 1.0f - 1.0e-4f &&
+            !SamePosition(AimForward(half), primaryForward) &&
+            !SamePosition(AimForward(half), acceptedB),
+        "50% is strictly between the primary direction and accepted B");
+    Check(half.valid && half.twoHandActive &&
+            halfTrace.orientationRebuildAttempted &&
+            halfTrace.orientationRebuildSucceeded &&
+            !halfTrace.exactAEndpointSelected,
+        "an intermediate influence still rebuilds from accepted B and stays active");
+
+    // Monotonic: more requested authority always moves the presented direction
+    // strictly closer to accepted B.
+    {
+        const float influences[] = {0.0f, 0.25f, 0.5f, 0.75f, 1.0f};
+        float previousAlignment = -2.0f;
+        float previousDistanceFromPrimary = -1.0f;
+        bool monotonic = true;
+        for (const float influence : influences)
+        {
+            AimPoseInputs inputs = base();
+            inputs.twoHandOffhandInfluence = influence;
+            const XrVector3f forward = AimForward(ComputeAimPose(inputs));
+            const float alignment = dot(forward, acceptedB);
+            const XrVector3f fromPrimary{
+                forward.x - primaryForward.x,
+                forward.y - primaryForward.y,
+                forward.z - primaryForward.z};
+            const float distance = std::sqrt(dot(fromPrimary, fromPrimary));
+            monotonic = monotonic && alignment > previousAlignment &&
+                distance > previousDistanceFromPrimary &&
+                alignment <= 1.0f + 1.0e-5f;
+            previousAlignment = alignment;
+            previousDistanceFromPrimary = distance;
+        }
+        Check(monotonic,
+            "offhand influence is monotonic: more authority always moves the "
+            "presented direction strictly closer to accepted B");
+    }
+
+    // Out-of-range and non-finite authority: the endpoints own the extremes and
+    // an unusable value fails safe to the exact primary endpoint.
+    {
+        AimPoseInputs over = base();
+        over.twoHandOffhandInfluence = 1.5f;
+        AimPoseInputs under = base();
+        under.twoHandOffhandInfluence = -0.5f;
+        AimPoseInputs nan = base();
+        nan.twoHandOffhandInfluence =
+            std::numeric_limits<float>::quiet_NaN();
+        AimPoseInputs infinite = base();
+        infinite.twoHandOffhandInfluence =
+            std::numeric_limits<float>::infinity();
+        Check(ExactAimResult(ComputeAimPose(over), full),
+            "an influence above 1 clamps to full accepted-B authority");
+        Check(ExactAimResult(ComputeAimPose(under), zero) &&
+                ExactAimResult(ComputeAimPose(nan), zero) &&
+                ExactAimResult(ComputeAimPose(infinite), zero),
+            "an out-of-range or non-finite influence fails safe to the exact primary endpoint");
+    }
+
+    // Virtual Stock ignores the setting entirely: its own gates and stock ray
+    // are untouched by the free two-hand authority input.
+    {
+        AimPoseInputs stock = base();
+        stock.virtualStockEnabled = true;
+        stock.virtualStockStrength = 1.0f;
+        stock.virtualStockRearHeightM = 0.0f;
+        stock.virtualStockRearReference = 0;
+        stock.virtualStockProximityRelease = false;
+        stock.headValid = true;
+        stock.headPosition = {0.0f, 1.60f, 0.0f};
+        stock.headOrientation = {0.0f, 0.0f, 0.0f, 1.0f};
+        AimPoseInputs stockZero = stock;
+        stockZero.twoHandOffhandInfluence = 0.0f;
+        AimPoseInputs stockHalf = stock;
+        stockHalf.twoHandOffhandInfluence = kTwoHandOffhandInfluenceDefault;
+        AimPoseTrace stockTrace{};
+        const AimPoseResult stockResult = ComputeAimPose(stock, &stockTrace);
+        Check(stockResult.valid && stockResult.twoHandActive &&
+                stockTrace.path == AimSolverPath::FixedStock &&
+                !ExactAimResult(stockResult, full),
+            "the Virtual Stock baseline is a real, distinct stock solve");
+        Check(ExactAimResult(ComputeAimPose(stockZero), stockResult) &&
+                ExactAimResult(ComputeAimPose(stockHalf), stockResult),
+            "Virtual Stock ignores the free two-hand offhand influence entirely");
+    }
+
+    // The Lab-disabled production path consumes the product setting: stored Lab
+    // values are never read while the Lab is off.
+    {
+        AimPoseInputs labStoredZero = base();
+        labStoredZero.twoHandLabEnabled = false;
+        labStoredZero.twoHandLabOffhandInfluence = 0.0f;
+        labStoredZero.twoHandOffhandInfluence = 1.0f;
+        AimPoseInputs labStoredFull = labStoredZero;
+        labStoredFull.twoHandLabOffhandInfluence = 1.0f;
+        AimPoseTrace labStoredTrace{};
+        const AimPoseResult labStoredResult =
+            ComputeAimPose(labStoredFull, &labStoredTrace);
+        Check(ExactAimResult(ComputeAimPose(labStoredZero), labStoredResult) &&
+                !labStoredTrace.labValid,
+            "a Lab-disabled solve never reads the stored Lab influence");
+        AimPoseInputs productZero = labStoredFull;
+        productZero.twoHandOffhandInfluence = 0.0f;
+        Check(ExactAimResult(ComputeAimPose(productZero), zero),
+            "the Lab-disabled production path consumes the product offhand influence");
+    }
+
+    // Smoothed geometry: at 0% the exact presented primary orientation is the
+    // smoothed primary copy this solve actually consumed, never the raw one.
+    {
+        AimPoseInputs smoothed = base();
+        smoothed.twoHandSmoothingGeometryValid = true;
+        smoothed.twoHandSmoothedPrimaryOrientation =
+            {0.1305262f, 0.0f, 0.0f, 0.9914449f};
+        smoothed.twoHandSmoothedPrimaryAimPosition = {-0.31f, 1.28f, -0.19f};
+        smoothed.twoHandSmoothedSupportAimPosition = {0.11f, 1.30f, -0.55f};
+        smoothed.twoHandSmoothedPrimaryGripValid = true;
+        smoothed.twoHandSmoothedPrimaryGripPosition = {0.10f, 1.30f, -0.18f};
+        smoothed.twoHandSmoothedSupportGripValid = true;
+        smoothed.twoHandSmoothedSupportGripPosition = {0.07f, 1.30f, -0.66f};
+        smoothed.twoHandOffhandInfluence = 0.0f;
+        const AimPoseResult smoothedZero = ComputeAimPose(smoothed);
+        Check(smoothedZero.valid && smoothedZero.twoHandActive &&
+                SameQuaternion(smoothedZero.pose.orientation,
+                    smoothed.twoHandSmoothedPrimaryOrientation),
+            "at 0% the smoothed two-hand solve keeps the exact smoothed primary orientation");
+    }
 }
 
 void TestAimTraceSemantics()
@@ -1850,10 +3174,15 @@ int main()
     TestHybridIgnoresLegacyProximity();
     TestHybridHorizontalReleaseComposition();
     TestHybridDiagnosticState();
+    TestTwoHandInputSmoothing();
+    TestTwoHandInputSmoothingStrength();
     TestHybridStockEquivalence();
     TestHybridDiagnosticOverrides();
     TestHybridDiagnosticModeIsolation();
     TestAimTraceObservationalEquivalence();
+    TestPersistentGripRetainedSteering();
+    TestFixedGripProductionGeometry();
+    TestFreeTwoHandOffhandInfluence();
     TestAimTraceSemantics();
     TestCounterfactualProfileIdentity();
     TestHybridInverseNeckIntegration();

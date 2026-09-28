@@ -7,6 +7,38 @@ entirely: there is no selector, no config key and no experiment surface left.
 Nothing here changes the accepted-build pointer in `docs/CURRENT-STATE.md`;
 headset acceptance of the packaged candidate is still the gate.**
 
+## September 28 extension: VS-OFF transition and input smoothing
+
+The VS Standard/Plus law above remains unchanged. The same fixed 200 ms
+latch-edge law applies to VS-OFF two-hand presentation as **fixed-on internal
+product behaviour**: the former `two_hand_transition_smoothing` toggle was
+retired on 2026-09-29 and no longer resolves (a historical `halomccvr.cfg`
+containing the key still loads quietly, but nothing reads the field and the
+generated config no longer writes it). With VS off, only durable latch
+false-to-true / true-to-false edges seed the transition; stock-solve ownership,
+B acceptance and persistent grip geometry do not start or restart it. Grab
+seeds from the same-frame one-hand counterfactual, release holds the prior
+presentation, and aim position is never changed. A
+lifecycle/title/generation/reference-space reset still fails open and cannot
+carry a transition into a new owner/session.
+
+The independent `two_hand_smoothing_strength` product control defaults to 0
+(off). For an applicable latched VS-OFF two-hand solve only, controller-input
+copies first pass through the fixed Pavlov-inspired response
+`alpha = clamp(25 * dt, 0, 1)`: orientation is shortest-arc quaternion SLERP and
+the specified position copies use linear interpolation. The user strength is
+then a wet/dry mix over that unchanged full-filter output: 0 emits raw input
+untouched, 25 emits the full-filtered result untouched, and every value between
+blends positions linearly and orientations along the shortest arc. It does not
+alter raw acquisition/latch samples, one-hand solves, the weapon/base position
+or any Virtual Stock output. It is a controller-input filter with a mix amount,
+never a user-visible interpolation speed and not a second Lab continuity mode.
+The Lab's constant/adaptive damping remains separately selectable and engages
+only on frames the product seam does not own (Lab enabled, resolved Virtual
+Stock off, `two_handed_aim` off: `TwoHandLabTemporalEngagedFor`), so it never
+stacks a second 200 ms correction. Headset acceptance of these candidate
+additions is pending.
+
 Scope: Virtual Stock **Standard (rear reference 0/1/2) and Plus (rear reference
 3)** with `two_handed_aim` on. Ordinary non-Virtual-Stock two-hand aim is
 untouched. The solver, stock strength, the W/seat thresholds, horizontal
@@ -170,12 +202,22 @@ stays unconsumed.
 
 ## 4. Config and UI
 
-None. The feature is always on for Virtual Stock when `two_handed_aim` is on
-and needs no user control. The rejected experiment's
-`virtual_stock_grab_transition` config key and its F1 "Grab Transition
-(Experimental)" selector were removed; an existing `halomccvr.cfg` containing
-that key still loads (unknown keys are ignored) and the generated config no
-longer writes it.
+For Virtual Stock Standard/Plus, the feature remains always on when
+`two_handed_aim` is on and needs no user control. The same holds for the VS-OFF
+latch continuity: since 2026-09-29 it is fixed-on internal product behaviour
+with **no user toggle**, and the retired `two_hand_transition_smoothing` config
+key no longer resolves (a historical file containing it still loads quietly;
+nothing reads the field and the generated config no longer writes it). The one
+separate VS-OFF product control is `two_hand_smoothing_strength` (0..25,
+default 0 = off); it keeps the fixed speed-25 response and exposes only the
+wet/dry mix amount (0 = raw, 25 = the previous full-strength behaviour). The
+previous candidate's boolean `two_hand_smoothing` key is not written any more;
+when it is present without the numeric key, `false` loads as strength 0 and
+`true` as strength 25, so an existing configuration keeps its behaviour. The
+rejected experiment's `virtual_stock_grab_transition` config key and its F1
+"Grab Transition (Experimental)" selector were removed; an existing
+`halomccvr.cfg` containing that key still loads (unknown keys are ignored) and
+the generated config no longer writes it.
 
 ## 5. Telemetry
 

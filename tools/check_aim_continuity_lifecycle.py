@@ -1,20 +1,24 @@
 """Guard the Virtual Stock aim-continuity invalidation topology in vr.cpp.
 
-The continuity layer must be invalidated on exactly the eight exceptional
-lifecycle paths that own it, and must NOT be invalidated by the routine
-prepared-frame retire. That invariant was silently broken once before: a reset
-on the routine path made every prepared frame a first observation, so no
-grab/release edge could ever seed. No behavioural test can catch it, because
-the defect is in the wiring rather than in the state machine.
+The continuity layer must be invalidated on exactly the exceptional lifecycle
+paths that own it, and must NOT be invalidated by the routine prepared-frame
+retire. That invariant was silently broken once before: a reset on the routine
+path made every prepared frame a first observation, so no grab/release edge
+could ever seed. No behavioural test can catch it, because the defect is in
+the wiring rather than in the state machine.
 
 The check is deliberately narrow. It asserts only:
 
-  1. the identifier ``InvalidateAimContinuityLayer(`` occurs exactly nine
-     times in ``src/dll/vr.cpp``: its definition plus exactly eight call sites
-     (EndPreparedFrameWithoutLayers, EnterFrameWaitFatalDrain, the LOCAL
-     reference-space change, session EXITING/LOSS_PENDING, instance loss, the
-     seam title/generation/epoch change, the seam !applicable branch, and the
-     handedness change);
+      1. the identifier ``InvalidateAimContinuityLayer(`` occurs exactly ten
+      times in ``src/dll/vr.cpp``: its definition plus exactly nine call sites
+      (EndPreparedFrameWithoutLayers, EnterFrameWaitFatalDrain, the LOCAL
+      reference-space change, session EXITING/LOSS_PENDING, instance loss, the
+      seam title/generation/epoch change, the seam !applicable branch, the
+      handedness change, and the persistent-support-grip owner break /
+      generation replacement). That owner break normally invalidates prior
+      geometry. The narrowly qualified VS-OFF product-release bridge instead
+      preserves an already-presented latch release to raw one-hand aim, but
+      never across title/generation identity loss;
   2. the body of ``ResetPreparedFrame`` (brace-matched from its definition
      signature) contains neither ``InvalidateAimContinuityLayer`` nor
      ``ResetAimContinuity``.
@@ -34,7 +38,7 @@ from pathlib import Path
 INVALIDATE = "InvalidateAimContinuityLayer"
 RESET = "ResetAimContinuity"
 ROUTINE_FUNCTION = "ResetPreparedFrame"
-EXPECTED_REFERENCES = 9
+EXPECTED_REFERENCES = 10
 FORBIDDEN_IN_ROUTINE = (INVALIDATE, RESET)
 DEFAULT_SOURCE = (
     Path(__file__).resolve().parent.parent / "src" / "dll" / "vr.cpp"
@@ -113,7 +117,7 @@ def check_source(text: str) -> list[str]:
         lines = ", ".join(str(line_number(text, offset)) for offset in references)
         violations.append(
             f"{INVALIDATE}( occurs {len(references)} times, expected exactly "
-            f"{EXPECTED_REFERENCES} (definition plus 8 call sites); found on "
+            f"{EXPECTED_REFERENCES} (definition plus 9 call sites); found on "
             f"line(s): {lines or 'none'}"
         )
 
@@ -150,6 +154,7 @@ SELF_TEST_CALL_SITES = (
     "seamIdentityChanged",
     "seamNotApplicable",
     "handednessChanged",
+    "persistentGripOwnerBreak",
 )
 
 

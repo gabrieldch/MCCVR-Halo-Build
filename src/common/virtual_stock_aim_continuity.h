@@ -213,13 +213,18 @@ struct AimContinuityInput
     uint64_t preparedSerial = 0;
     float dtSeconds = 0.0f;
 
-    // Latch / ownership signals. Either a latch false->true or stock ownership
-    // becoming true is a grab edge; either leaving is a release edge.
+    // Durable latch state. This is the only transition edge source for the
+    // VS-OFF product bridge. VS Standard/Plus also preserve their historical
+    // stock-solve ownership edge below.
     bool latched = false;
+
+    // VS Standard/Plus historically start/finish continuity when their stock
+    // solve begins/ends owning presentation. The VS-OFF product path leaves
+    // this false, so B acceptance, PG retention and geometry changes cannot
+    // restart its latch-edge bridge.
     bool stockSolveOwnsPresentation = false;
 
-    // Fully calibrated orientation the live solver returned this serial. When
-    // stockSolveOwnsPresentation is false this is the live one-hand pose.
+    // Fully calibrated orientation the live solver returned this serial.
     bool liveOrientationValid = false;
     Quat4 liveOrientation{};
 
@@ -522,9 +527,11 @@ inline void AdvanceAimContinuity(
         (state.previousStockOwnsPresentation &&
             !input.stockSolveOwnsPresentation);
     state.previousLatched = input.latched;
-    state.previousStockOwnsPresentation = input.stockSolveOwnsPresentation;
+    state.previousStockOwnsPresentation =
+        input.stockSolveOwnsPresentation;
 
-    // Ownership leaving stock wins if both edges are seen on one serial.
+    // A released latch seeds the release transition; otherwise acquire only on
+    // a false-to-true latch edge.
     if (releaseEdge)
         SeedAimContinuityRelease(state, input);
     else if (grabEdge)

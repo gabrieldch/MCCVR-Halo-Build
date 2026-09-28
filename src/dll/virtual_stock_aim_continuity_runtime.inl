@@ -71,8 +71,10 @@
         input.preparedSerial = preparedSerial;
         input.dtSeconds = dtSeconds;
         input.latched = stockInputs.twoHandLatched;
-        input.stockSolveOwnsPresentation =
-            live.updateTwoHandActivity && live.twoHandActive;
+        // Preserve VS Standard/Plus ownership-edge behavior. The free-aim
+        // product bridge is strictly latch-edge driven.
+        input.stockSolveOwnsPresentation = stockInputs.virtualStockEnabled &&
+            solve.liveValid && live.twoHandActive;
         input.liveOrientationValid = solve.liveValid;
         input.liveOrientation = solve.live;
         input.oneHandOrientationValid = solve.oneHandValid;

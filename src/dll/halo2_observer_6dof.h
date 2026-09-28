@@ -115,5 +115,8 @@ void Halo2Observer6Dof_ShutdownForVrFailure() noexcept;
 //           bit30 = lifecycle/generation guard rejection (GuardRejected);
 //           bit1  = primary datum ownership proven (set on true return);
 //           bit0  = secondary slot present (raw, not an absence claim).
+// primaryAbsentOut (optional) distinguishes the native explicit raw slot
+// UINT32_MAX from a validation/read failure. It is never set on false
+// without a proven empty slot.
 bool Halo2DiagnosticReadPrimaryWeapon(uint32_t& unitOut, uint32_t& weaponOut,
-    uint32_t& detailOut) noexcept;
+    uint32_t& detailOut, bool* primaryAbsentOut = nullptr) noexcept;

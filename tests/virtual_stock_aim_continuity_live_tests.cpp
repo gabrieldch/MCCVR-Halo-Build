@@ -21,6 +21,7 @@
 //   * the layer never alters a solver's live target and never mutates caller
 //     inputs, and whenever it is inactive presented is bit-identical to live.
 #include <openxr/openxr.h>
+#include "../src/common/two_hand_input_smoothing.h"
 #include "../src/common/virtual_stock_logic.h"
 #include "../src/common/virtual_stock_aim_continuity.h"
 #include "../src/common/virtual_stock_test_profiles.h"
@@ -658,6 +659,185 @@ void TestSolverIsolationAndImmutability()
             "an inactive layer presents the live aim bit-identically");
     }
 }
+// ---------------------------------------------------------------------------
+// Composition order: Pavlov-inspired input smoothing runs FIRST, and the
+// continuity layer composes its live (x) correction onto the SMOOTHED solve.
+// The raw capture, the latch/acquisition sample and the weapon base position
+// stay untouched by both stages.
+// ---------------------------------------------------------------------------
+two_hand_input_smoothing::Sample SmoothingSampleOf(const AimPoseInputs& inputs)
+{
+    two_hand_input_smoothing::Sample sample{};
+    sample.primaryOrientation = {inputs.right.orientation.x,
+        inputs.right.orientation.y, inputs.right.orientation.z,
+        inputs.right.orientation.w};
+    sample.primaryAimPosition = {inputs.right.position.x,
+        inputs.right.position.y, inputs.right.position.z};
+    sample.supportAimPosition = {inputs.left.position.x,
+        inputs.left.position.y, inputs.left.position.z};
+    sample.primaryGripValid = inputs.primaryGripValid;
+    sample.primaryGripPosition = {inputs.primaryGripPosition.x,
+        inputs.primaryGripPosition.y, inputs.primaryGripPosition.z};
+    sample.supportGripValid = inputs.supportGripValid;
+    sample.supportGripPosition = {inputs.supportGripPosition.x,
+        inputs.supportGripPosition.y, inputs.supportGripPosition.z};
+    return sample;
+}
+
+// Mirrors the production consumer mapping: the filtered copies replace only
+// the directional solve geometry; the raw pose fields, the latch and the base
+// position are untouched.
+AimPoseInputs WithFilteredGeometry(
+    const AimPoseInputs& inputs,
+    const two_hand_input_smoothing::Result& filtered)
+{
+    AimPoseInputs out = inputs;
+    out.twoHandSmoothingGeometryValid = true;
+    out.twoHandSmoothedPrimaryOrientation = {
+        filtered.filtered.primaryOrientation.x,
+        filtered.filtered.primaryOrientation.y,
+        filtered.filtered.primaryOrientation.z,
+        filtered.filtered.primaryOrientation.w};
+    out.twoHandSmoothedPrimaryAimPosition = {
+        filtered.filtered.primaryAimPosition.x,
+        filtered.filtered.primaryAimPosition.y,
+        filtered.filtered.primaryAimPosition.z};
+    out.twoHandSmoothedSupportAimPosition = {
+        filtered.filtered.supportAimPosition.x,
+        filtered.filtered.supportAimPosition.y,
+        filtered.filtered.supportAimPosition.z};
+    out.twoHandSmoothedPrimaryGripValid = filtered.filtered.primaryGripValid;
+    out.twoHandSmoothedPrimaryGripPosition = {
+        filtered.filtered.primaryGripPosition.x,
+        filtered.filtered.primaryGripPosition.y,
+        filtered.filtered.primaryGripPosition.z};
+    out.twoHandSmoothedSupportGripValid = filtered.filtered.supportGripValid;
+    out.twoHandSmoothedSupportGripPosition = {
+        filtered.filtered.supportGripPosition.x,
+        filtered.filtered.supportGripPosition.y,
+        filtered.filtered.supportGripPosition.z};
+    return out;
+}
+
+void TestSmoothingComposesBeforeContinuity()
+{
+    using two_hand_input_smoothing::Advance;
+
+    // One VS-OFF fixture: no Virtual Stock, both controllers valid, primary
+    // grip present. The yaw/position parameters let one serial of raw motion
+    // be replayed both through the smoothing filter and as the raw solve.
+    const auto frameAt = [](float yawDeg, float primaryX, float supportZ) {
+        AimPoseInputs frame = StockInputs(3, 1.0f, true);
+        frame.virtualStockEnabled = false;
+        frame.primaryGripValid = true;
+        frame.supportGripValid = true;
+        frame.supportEndpointUsedGrip = false;
+        const float half = yawDeg * 0.5f * 0.01745329252f;
+        frame.right.orientation = {0.0f, std::sin(half), 0.0f, std::cos(half)};
+        frame.right.position = {primaryX, 1.30f, -0.25f};
+        frame.left.position = {0.10f, 1.29f, supportZ};
+        frame.supportPosition = frame.left.position;
+        frame.primaryGripPosition = frame.right.position;
+        frame.supportGripPosition = frame.left.position;
+        return frame;
+    };
+    const auto frameYaw = [&](int index) {
+        // A fast lateral swing (3 deg per 64 Hz prepared frame) that the
+        // smoothing layer genuinely lags; the latch swing stays well inside
+        // the support-agreement acceptance.
+        return frameAt(3.0f * static_cast<float>(index), 0.15f,
+            -0.60f - 0.005f * static_cast<float>(index));
+    };
+
+    AimPoseInputs idle = frameYaw(0);
+    idle.twoHandLatched = false;
+    const AimPoseResult latchedReference = ComputeAimPose(frameYaw(0));
+    Check(latchedReference.valid && latchedReference.twoHandActive,
+        "the VS-OFF smoothing/continuity fixture engages the two-hand solve");
+
+    // The smoothing advance clock is its own fixed 10 ms step (exact alpha
+    // 0.25); the continuity driver keeps the 1/64 prepared-frame step.
+    constexpr float kSmoothingDt = 0.01f;
+
+    Driver driver;
+    two_hand_input_smoothing::State filter{};
+    // Serial 1: unlatched baseline. Production does not even run the filter
+    // without the durable latch, so no filtered copies exist and the filter
+    // history is still empty.
+    driver.Step(idle);
+
+    // Serial 2: the latch edge. The filter seeds its first eligible serial
+    // exactly raw, so the copies are present and equal to the raw geometry.
+    const auto seeded = Advance(
+        filter, 2, kSmoothingDt, SmoothingSampleOf(frameYaw(0)));
+    Check(seeded.valid && seeded.advanced,
+        "the smoothing layer seeds its first latched prepared serial");
+    const AimContinuityFrameSolve grab =
+        driver.Step(WithFilteredGeometry(frameYaw(0), seeded));
+    Check(grab.correctionActive &&
+            driver.state.edgeKind == virtual_stock::AimContinuityEdgeKind::Grab &&
+            CloseRotation(grab.presented, grab.oneHand, 1.0e-4f),
+        "the latch edge still anchors on the same-frame one-hand aim with smoothing upstream");
+
+    // Serial 3: the raw primary arm has already moved, so the filtered copy is
+    // a genuine blend that differs from the raw solve. Continuity's live
+    // target must be the SMOOTHED solve.
+    AimPoseInputs raw3 = frameYaw(1);
+    const auto blended = Advance(filter, 3, kSmoothingDt, SmoothingSampleOf(raw3));
+    Check(blended.valid && blended.advanced && Close(blended.alpha, 0.25f, 1.0e-6f),
+        "the smoothing layer applies its fixed speed-25 alpha while moving");
+    const AimPoseInputs smoothed3 = WithFilteredGeometry(raw3, blended);
+    const AimPoseResult smoothedReference = ComputeAimPose(smoothed3);
+    const AimPoseResult rawReference = ComputeAimPose(raw3);
+    Check(smoothedReference.valid && smoothedReference.twoHandActive &&
+            rawReference.valid && rawReference.twoHandActive,
+        "both the filtered and the raw solve are valid two-hand solves");
+    Check(RotationDegrees(Orientation(smoothedReference), Orientation(rawReference)) >
+            0.05f,
+        "the filtered geometry really differs from the raw solve in this fixture");
+    const AimContinuityFrameSolve step3 = driver.Step(smoothed3);
+    Check(step3.liveValid &&
+            CloseRotation(step3.live, Orientation(smoothedReference), 1.0e-4f),
+        "continuity's live target is the smoothed solve, so smoothing runs first");
+    const virtual_stock::Quat4 composed = virtual_stock::MultiplyQuat4(
+        step3.live, driver.state.correction);
+    Check(CloseRotation(step3.presented, composed, 0.01f),
+        "continuity composes its correction onto the smoothed live aim");
+
+    // Keep a constant raw motion flowing until the acquire ease completes. The
+    // smoothing lag stays bounded, so at completion the presented aim is the
+    // smoothed live solve, measurably away from the raw one.
+    AimPoseInputs rawFinal = raw3;
+    AimPoseResult finalReference{};
+    AimContinuityFrameSolve settled = step3;
+    for (int frame = 0; frame < 14; ++frame)
+    {
+        rawFinal = frameYaw(2 + frame);
+        const auto filtered = Advance(filter, 4 + static_cast<uint64_t>(frame),
+            kSmoothingDt, SmoothingSampleOf(rawFinal));
+        const AimPoseInputs inputs = WithFilteredGeometry(rawFinal, filtered);
+        settled = driver.Step(inputs);
+        finalReference = ComputeAimPose(inputs);
+        Check(CloseRotation(settled.live, Orientation(finalReference), 1.0e-4f),
+            "the continuity target keeps tracking the smoothed solve every serial");
+    }
+    Check(!driver.state.active,
+        "the acquisition completes on schedule with the smoothing layer upstream");
+    Check(CloseRotation(settled.presented, settled.live, 1.0e-4f),
+        "the completed acquisition presents the smoothed live aim exactly");
+    Check(RotationDegrees(settled.presented, Orientation(ComputeAimPose(rawFinal))) >
+            0.05f,
+        "the completed presentation is the lagging smoothed aim, not the raw aim");
+    std::cout << "  smoothing lag at completion: "
+              << RotationDegrees(
+                     settled.presented, Orientation(ComputeAimPose(rawFinal)))
+              << " deg\n";
+    Check(finalReference.valid && finalReference.twoHandActive &&
+            finalReference.pose.position.x == rawFinal.right.position.x &&
+            finalReference.pose.position.y == rawFinal.right.position.y &&
+            finalReference.pose.position.z == rawFinal.right.position.z,
+        "the presented base position stays the raw primary position");
+}
 } // namespace
 
 int main()
@@ -671,10 +851,12 @@ int main()
         TestOncePerSerialAndConsecutiveSerials();
         TestInvalidationAndFailOpen();
         TestSolverIsolationAndImmutability();
+        TestSmoothingComposesBeforeContinuity();
         std::cout << "aim continuity live seam: Standard (rear 0/1) and Plus "
                      "(rear 3) acquisition/release continuity, moving live "
                      "target, rapid reversals, once-per-serial lifetime, "
-                     "invalidation, fail-open and solver isolation passed\n";
+                     "invalidation, fail-open, solver isolation and "
+                     "smoothing-then-continuity composition passed\n";
         return 0;
     }
     catch (const std::exception& error)

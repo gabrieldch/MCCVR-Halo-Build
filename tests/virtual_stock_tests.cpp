@@ -281,6 +281,108 @@ void TestSupportEndpointSelection(TestContext& test,
         "virtual-stock direction uses the selected support endpoint");
 }
 
+// Free two-hand production geometry (W2): the fixed Grip -> Grip (GG) pair.
+// The pair is a product rule, so it is never config-selected: nothing about the
+// Virtual Stock support endpoint or "Reduce Support-Hand Rotation" enters it,
+// both grips (or neither) must be usable, and the aim-position pair is the only
+// fallback.
+void TestFixedGripEndpointSelection(TestContext& test,
+    const CommonGeometry& geometry)
+{
+    const Point3 primaryAim = Point(0.34f, 1.42f, -0.18f);
+    const Point3 supportAim = Point(0.22f, 1.38f, -0.55f);
+    const Point3 primaryGrip = Point(0.30f, 1.39f, -0.14f);
+    const Point3 supportGrip = Point(0.26f, 1.40f, -0.61f);
+
+    const auto both = virtual_stock::SelectTwoHandGripEndpoints(
+        primaryAim, supportAim, true, primaryGrip, true, supportGrip);
+    test.Check(both.valid && both.usedGrips,
+        "GG is valid and grip-owned when both grips are committed");
+    test.CheckNear(both.primary, primaryGrip,
+        "GG primary pivot is the primary Grip position");
+    test.CheckNear(both.support, supportGrip,
+        "GG support pivot is the support Grip position");
+
+    // The aim endpoints are not consulted at all while both grips are usable:
+    // whatever the caller's support-endpoint selection produced, the pair is
+    // the grips.
+    const auto movedAims = virtual_stock::SelectTwoHandGripEndpoints(
+        Point(9.0f, -9.0f, 9.0f), Point(-9.0f, 9.0f, -9.0f),
+        true, primaryGrip, true, supportGrip);
+    test.Check(movedAims.valid && movedAims.usedGrips &&
+            ApproximatelyEqual(movedAims.primary, both.primary) &&
+            ApproximatelyEqual(movedAims.support, both.support),
+        "GG ignores both aim endpoints while both grips are usable");
+
+    const auto missingSupport = virtual_stock::SelectTwoHandGripEndpoints(
+        primaryAim, supportAim, true, primaryGrip, false, supportGrip);
+    test.Check(missingSupport.valid && !missingSupport.usedGrips &&
+            ApproximatelyEqual(missingSupport.primary, primaryAim) &&
+            ApproximatelyEqual(missingSupport.support, supportAim),
+        "a missing support grip falls back to the exact aim-position pair");
+
+    const auto missingPrimary = virtual_stock::SelectTwoHandGripEndpoints(
+        primaryAim, supportAim, false, primaryGrip, true, supportGrip);
+    test.Check(missingPrimary.valid && !missingPrimary.usedGrips &&
+            ApproximatelyEqual(missingPrimary.primary, primaryAim) &&
+            ApproximatelyEqual(missingPrimary.support, supportAim),
+        "a missing primary grip falls back to the exact aim-position pair");
+
+    const auto noGrips = virtual_stock::SelectTwoHandGripEndpoints(
+        primaryAim, supportAim, false, primaryGrip, false, supportGrip);
+    test.Check(noGrips.valid && !noGrips.usedGrips,
+        "no grip sample at all falls back to the aim-position pair");
+
+    // A committed but non-finite grip is not usable. It must never be mixed
+    // with the other hand's grip and never fabricated: the whole pair falls
+    // back to the aim positions.
+    const auto nanPrimary = virtual_stock::SelectTwoHandGripEndpoints(
+        primaryAim, supportAim, true, Point(kNan, 1.39f, -0.14f),
+        true, supportGrip);
+    test.Check(nanPrimary.valid && !nanPrimary.usedGrips &&
+            ApproximatelyEqual(nanPrimary.primary, primaryAim) &&
+            ApproximatelyEqual(nanPrimary.support, supportAim),
+        "a committed non-finite primary grip falls back to the aim-position pair");
+    const auto infSupport = virtual_stock::SelectTwoHandGripEndpoints(
+        primaryAim, supportAim, true, primaryGrip, true,
+        Point(0.26f, kInf, -0.61f));
+    test.Check(infSupport.valid && !infSupport.usedGrips &&
+            ApproximatelyEqual(infSupport.primary, primaryAim) &&
+            ApproximatelyEqual(infSupport.support, supportAim),
+        "a committed non-finite support grip falls back to the aim-position pair");
+
+    // Neither pair usable: invalid, so the caller keeps its own fail-closed
+    // behaviour instead of consuming a manufactured pivot.
+    const auto unusable = virtual_stock::SelectTwoHandGripEndpoints(
+        Point(kNan, 0.0f, 1.42f), Point(0.0f, kInf, 0.0f), false, primaryGrip,
+        false, supportGrip);
+    test.Check(!unusable.valid && !unusable.usedGrips,
+        "an unusable aim fallback leaves the GG selection invalid");
+
+    // The VS-off selector consumes exactly the selected pair as the B line,
+    // with the caller's primary forward as the agreement reference.
+    const Point3 ggDirection =
+        NormalizeReference(Subtract(supportGrip, primaryGrip));
+    const auto legacy = virtual_stock::SelectTwoHandAimDirection(
+        false, 1.0f, 0.0f, true, geometry.head, both.support, both.primary,
+        both.support, ggDirection);
+    test.Check(legacy.valid && !legacy.usedVirtualStock,
+        "the VS-off selector accepts the GG pair as its B line");
+    test.CheckNear(legacy.direction, ggDirection,
+        "the VS-off B direction is the Grip -> Grip line");
+
+    // The selected pair is what makes the VS-off product geometry a real
+    // differential against the pre-GG aim-line pair.
+    const Point3 aimDirection =
+        NormalizeReference(Subtract(supportAim, primaryAim));
+    const auto aimLine = virtual_stock::SelectTwoHandAimDirection(
+        false, 1.0f, 0.0f, true, geometry.head, supportAim, primaryAim,
+        supportAim, aimDirection);
+    test.Check(aimLine.valid &&
+            !ApproximatelyEqual(legacy.direction, aimLine.direction),
+        "the GG line is a real differential against the aim-position line");
+}
+
 void TestGripHandednessRouting(TestContext& test)
 {
     const Point3 physicalLeft = Point(-0.20f, 1.25f, -0.50f);
@@ -1535,6 +1637,147 @@ void TestLegacyFallbackAndRejection(TestContext& test,
         "degenerate stock ray preserves legacy extreme-angle rejection");
 }
 
+// T13 corrective: persistent-grip retained support steering. A qualified
+// (engaged + trusted) invocation keeps its support-derived direction when the
+// primary -> support agreement crosses below the legacy 0.35 floor; every
+// other guard and every unretained path stays exactly as it was.
+void TestRetainedSupportSteering(TestContext& test)
+{
+    const Point3 primary{0.0f, 0.0f, 0.0f};
+    const Point3 forward{0.0f, 0.0f, -1.0f};
+    const auto supportAtAgreement = [](float agreement) {
+        const float lateral = std::sqrt(1.0f - agreement * agreement);
+        return Point3{lateral, 0.0f, -agreement};
+    };
+    const Point3 above = supportAtAgreement(0.3501f);
+    const Point3 below = supportAtAgreement(0.3499f);
+
+    // Unretained behaviour is byte-identical at the boundary: 0.3501 passes,
+    // 0.3499 rejects with the floor recorded.
+    Point3 unretainedDirection{};
+    bool unretainedRejected = false;
+    float unretainedAgreement = 0.0f;
+    test.Check(virtual_stock::TryBuildAcceptedSupportDirection(
+            primary, above, forward, unretainedDirection,
+            unretainedRejected, unretainedAgreement) &&
+            !unretainedRejected && unretainedAgreement == 0.0f,
+        "the legacy rule still accepts just above the 0.35 agreement floor");
+    test.Check(virtual_stock::Dot(
+            unretainedDirection, forward) > 0.35f &&
+            ApproximatelyEqual(unretainedDirection,
+                NormalizeReference(Subtract(above, primary))),
+        "the accepted legacy direction is the exact normalized segment");
+    test.Check(!virtual_stock::TryBuildAcceptedSupportDirection(
+            primary, below, forward, unretainedDirection,
+            unretainedRejected, unretainedAgreement) &&
+            unretainedRejected &&
+            std::fabs(unretainedAgreement - 0.3499f) <= 1e-5f,
+        "the legacy rule still rejects just below the 0.35 agreement floor");
+
+    // Retained: the floor no longer rejects, the direction is the same exact
+    // normalized segment, and the floor verdict is still reported.
+    Point3 retainedDirection{};
+    bool retainedRejected = false;
+    float retainedAgreement = 0.0f;
+    test.Check(virtual_stock::TryBuildAcceptedSupportDirection(
+            primary, below, forward, retainedDirection,
+            retainedRejected, retainedAgreement, true) &&
+            retainedRejected &&
+            std::fabs(retainedAgreement - 0.3499f) <= 1e-5f,
+        "retention accepts the sub-floor direction and still records the "
+        "floor verdict");
+    test.Check(ApproximatelyEqual(retainedDirection,
+            NormalizeReference(Subtract(below, primary))) &&
+            std::fabs(std::sqrt(virtual_stock::Dot(
+                retainedDirection, retainedDirection)) - 1.0f) <= 1e-5f,
+        "the retained direction is the exact normalized support segment");
+
+    // Retention skips ONLY the floor: finiteness and the minimum segment
+    // length still reject.
+    bool retainedRejectedAfter = true;
+    float retainedAgreementAfter = 1.0f;
+    test.Check(!virtual_stock::TryBuildAcceptedSupportDirection(
+            primary, below, Point(kNan, 0.0f, 0.0f), retainedDirection,
+            retainedRejectedAfter, retainedAgreementAfter, true) &&
+            !retainedRejectedAfter && retainedAgreementAfter == 0.0f,
+        "retention never accepts a non-finite primary forward");
+    // A finite-but-huge forward overflows the dot product: the non-finite
+    // agreement guard must still reject (and record) even when retained.
+    retainedRejectedAfter = false;
+    retainedAgreementAfter = 0.0f;
+    test.Check(!virtual_stock::TryBuildAcceptedSupportDirection(
+            primary, Point(0.577f, 0.577f, 0.577f),
+            Point(3.0e38f, 3.0e38f, 3.0e38f), retainedDirection,
+            retainedRejectedAfter, retainedAgreementAfter, true) &&
+            retainedRejectedAfter && !std::isfinite(retainedAgreementAfter),
+        "retention never accepts a non-finite agreement");
+    retainedRejectedAfter = true;
+    test.Check(!virtual_stock::TryBuildAcceptedSupportDirection(
+            primary, Point(kInf, 0.0f, 0.0f), forward, retainedDirection,
+            retainedRejectedAfter, retainedAgreementAfter, true) &&
+            !retainedRejectedAfter,
+        "retention never accepts non-finite support geometry");
+    retainedRejectedAfter = true;
+    test.Check(!virtual_stock::TryBuildAcceptedSupportDirection(
+            primary, Point(primary.x + 5.0e-5f, primary.y, primary.z), forward,
+            retainedDirection, retainedRejectedAfter, retainedAgreementAfter,
+            true) && !retainedRejectedAfter &&
+            ApproximatelyEqual(retainedDirection, Point(0.0f, 0.0f, 0.0f)),
+        "retention keeps the minimum primary-to-support segment guard");
+
+    // Selector plumbing: VS off with retention keeps the exact legacy ray and
+    // flags the crossed floor; the unretained selector still rejects.
+    const auto retainedSelection =
+        virtual_stock::SelectTwoHandAimDirection(
+            false, 1.0f, 0.0f, true, Point(0.0f, 0.0f, 0.0f), below,
+            primary, below, forward, true);
+    test.Check(retainedSelection.valid && !retainedSelection.usedVirtualStock &&
+            retainedSelection.retainedBeyondAgreementFloor &&
+            !retainedSelection.rejectedExtreme &&
+            std::fabs(retainedSelection.rejectedAgreement - 0.3499f) <= 1e-5f,
+        "the retained legacy selection is valid, attributed and keeps the "
+        "exact crossed floor agreement for diagnostics");
+    // T14-VER-03 F1: the agreement store is retention-only. An ordinary
+    // in-cone acceptance must keep it at exactly zero, so the diagnostic can
+    // never present a normal pass as a crossed floor.
+    const auto inConeSelection =
+        virtual_stock::SelectTwoHandAimDirection(
+            false, 1.0f, 0.0f, true, Point(0.0f, 0.0f, 0.0f), above,
+            primary, above, forward, true);
+    test.Check(inConeSelection.valid && !inConeSelection.usedVirtualStock &&
+            !inConeSelection.retainedBeyondAgreementFloor &&
+            !inConeSelection.rejectedExtreme &&
+            inConeSelection.rejectedAgreement == 0.0f,
+        "an ordinary in-cone selection keeps the retention store at zero");
+    test.CheckNear(retainedSelection.direction,
+        NormalizeReference(Subtract(below, primary)),
+        "the retained legacy selection preserves the exact support direction");
+    const auto unretainedSelection =
+        virtual_stock::SelectTwoHandAimDirection(
+            false, 1.0f, 0.0f, true, Point(0.0f, 0.0f, 0.0f), below,
+            primary, below, forward);
+    test.Check(!unretainedSelection.valid &&
+            unretainedSelection.rejectedExtreme &&
+            !unretainedSelection.retainedBeyondAgreementFloor &&
+            unretainedSelection.rejectedAgreement < 0.35f,
+        "the unretained legacy selection still rejects the sub-floor ray");
+
+    // VS-on stock paths ignore the retention request entirely: a valid stock
+    // ray wins outright and never reports a retained selection.
+    const Point3 stockSupport{0.55f, 0.30f, -0.80f};
+    const auto stockWithRetention =
+        virtual_stock::SelectTwoHandAimDirection(
+            true, 1.0f, 0.0f, true, Point(0.0f, 1.62f, 0.0f), stockSupport,
+            primary, below, Point(-1.0f, 0.0f, 0.0f), true);
+    test.Check(stockWithRetention.valid && stockWithRetention.usedVirtualStock &&
+            !stockWithRetention.retainedBeyondAgreementFloor &&
+            !stockWithRetention.rejectedExtreme,
+        "a valid stock ray is unaffected by the retention request");
+    test.CheckNear(stockWithRetention.direction,
+        NormalizeReference(Subtract(stockSupport, Point(0.0f, 1.62f, 0.0f))),
+        "the stock ray keeps its head-to-support direction");
+}
+
 void TestHybridPureHelpers(TestContext& test)
 {
     const Point3 primary{0.0f, 0.0f, 0.0f};
@@ -2244,6 +2487,7 @@ int main()
     const CommonGeometry geometry;
     TestStockDirectionSelection(test, geometry);
     TestSupportEndpointSelection(test, geometry);
+    TestFixedGripEndpointSelection(test, geometry);
     TestGripHandednessRouting(test);
     TestContinuousRearReference(test, geometry);
     TestShoulderRearReference(test, geometry);
@@ -2259,6 +2503,7 @@ int main()
     TestHybridHorizontalRelease(test);
     TestStrengthBoundarySemantics(test, geometry);
     TestLegacyFallbackAndRejection(test, geometry);
+    TestRetainedSupportSteering(test);
     TestHybridPureHelpers(test);
     TestHybridRichEvaluatorEquivalence(test);
     TestHybridGeometricRegressions(test);

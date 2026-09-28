@@ -486,6 +486,18 @@ static void Clamp()
                          kVirtualStockStrengthMinimum,
                          kVirtualStockStrengthMaximum)
             : kVirtualStockPlusStrengthDefault;
+    g_config.two_hand_smoothing_strength =
+        std::isfinite(g_config.two_hand_smoothing_strength)
+            ? std::clamp(g_config.two_hand_smoothing_strength,
+                         kTwoHandSmoothingStrengthMinimum,
+                         kTwoHandSmoothingStrengthMaximum)
+            : kTwoHandSmoothingStrengthDefault;
+    g_config.two_hand_offhand_influence =
+        std::isfinite(g_config.two_hand_offhand_influence)
+            ? std::clamp(g_config.two_hand_offhand_influence,
+                         kTwoHandOffhandInfluenceMinimum,
+                         kTwoHandOffhandInfluenceMaximum)
+            : kTwoHandOffhandInfluenceDefault;
     g_config.virtual_stock_rear_height_m = std::isfinite(g_config.virtual_stock_rear_height_m)
         ? std::clamp(g_config.virtual_stock_rear_height_m,
                      kVirtualStockRearHeightMinimumM,
@@ -926,6 +938,9 @@ void ConfigLoad(const wchar_t* path)
     bool loadedStandardVirtualStockStrength = false;
     bool loadedPlusVirtualStockStrength = false;
     float legacyVirtualStockStrength = kVirtualStockPlusStrengthDefault;
+    bool loadedTwoHandSmoothingStrength = false;
+    bool loadedLegacyTwoHandSmoothing = false;
+    float legacyTwoHandSmoothingStrength = kTwoHandSmoothingStrengthDefault;
     while (fgets(line, sizeof(line), f))
     {
         if (char* hash = strchr(line, '#'))
@@ -1074,6 +1089,52 @@ void ConfigLoad(const wchar_t* path)
         if(!strcmp(key,"two_hand_support_grip_pose"))
         {
             ParseBoolSetting(key, val, g_config.two_hand_support_grip_pose);
+            continue;
+        }
+        if(!strcmp(key,"persistent_support_grip"))
+        {
+            ParseBoolSetting(key, val, g_config.persistent_support_grip);
+            continue;
+        }
+        if(!strcmp(key,"two_hand_smoothing_strength"))
+        {
+            loadedTwoHandSmoothingStrength = ParseFloatSetting(
+                key, val, g_config.two_hand_smoothing_strength);
+            continue;
+        }
+        if(!strcmp(key,"two_hand_offhand_influence"))
+        {
+            ParseFloatSetting(key, val, g_config.two_hand_offhand_influence);
+            continue;
+        }
+        if(!strcmp(key,"two_hand_smoothing"))
+        {
+            // Previous-candidate boolean key. It is only a migration source and
+            // is not re-saved; true means the old full-strength speed-25
+            // filter, never slider value 1.
+            bool enabled = false;
+            if(ParseBoolSetting(key, val, enabled))
+            {
+                loadedLegacyTwoHandSmoothing = true;
+                legacyTwoHandSmoothingStrength = enabled
+                    ? kTwoHandSmoothingStrengthMaximum
+                    : kTwoHandSmoothingStrengthMinimum;
+            }
+            continue;
+        }
+        if(!strcmp(key,"two_hand_transition_smoothing"))
+        {
+            // Retired 2026-09-29: the 200 ms VS-OFF acquire/release continuity
+            // is fixed-on product behaviour (TwoHandTransitionContinuityEnabled()
+            // in virtual_stock_settings.h). This legacy key is still parsed so
+            // historical files load quietly, but the value is dormant and is
+            // never resolved by any product or telemetry path.
+            ParseBoolSetting(key, val, g_config.two_hand_transition_smoothing);
+            continue;
+        }
+        if(!strcmp(key,"two_hand_switch_inherit"))
+        {
+            ParseBoolSetting(key, val, g_config.two_hand_switch_inherit);
             continue;
         }
         // Keep new keys outside the already-at-limit legacy else-if chain.
@@ -1610,6 +1671,11 @@ void ConfigLoad(const wchar_t* path)
             g_config.virtual_stock_standard_strength = legacyVirtualStockStrength;
         }
     }
+    // Previous-candidate boolean two_hand_smoothing: false/absent keeps the
+    // 0.0 default, true migrates to the full 25.0 strength. An explicit
+    // numeric key always wins, and the numeric key is what gets saved.
+    if (loadedLegacyTwoHandSmoothing && !loadedTwoHandSmoothingStrength)
+        g_config.two_hand_smoothing_strength = legacyTwoHandSmoothingStrength;
     if(!flashlightMappingV2) {
         for(auto& button:g_config.flashlight_button)
             if(button==0) button=flashlight_input::kGripDefault;
@@ -2532,6 +2598,38 @@ void ConfigSave()
     fprintf(f, "# Reduce support-hand rotation while preserving support-position steering.\n");
     fprintf(f, "# (default %d)\n", d.two_hand_support_grip_pose ? 1 : 0);
     fprintf(f, "two_hand_support_grip_pose = %d\n\n", g_config.two_hand_support_grip_pose ? 1 : 0);
+    fprintf(f, "# Durable owner-bound support grip; off restores spatial-only support behaviour.\n");
+    fprintf(f, "# (default %d)\n", d.persistent_support_grip ? 1 : 0);
+    fprintf(f, "persistent_support_grip = %d\n\n", g_config.persistent_support_grip ? 1 : 0);
+    fprintf(f, "# Pavlov-inspired controller-input smoothing strength: 0 = off/raw controller\n");
+    fprintf(f, "# input; 25 = the full fixed speed-25 quaternion-native filter; values between\n");
+    fprintf(f, "# wet/dry mix the filtered directional input copies over raw. VS-OFF free\n");
+    fprintf(f, "# two-hand aiming only; Virtual Stock is unaffected.\n");
+    fprintf(f, "# (default %.2f, range %.2f to %.2f)\n",
+        d.two_hand_smoothing_strength,
+        kTwoHandSmoothingStrengthMinimum,
+        kTwoHandSmoothingStrengthMaximum);
+    fprintf(f, "two_hand_smoothing_strength = %.2f\n\n",
+        g_config.two_hand_smoothing_strength);
+    fprintf(f, "# Free two-hand (VS-OFF) support-steering authority: 0 = the primary\n");
+    fprintf(f, "# controller's own aim is authoritative; 1 = the support controller's aim\n");
+    fprintf(f, "# carries equal authority. VS-OFF free two-hand aiming only; Virtual Stock\n");
+    fprintf(f, "# is unaffected.\n");
+    fprintf(f, "# (default %.2f, range %.2f to %.2f)\n",
+        d.two_hand_offhand_influence,
+        kTwoHandOffhandInfluenceMinimum,
+        kTwoHandOffhandInfluenceMaximum);
+    fprintf(f, "two_hand_offhand_influence = %.2f\n\n",
+        g_config.two_hand_offhand_influence);
+    // two_hand_transition_smoothing is retired: the fixed 200 ms VS-OFF
+    // acquire/release continuity is internal product behaviour and the key is
+    // no longer written. Historical files may still contain it; ConfigLoad
+    // parses it and ignores it.
+    fprintf(f, "# Persistent-grip switch option: 1 = a weapon switch while the grip is held\n");
+    fprintf(f, "# keeps the two-hand hold on the new weapon immediately (no re-orientation).\n");
+    fprintf(f, "# 0 = grip the new weapon normally; the grip button need not be released.\n");
+    fprintf(f, "# (default %d)\n", d.two_hand_switch_inherit ? 1 : 0);
+    fprintf(f, "two_hand_switch_inherit = %d\n\n", g_config.two_hand_switch_inherit ? 1 : 0);
     fprintf(f, "# Main weapon, aim and trigger on the physical left controller.\n");
     fprintf(f, "# Movement, turning and face buttons keep their physical bindings.\n");
     fprintf(f, "left_handed = %d\n\n", g_config.left_handed ? 1 : 0);

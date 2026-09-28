@@ -562,7 +562,7 @@ several evidence families rather than as one Virtual Stock record.
 | Runtime/render state | `active_title`, `openxr_session_state`, `should_render`, `upcoming_views_valid`, `located_view_count`, `focused`, `stereo_enabled`, `menu_open`, `contact_space_epoch` | Context in which observations were made |
 | Semantic controller poses | `semantic_primary_aim`, `semantic_primary_forward`, `semantic_support_aim`, `semantic_support_endpoint` | Primary/support roles after MCC handedness routing |
 | Physical controller poses | `physical_left_aim`, `physical_right_aim` | Raw anatomical left/right aim roles before semantic routing |
-| Grip-position observations | `support_grip_position`, `semantic_primary_grip_position`, `support_endpoint_used_grip` | Position-only grip-action endpoints and effective support-endpoint source selection |
+| Grip-position observations | `support_grip_position`, `semantic_primary_grip_position`, `support_endpoint_used_grip` | Position-only grip-action endpoints (including the fixed VS-OFF grip pair) and the Virtual Stock/Lab support-endpoint source selection |
 | Head/views | `semantic_hmd`, `views[]`, `headset_smoothing` | HMD pose and located stereo views |
 | Velocities | semantic primary/support linear velocity + sample timestamps | Controller motion observations |
 | Input | `pad` | Routed pad state used that frame |
@@ -570,7 +570,17 @@ several evidence families rather than as one Virtual Stock record.
 | Aim trace | `aim_trace` | Intermediate geometry, authority, path and provenance from the canonical solve |
 | Canonical output | `canonical_aim` | Recorded output of the active settings/profile |
 | Grab/release aim continuity | `transition_stock_mode`, `transition_active`, `transition_presented_forward`, `transition_one_hand_anchor_forward`, `transition_advance_count`, ... | Presentation-only correction layered after the live solve for Virtual Stock (Standard and Plus); raw live aim is still `aim_trace`/`canonical_aim` |
+| Two-Hand transition/input smoothing | `two_hand_transition_smoothing_configured`, `two_hand_transition_active`, `two_hand_smoothing_configured`, `two_hand_smoothing_applied`, `two_hand_smoothing_strength`, `two_hand_smoothing_mix`, `two_hand_smoothing_alpha`, `two_hand_smoothing_*_error_*`, `two_hand_offhand_influence` | Additive config/activity and raw-to-filtered input error values; `two_hand_smoothing_strength` is the user amount in [0,25] (0 = raw/off, 25 = the full fixed speed-25 filter) frozen for the frame's serial, `two_hand_smoothing_mix` is strength/25 in [0,1] (the applied wet/dry amount, never a filter speed), `two_hand_smoothing_alpha` is the filter's internal clamp(25*dt,0,1) coefficient, and `two_hand_offhand_influence` is the frozen VS-OFF offhand directional authority in [0,1]; orientation error is degrees, position errors are OpenXR LOCAL metres |
+| Two-Hand Lab | `two_hand_lab_enabled`, `two_hand_lab_anchor_resolved`, `two_hand_lab_effective_influence`, `two_hand_lab_stateless_direction`, `two_hand_lab_presented_direction`, `two_hand_lab_temporal_active`, ... | VS-off experimental anchor/authority/temporal presentation; the stateless Lab observation and the temporal presented orientation are kept distinct |
+| Persistent support grip | `persistent_support_grip_configured`, `persistent_support_grip_applicable`, `support_relationship_readable`, `support_relationship_engaged`, `support_epoch`, `support_solve_trusted`, `support_force_one_hand`, `support_solve_serial` | Frozen solve-time persistent-grip qualification of the frame's own canonical assembly, plus this frame's config knob and title gate |
 | Same-frame controls | `cf_vs_off`, `cf_fixed_head`, `cf_fixed_shoulder` | Pure telemetry-only counterfactual solves using the same captured frame inputs |
+| Presented aim | `presented_aim_valid`, `presented_aim_forward` | Same-frame reconstruction of the composed steering ray (frame-local solve, then VS continuity, then Lab temporal presentation) |
+| Presented reticle | `reticle_presented_*` | Exact consumer-visible reticle pose with its own serial (normally one frame behind; never asserted equal to `prepared_serial`) |
+| Engine aim | `engine_aim_*` | Per-title engine aim feedback in engine-world units with source provenance |
+| Engine camera/scale | `engine_camera_*`, `world_scale_*` | Engine camera truth (pre-lean base, rendered eye) plus the authoritative units-per-metre scale |
+| Reticle/steering settings | `aim_stabilization`, `crosshair_distance_m`, `crosshair_size_deg`, `crosshair`, `kill_reticle` in `effective_settings` | Exact effective knobs behind the presented ray |
+| Weapon pad | `weapon_buttons`, `weapon_pulse_until_ms`, `weapon_generation` in `pad` | Gesture output copied with the pad sample |
+| Dual predicate | `dual_active` | Shared dual-weapon presentation eligibility (per-shot slot identity travels in the sparse `shot` event, [§9.1](#91-the-weapon-order-channel-as-the-model)) |
 
 This table is a contribution map, not a substitute for the schema. When adding
 or changing fields, inspect `TelemetryFrame`, the serializer, the validator,
@@ -587,6 +597,109 @@ schema-2 version: the experiment-era `transition_mode` and
 `transition_motion_gate_*` fields were removed before landing, so no released
 recording contains them. The feature contract is in
 `docs/VIRTUAL-STOCK-AIM-CONTINUITY-2026-09-27.md`.
+
+The `two_hand_lab_*` family is the same kind of additive schema-2 family for
+the runtime-only Two-Handed Lab rig (VS-off anchor selection, soft off-hand
+authority, temporal damping experiments). `two_hand_lab_enabled` means the Lab
+steered that frame's canonical solve; while false the family reads its
+inactive defaults (enums 0, scalars 0, validity false, zero vectors), never a
+stale observation. The stateless observation (requested/resolved anchors,
+fallback, agreement, confidence, requested/effective influence, selected
+pivots, stateless direction) comes from the canonical solve's trace Lab
+payload; the presented orientation (`two_hand_lab_presented_direction`,
+valid only while `two_hand_lab_temporal_active`) comes from the Lab temporal
+packet/state for the same serial. Raw live aim stays raw in
+`aim_trace`/`canonical_aim`. The family contract is in
+`docs/TWO-HAND-LAB-2026-09-27.md`.
+
+The `two_hand_transition_*` / `two_hand_smoothing_*` fields are an additive
+schema-2 family. `two_hand_smoothing_strength` is the user amount in [0,25]
+(0 = off/raw, 25 = the full fixed speed-25 filter) and `two_hand_smoothing_mix`
+is `strength / 25` in [0,1] derived from that same frozen strength: the applied
+wet/dry amount, never a filter speed. `two_hand_smoothing_alpha` is the
+filter's **internal** `clamp(25 * dt, 0, 1)` temporal coefficient and is never
+the user amount. The primary orientation error is degrees and the
+primary/support position errors are OpenXR LOCAL metres. Error values are
+raw-to-full-filtered input differences; they do not describe solver output or
+presented-aim error. `two_hand_offhand_influence` rides beside the family (not
+inside it) as the free two-hand (VS-OFF) product offhand directional authority
+in [0,1], frozen per frame from the frame's own assembly and never consumed by
+Virtual Stock solves or by a Lab-active solve (which uses
+`two_hand_lab_offhand_influence`). The latch continuity the family's
+`two_hand_transition_*` flags report is fixed-on internal product behaviour with
+no user toggle; the retired `two_hand_transition_smoothing` key no longer
+resolves. Older recordings may omit the family, recordings from the earlier
+boolean era carry it without the strength/mix keys, and a capture written before
+`two_hand_offhand_influence` existed omits that key - absence in every case is
+not a zero value.
+
+The `persistent_support_grip_*` / `support_*` family is the same kind of
+additive schema-2 family, recording what the persistent-grip (PG)
+qualification gave the frame's **own** canonical assembly. It is frozen
+solve-time provenance, never a live re-read of mutable PG state and never a
+second assembly: `persistent_support_grip_configured` is the config knob read
+for that frame and `persistent_support_grip_applicable` the pure title gate;
+`support_relationship_readable` / `support_relationship_engaged` /
+`support_epoch` are the assembly's frozen relationship qualification;
+`support_solve_trusted` is the qualification **permission** (this invocation
+proved the relationship owner) - whether the solve actually *consumed*
+support geometry is a separate, unrecorded narrowing, so this field must not
+be read as a consumption receipt; `support_force_one_hand` is **explicit PG
+forcing** of that invocation to the one-hand path and is distinct from an
+ordinary `effective_settings.two_hand_enabled == false`, which conflates
+config-off, dual presentation and forcing. `support_epoch` is a plain unsigned
+integer so the all-ones `18446744073709551615` sentinel ("the relationship
+could not be read") survives the wire; it is deliberately not zero, because
+epoch 0 means the relationship was coherently readable and disengaged - an
+unreadable relationship must never be read as a disengaged one, and epochs are
+process-local values that must never be compared across sessions.
+`support_solve_serial` is the solve serial the assembly stamped: at capture it
+is the last published prepared serial, normally `prepared_serial` minus one,
+and it must never be asserted equal to `prepared_serial`. With PG off the
+qualification short-circuits and the copied fields read their frozen
+zero/false defaults, so a PG-off frame never reports a stale receipt; a
+recording from before this family simply lacks its keys.
+
+The shots-vs-reticle families (`presented_aim_*`, `reticle_presented_*`,
+`engine_aim_*`, `engine_camera_*`, `world_scale_*`, `dual_active`, plus the
+reticle/steering settings and weapon pad additions) are the same kind of
+additive schema-2 families for "shots vs reticle" troubleshooting:
+
+- `presented_aim_forward` is a same-frame reconstruction of the composed
+  steering ray: the frame-local solve orientation, then the VS continuity
+  presentation, then the Lab temporal presentation, exactly as
+  `VR_GetAimPoseWithSupportProvenance` composes them, including its final
+  solve-validity gate. `presented_aim_valid` is true only when every stage is
+  provably that getter's output for the frame's own assembly; otherwise it is
+  false and the `transition_*` / `two_hand_lab_*` piece fields carry the
+  evidence (never a fabricated ray).
+- `reticle_presented_*` is the exact consumer-visible reticle pose with its
+  own serial. Capture runs before the reticle block publishes in the same
+  frame, so the pose normally lags one prepared frame; the serial travels in
+  the field and must never be asserted equal to `prepared_serial`.
+- `engine_aim_*` / `engine_camera_*` live in the engine-world domain (Blam
+  Z-up, world units; forward = `(cos p cos y, cos p sin y, sin p)`), never
+  OpenXR LOCAL. The source enums name the exact publication per title
+  (shared H3/ODST aim and camera singletons are title-qualified at read;
+  Reach seated truth prefers native unit aim with the compact fallback
+  labelled; Halo 4 carries its observer aim/pitch serial and publishes its
+  pristine observer camera position from the stereo transaction with its own
+  serial, source 6 `H4Observer`, while a frame without a usable publication
+  stays source 5 `H4Absent`; Halo 2 carries its observer stock; Halo CE has
+  no publication). Latest-only sources read serial 0; sampleMs 0 means no
+  sample clock.
+- The Halo 4 stock-camera publication is version-counter bracketed
+  (`stockCameraVersion`): the recorded position, validity and serial always
+  come from one whole writer iteration, or the read fails open to source 5
+  `H4Absent` with exact zeros and serial 0. The pre-existing Halo 4
+  engine-aim publication is **not** version-bracketed: its payload is stored
+  before its serial is bumped, so the recorded `engine_aim_serial` may differ
+  from its payload by one writer iteration. Treat the pair as serial ±1 and
+  never assert an exact serial-to-payload pairing for source 6; the vector is
+  still a genuine published sample, not a fabricated one.
+- Invalid payloads in these families read exact zeros (never stale,
+  never non-finite) while the source still names the attributed publication;
+  validity flags stay authoritative.
 
 ### 8.2 Identity and timing
 
@@ -625,16 +738,24 @@ option), not an obsolete research artefact:
 ```text
 support_grip_position            position-only OpenXR grip-action locate
 support_grip_valid               whether that locate is usable at all
-support_endpoint_used_grip       whether production selected the grip source
-semantic_support_endpoint        the effective endpoint used by the solve
-semantic_support_endpoint_valid  whether that effective endpoint is usable
+support_endpoint_used_grip       which source the VS/Lab support-endpoint selector chose
+semantic_support_endpoint        the selected support endpoint for those VS/Lab paths
+semantic_support_endpoint_valid  whether that selected endpoint is usable
 ```
 
-This separates **what was sampled** from **what production actually selected**
-and from **what the solver ultimately used**. Reuse this pattern wherever
-several sources can provide similar data; the `effective_settings` block also
-records the relevant enabling settings (for example
-`support_grip_pose_enabled`) so a frame explains its own configuration context.
+This separates **what was sampled** from **what the selector chose** and from
+**what that selection is used for**. The selection is provenance for the
+Virtual Stock support path and the Two-Handed Lab Production anchor
+pass-through; it is **not** a consumption receipt for the free two-hand product
+geometry. With Virtual Stock off (and the Lab inactive), the two-hand solve
+consumes the fixed primary-Grip -> support-Grip positional pair reported by
+`support_grip_position` / `semantic_primary_grip_position` and does not read
+`support_endpoint_used_grip` or `semantic_support_endpoint` at all (both are
+still reported for the frame's fresh support sample, so their presence must not
+be read as consumption). Reuse this pattern wherever several sources can
+provide similar data; the `effective_settings` block also records the relevant
+enabling settings (for example `support_grip_pose_enabled`) so a frame explains
+its own configuration context.
 
 ### 8.5 Validity is authoritative
 
@@ -670,6 +791,11 @@ transition_live_calibrated_forward_valid -> transition_live_calibrated_forward
 transition_presented_forward_valid -> transition_presented_forward
 transition_one_hand_anchor_valid   -> transition_one_hand_anchor_forward
 transition_stock_mode_valid        -> transition_stock_mode (0 = Standard, 1 = Plus; an invalid mode reads 0)
+two_hand_lab_enabled               -> the whole two_hand_lab_* family payload
+two_hand_lab_primary_pivot_valid   -> two_hand_lab_primary_pivot
+two_hand_lab_support_pivot_valid   -> two_hand_lab_support_pivot
+two_hand_lab_stateless_direction_valid -> two_hand_lab_stateless_direction
+two_hand_lab_presented_direction_valid -> two_hand_lab_presented_direction (requires two_hand_lab_temporal_active)
 ```
 
 `aim_trace` and the counterfactual sections contain additional applicability
@@ -701,8 +827,10 @@ forward axis:          -Z
 ```
 
 It also describes semantic routing, physical left/right routing, HMD/view
-provenance, stereo view semantics and grip-position provenance (including that
-a position-only grip locate is valid only when its validity flag is true).
+provenance, stereo view semantics, grip-position provenance (including that
+a position-only grip locate is valid only when its validity flag is true), and
+the provenance of the free two-hand product controls
+(`two_hand_smoothing_provenance`, `two_hand_offhand_influence_provenance`).
 
 Do not rely on undocumented assumptions about these semantics, and do not
 assume two vector fields share a coordinate domain merely because both are
@@ -771,7 +899,7 @@ aux0, aux1        kind-specific payload
 
 Current kind names: `present_begin`, `after_present_before_prepare`,
 `capture_pre_latch`, `capture_probe_begin`, `capture_probe_result`,
-`fp_entry`, `fp_weapon_commit`. Current status names include `success`,
+`fp_entry`, `fp_weapon_commit`, `shot`. Current status names include `success`,
 `no_observation`, `reader_returned_false`, `guard_rejected`,
 `exception_or_fault`, `not_attempted_no_safe_thread`,
 `not_attempted_thread_mismatch`, and `definitively_absent`.
@@ -779,6 +907,163 @@ Current kind names: `present_begin`, `after_present_before_prepare`,
 `aux0`/`aux1` are kind-specific; currently, `capture_probe_result` carries the
 matching `capture_probe_begin` sequence in `aux0`. Any new use must document
 and test the exact meaning per kind. Do not create undocumented bit soup.
+
+#### The `shot` kind (firing-path shot evidence)
+
+`shot` is the first kind whose record is per-shot rather than per-weapon-order
+marker. It carries one fixed payload in addition to the shared envelope
+(`prepared_serial`, `controlled_unit`, `primary_weapon`, `title`,
+`title_generation`, `qpc`, `seq`):
+
+| Field | Meaning |
+| --- | --- |
+| `shot_origin`, `shot_direction` | The **final** ray the engine consumed, in engine-world units, recorded after the title's own aim call and after any substitution. A non-finite ray is suppressed by the producer (never published as a null ray). A `[0,0,0]` direction means the producer's firing call-site carries no direction (ODST's firing-origin hook), never a fabricated ray. |
+| `shot_engine_aim` | The title's engine aim feedback snapshot in engine-world units (Halo 3/ODST shared aim publication; Reach seated native or shared compact; Halo 4 stereo-transaction observer aim; Halo 2 observer stock forward). Zeros when that publication is unavailable or carries no usable direction, by the same rule as the frame's `engine_aim_*` capture (read success plus a finite, non-zero-length forward). |
+| `shot_engine_aim_source` | Provenance ordinal for `shot_engine_aim`, using the frame's `engine_aim_source` vocabulary: `0` none, `1` Halo 3 shared, `2` ODST shared, `3` Reach seated unit, `4` Reach seated compact, `5` Reach on-foot compact, `6` Halo 4 observer, `7` Halo 2 observer, `8` Halo 2 absent. `0` and `8` mean no usable snapshot was available for that shot (the read failed or the direction was unusable), and the aim vector is then exactly zero. |
+| `shot_reticle_direction` | The consumer-visible presented reticle forward in OpenXR LOCAL. The reticle publication lags the frame by construction, so this is normally the previous prepared serial's pose; no serial equality with `prepared_serial` exists or is asserted. Zeros when the publication is unavailable. |
+| `shot_slot`, `shot_barrel` | `0`/`1` when the firing context carries them; `-1` when it does not (in-memory sentinel `0xFF`, mapped at serialization). Never a fabricated identity. |
+| `shot_flags` | Eight documented bits, unknown = 0 (below). |
+
+```text
+shot_flags bit0  predicted        the title's fire call carried prediction
+shot_flags bit1  substituted      this mod's independent path produced the ray
+shot_flags bit2  vrAimActive
+shot_flags bit3  twoHandActive    bounded read of the shared two-hand bit
+shot_flags bit4  leftHanded       captured MCC handedness
+shot_flags bit5  dualActive       shared dual-presentation predicate
+shot_flags bit6  firesFromCamera  the title's aim call carries the flag
+shot_flags bit7  unitAim          the title's aim call carries the flag
+```
+
+Per-title producers (all five supported firing paths; Halo CE produces no
+`shot` records):
+
+- **Halo 3** publishes from the firing invocation of its own aim call
+  (`Halo3IndependentAimDetour`), after the native call, whether or not the
+  independent path substituted the ray. bit0 is the native fire call's own
+  prediction flag; `substituted` is true only when the independent ray rewrite
+  produced the final direction or when the committed muzzle ray was the
+  engine's input. Slot rides the acquisition scope, barrel rides the per-shot
+  muzzle request.
+- **Halo 4** publishes from the firing invocation of its muzzle aim call, after
+  the native call, whether or not the committed muzzle barrel produced the ray.
+  Its four-argument fire scope carries no prediction flag, so bit0 stays 0
+  (unknown) there rather than being inferred from the simulation byte.
+- **ODST** publishes from the weapon-barrel call-site's single call into
+  `unit_get_camera_position` (the runtime-derived firing return address). The
+  origin is the `out[]` value the engine's own barrel function will consume:
+  the rendered eye when the seated-origin substitution wrote it (`substituted`
+  true), the engine's stock value otherwise. **The direction is absent by
+  construction** and is published as an exact `[0,0,0]`; slot, barrel, weapon
+  and predicted are not carried by this call-site and stay unknown (`-1` /
+  the envelope sentinel). The event is published on every invocation of the
+  firing call-site, including the cinematic-locked, foreign-unit,
+  barrel-firing and invalid-camera branches, because those shots still consume
+  an origin the evidence needs.
+- **Reach** publishes one event per `unit-adjust` invocation. That transaction
+  is the engine's projectile-builder call (HREK `0xD67EE0`; the pinned retail
+  module has exactly one image caller, the projectile transaction at
+  `0x004C303A`), so every invocation the hook serves is a firing invocation.
+  Final origin/direction are read after the body: post-substitution when the
+  on-foot hand ray, the committed muzzle barrel, or the reticle redirect
+  produced the ray (`substituted` true), the engine's stock values otherwise.
+  Weapon and barrel come from the firing transaction's own request context
+  where present, else unknown; slot is unknown; bit0 (predicted) stays 0
+  (unknown), never inferred. **Reach consumes no prepared serial inside this
+  weapon transaction**, so `prepared_serial` is the latest published serial —
+  a bounded snapshot, never an equality claim.
+- **Halo 2** publishes from the firing invocation of its weapon-firing
+  transaction's own aim call (`Halo2IndependentAimDetour`, fired by the single
+  retail caller of the aim helper `+0x8F0F70` at `+0x8E4FCD`, inside the firing
+  function `+0x8E4940`), after the native call, whether or not the independent
+  path substituted the ray. `substituted` is true when this mod produced the
+  final direction: either the committed muzzle barrel was the native call's
+  input (the mod then passes camera projection/unit aim `0/0`, so bits 6/7 are
+  reported false) or the controller-carrier rewrite produced the returned
+  direction. Slot is the acquisition scope's resolved slot when that scope owns
+  the firing unit, else unknown. Weapon and barrel are the firing transaction's
+  own arguments carried by the per-shot request (barrel unknown where the
+  argument is not a barrel index). The aim call carries no prediction flag, so
+  bit0 stays 0 (unknown) rather than being inferred from the fire scope's own
+  byte. **The Halo 2 firing path consumes no prepared serial inside this
+  weapon transaction**, so `prepared_serial` is the latest published serial —
+  a bounded snapshot, never an equality claim.
+
+  *Halo 2 coverage boundary (documented cut).* The producer observes exactly
+  the firing invocations that execute that aim call. The mod's own
+  independent/dual substitution happens at the same call-site, so those shots
+  are observed by construction. The H2EK-proven helper has exactly one code
+  caller in the pinned module, and that call sits inside the engine's
+  per-weapon firing function (`+0x8E4940`), i.e. inside the ordinary
+  weapon-firing transaction rather than a dual-wield-only branch; other firing
+  invocations that reach it (the local player's single-wield shots, other
+  actors' shots) are therefore published too, unfiltered like the other
+  titles. What is **not** claimed: a firing shape that returns from the
+  engine's firing transaction before that call (a weapon-type or state
+  early-out is not visible from the call-site), and any non-weapon damage
+  source (melee, grenades, vehicle collisions). Such a shot produces no `shot`
+  record and cannot be distinguished in the capture from a shot that never
+  happened; observing it needs a new hook on that path, which is deliberately
+  outside this recorder-only change. **Verify in a headset capture**: whether
+  the local player's ordinary single-wield shots reach the call — look for
+  `shot` records with `shot_flags` bit1 clear while single-wielding. If they
+  are absent, that path returns before the call and this producer covers only
+  the invocations that do reach it. The event is per invocation of the aim
+  call (the same granularity as the other titles' fire hooks), never a
+  trigger-pull or ammunition counter.
+
+**Local-actor qualification (investigated, deliberately unfiltered).** These
+hooks run on shared engine weapon functions, so an invocation can belong to a
+unit the local player does not control; the events therefore describe local
+*and* other actors' firing invocations. A filter was investigated for each
+title and deliberately not added, because every candidate local-identity helper
+is used in its subsystem with an explicit unknown/excluded arm and would drop
+some of the local player's own shots if reused as a hard predicate:
+
+- Halo 3: `Halo3IndependentTargetStorage` qualifies `unit ==
+  g_halo3PlayerUnitGetter(0)` but deliberately refuses controlling-parent
+  (in-vehicle) units, and native firing can hand the aim call such a unit.
+- ODST: the firing hook already compares the engine's unit against
+  `g_odstSeatedPlayerUnit` (which is `g_odstPlayerUnitGetter(0)`) for
+  substitution; the value is refreshed by the camera probe and reset to `-1`
+  on teardown, and driver/mounted-gun shots intentionally never reach the
+  substitution arm.
+- Reach: `LegacyCollisionIgnoredObject(HaloReach)` is used inside this very
+  transaction, but only as one arm of the ownership check (`-1` is explicitly
+  handled as unknown) and it is not the identity used for the vehicle branch.
+- Halo 4: the muzzle target-storage helper requires `!Halo4ReadVehicleInput(
+  seat).seated`, so it cannot identify the local player's in-vehicle shots.
+- Halo 2: the firing-path ownership helper `Halo2IndependentTargetStorage`
+  refuses any unit with a controlling parent (`+0x260 != UINT32_MAX`) and
+  `Halo2ReadIndependentWeapons` reads only output user 0's two weapon slots, so
+  a hard filter would drop the local player's own in-vehicle/mounted firing
+  invocations. The producer therefore publishes every firing invocation the
+  shared firing transaction's aim call serves.
+
+Volume may therefore rise relative to a local-only expectation, and drops and
+gaps remain fully accounted by the channel; use `title`, `controlled_unit` and
+the install state in `HaloMCCVR.log` before drawing actor conclusions.
+**Never "fix" this by filtering on a helper that can return unknown or that
+excludes a local case**: dropping the local player's own shots is worse than
+observing other actors' shots.
+
+**Firing-path producers are gate-qualified evidence.** The producer's first
+action is the disabled gate (a single admission load) before any diagnostic
+read; when telemetry is not accepting it performs no diagnostic read at all.
+Because ODST's and Reach's firing hooks are shared with gameplay timing, those
+producers cannot return early; they still perform zero diagnostic reads past
+the gate. A `shot` record therefore requires that the title's firing-path hooks
+exist for that build, that they are installed for the running title, and that a
+recording is active. **Absence of `shot` records does not mean no shots were
+fired**: it means this channel did not observe them. Do not use the sparse
+event channel as a shot counter, and do not compare a capture's `shot` count
+against gameplay statistics without checking the recorder/health accounting and
+the title's install state in `HaloMCCVR.log`.
+
+The channel's admission, generation, sequence and gap semantics are unchanged
+by the `shot` kind: `event_gap` markers cover exactly the dropped or
+cross-session claims, and an analysis whose interval crosses a gap stays
+indeterminate ([§9.2](#92-ordering-sequence-and-gap-semantics)).
 
 The event channel is read-only diagnostic instrumentation. Producer gates are
 extremely cheap when recording is off, and producers may perform only bounded
@@ -888,7 +1173,7 @@ Do not conflate these version domains:
 | raw telemetry schema | `kTelemetrySchemaVersion` (recorder) | 2 |
 | manifest schema | `manifest_schema_version` | 1 |
 | diagnostics schema | `diagnostics_schema_version` | 1 |
-| analyser implementation | generator `version` + `sha256` | `6.0.0-standalone` + file SHA-256 |
+| analyser implementation | generator `version` + `sha256` | `6.3.0-standalone` + file SHA-256 |
 
 A new analyser version does not automatically require a new raw/manifest/
 diagnostics schema. Bump only the schema whose consumer-visible contract
@@ -973,7 +1258,8 @@ Query presets currently include: `profile-provenance`, `profile-changes`,
 `settings`, `grip-held-aim-inactive`, `latch-release-while-grip-held`,
 `b-boundary`, `b-chatter`, `w-transitions`, `head-yaw`, `horizontal-reach`,
 `low-held-retention`, `steady-jumps`, `all-jumps`, `singularity`,
-`control-oracle`, `authority`, `transitions`, `performance`, `events`.
+`control-oracle`, `authority`, `transitions`, `performance`, `pg-lab`,
+`pg-lab-events`, `events`.
 `--query list` returns the sorted set. `--query` currently requires exactly one
 recording.
 
@@ -1528,9 +1814,9 @@ change; each must be updated with the process that owns it.
 raw telemetry schema:        2 (analyser reads schema 1 where its rules say so)
 manifest schema:             1
 diagnostics schema:          1
-analyser version:            6.0.0-standalone
-analyser package pin:        312031 bytes;
-                             SHA-256 73945DB9971D63B0F688EFFCBCB433B266C262800757291E8CE8ACB896B4D722
+analyser version:            6.3.0-standalone
+analyser package pin:        395283 bytes;
+                             SHA-256 053CF61671BE281551B89A459E0611490F29D0FFD00387B43668043793BAE5B4
 frame ring:                  4096 slots / 4095 usable / drop_new
 sparse event queue:          1024 slots
 TelemetryFrame size ceiling: 2048 bytes (compile-time); trivially copyable; standard layout

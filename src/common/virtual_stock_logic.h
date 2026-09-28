@@ -40,6 +40,12 @@ struct DirectionSelection
     bool usedVirtualStock = false;
     bool rejectedExtreme = false;
     float rejectedAgreement = 0.0f;
+    // Persistent support grip corrective (T13): true only when `valid` was
+    // produced by a retained support-steering invocation whose primary ->
+    // support agreement crossed below the legacy 0.35 floor. The floor verdict
+    // itself stays recorded in rejectedAgreement, so the acceptance is never
+    // presented as an ordinary in-cone pass.
+    bool retainedBeyondAgreementFloor = false;
     Point3 direction{0.0f, 0.0f, 0.0f};
 };
 
@@ -322,12 +328,76 @@ inline SupportEndpointSelection SelectTwoHandSupportEndpoint(
     return result;
 }
 
+// Free two-hand production geometry: Grip -> Grip (GG). With Virtual Stock OFF
+// and the two-hand hold latched, the positional B line IS the primary Grip
+// position -> support Grip position pair. It is a fixed implementation detail
+// of the product, not a user-selectable anchor and not a config/menu switch,
+// and it deliberately never consults "Reduce Support-Hand Rotation": that
+// setting only chooses the Virtual Stock support endpoint.
+//
+// Both grips must be committed (`*GripValid`) and finite. Anything else -
+// either grip missing, non-finite, or the solve carrying no grip sample at all
+// - returns the caller's aim-position pair, which is the exact pre-GG geometry,
+// so absent or untracked grip data degrades to the previous behaviour instead
+// of a mixed grip/aim pair or a fabricated position. A committed-but-
+// non-finite grip is treated the same way here rather than failing the whole
+// selection: the product solve must keep steering (fail-safe, never NaN).
+//
+// This mirrors the Two-Hand Lab's GG anchor (same both-grips-or-aim-line rule);
+// the product path computes it here so GG never depends on the Lab being
+// enabled.
+struct TwoHandGripEndpoints
+{
+    // True only when the returned pair is the Grip -> Grip pair.
+    bool usedGrips = false;
+    // False only when neither pair is usable (non-finite aim endpoints); the
+    // caller then keeps today's fail-closed behaviour.
+    bool valid = false;
+    Point3 primary{};
+    Point3 support{};
+};
+
+inline TwoHandGripEndpoints SelectTwoHandGripEndpoints(
+    Point3 primaryAim, Point3 supportAim, bool primaryGripValid,
+    Point3 primaryGrip, bool supportGripValid, Point3 supportGrip) noexcept
+{
+    TwoHandGripEndpoints result{};
+    if (primaryGripValid && supportGripValid && Finite(primaryGrip) &&
+        Finite(supportGrip))
+    {
+        result.usedGrips = true;
+        result.primary = primaryGrip;
+        result.support = supportGrip;
+        result.valid = true;
+        return result;
+    }
+    if (Finite(primaryAim) && Finite(supportAim))
+    {
+        result.primary = primaryAim;
+        result.support = supportAim;
+        result.valid = true;
+    }
+    return result;
+}
+
 // The legacy controller-to-controller acceptance rule is also the Hybrid
 // offhand candidate. Keep the rejection threshold and diagnostics in one pure
 // helper so Hybrid cannot accidentally bypass the stock-safe agreement guard.
+//
+// `retainBeyondAgreementFloor` is the persistent-support-grip corrective: the
+// caller may set it only for an invocation that is qualified to consume
+// support geometry (wired title, durable relationship engaged and readable,
+// current invocation proving the same owner). When set, the 0.35 agreement
+// floor no longer rejects the direction; every other guard is unchanged
+// (finite inputs, the minimum segment length, the normalization and the
+// finite output check all still run first), and the floor verdict is still
+// written to `rejectedExtreme` / `rejectedAgreement` so a caller can record
+// that the floor would have rejected. The stock ray path and the Hybrid
+// offhand path never set it.
 inline bool TryBuildAcceptedSupportDirection(
     Point3 primary, Point3 support, Point3 primaryForward,
-    Point3& out, bool& rejectedExtreme, float& rejectedAgreement) noexcept
+    Point3& out, bool& rejectedExtreme, float& rejectedAgreement,
+    bool retainBeyondAgreementFloor = false) noexcept
 {
     out = Point3{};
     rejectedExtreme = false;
@@ -352,11 +422,19 @@ inline bool TryBuildAcceptedSupportDirection(
     if (!Finite(out))
         return false;
     const float agreement = Dot(out, primaryForward);
-    if (!std::isfinite(agreement) || agreement < 0.35f)
+    if (!std::isfinite(agreement))
     {
+        // A non-finite agreement is never retention-eligible: the primary
+        // forward itself is unusable and the caller must fall back.
         rejectedExtreme = true;
         rejectedAgreement = agreement;
         return false;
+    }
+    if (agreement < 0.35f)
+    {
+        rejectedExtreme = true;
+        rejectedAgreement = agreement;
+        return retainBeyondAgreementFloor;
     }
     return true;
 }
@@ -1093,10 +1171,21 @@ inline float ApplyVirtualStockProximityReleaseForTarget(
 // head-decoupling. Anything else (option off, no coherent head, degenerate
 // ray) falls back to the legacy primary -> support line with its agreement
 // rejection intact. Exact zero strength always enters that legacy branch.
+//
+// `retainBeyondAgreementFloor` is the persistent-support-grip corrective and
+// applies to the legacy fallback only. The caller sets it only for a
+// qualified invocation (engaged + trusted relationship) AND only while
+// Virtual Stock is off; the stock branch above and the non-retained fallback
+// are byte-identical to the pre-fix rule. When it is set and the floor
+// rejects, the selection stays valid and records the crossed floor in
+// `retainedBeyondAgreementFloor` (with the floor agreement in
+// `rejectedAgreement`), so the caller can distinguish the retained
+// acceptance from an ordinary in-cone pass.
 inline DirectionSelection SelectTwoHandAimDirection(
     bool virtualStockEnabled, float stockStrength, float rearHeightM,
     bool headValid, Point3 head, Point3 stockSupport, Point3 primary,
-    Point3 legacySupport, Point3 primaryForward) noexcept
+    Point3 legacySupport, Point3 primaryForward,
+    bool retainBeyondAgreementFloor = false) noexcept
 {
     DirectionSelection result{};
     if (virtualStockEnabled && std::isfinite(stockStrength) &&
@@ -1132,11 +1221,27 @@ inline DirectionSelection SelectTwoHandAimDirection(
         }
     }
     Point3 candidate{};
-    result.valid = TryBuildAcceptedSupportDirection(
+    bool floorRejected = false;
+    float floorAgreement = 0.0f;
+    const bool accepted = TryBuildAcceptedSupportDirection(
         primary, legacySupport, primaryForward, candidate,
-        result.rejectedExtreme, result.rejectedAgreement);
-    if (result.valid)
+        floorRejected, floorAgreement, retainBeyondAgreementFloor);
+    result.valid = accepted;
+    if (accepted)
+    {
         result.direction = candidate;
+        result.retainedBeyondAgreementFloor = floorRejected;
+        // Only a retained acceptance bypassed the floor: it keeps the crossed
+        // agreement the floor rejected (the `DirectionSelection` contract),
+        // while an ordinary in-cone pass keeps exactly zero. No consumer reads
+        // this field for an accepted selection, so the store is diagnostic.
+        result.rejectedAgreement = floorRejected ? floorAgreement : 0.0f;
+    }
+    else
+    {
+        result.rejectedExtreme = floorRejected;
+        result.rejectedAgreement = floorAgreement;
+    }
     return result;
 }
 

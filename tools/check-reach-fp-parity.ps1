@@ -233,15 +233,15 @@ $analyserDeliveryContracts = [ordered]@{
     'package analyser self-test' = @($package,
         '\$analyserPath\s+--self-test')
     'package analyser pinned hash' = @($package,
-        '73945DB9971D63B0F688EFFCBCB433B266C262800757291E8CE8ACB896B4D722')
+        '053CF61671BE281551B89A459E0611490F29D0FFD00387B43668043793BAE5B4')
     'package analyser pinned size' = @($package,
-        'analyserSource\.Length\s+-ne\s+312031')
+        'analyserSource\.Length\s+-ne\s+395283')
     'installer manifest schema' = @($installer,
         'Test-ExactInt32\s+\$manifest\.schema_version\s+55')
     'installer analyser pinned hash' = @($installer,
-        '73945DB9971D63B0F688EFFCBCB433B266C262800757291E8CE8ACB896B4D722')
+        '053CF61671BE281551B89A459E0611490F29D0FFD00387B43668043793BAE5B4')
     'installer analyser pinned size' = @($installer,
-        '\$expectedAnalyserBytes\s*=\s*312031')
+        '\$expectedAnalyserBytes\s*=\s*395283')
     'installer analyser identity' = @($installer,
         "Assert-FileIdentity[\s\S]{0,100}'Installed telemetry analyser'")
 }

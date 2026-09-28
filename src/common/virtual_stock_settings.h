@@ -97,6 +97,52 @@ inline constexpr float kVirtualStockHybridInverseNeckLateralMinimumM = -0.30f;
 inline constexpr float kVirtualStockHybridInverseNeckLateralMaximumM = 0.30f;
 inline constexpr float kVirtualStockHybridInverseNeckCorrectionCapM = 0.15f;
 inline constexpr bool kTwoHandSupportGripPoseDefault = true;
+// Two-Hand Smoothing user strength. 0 = raw/off controller input; 25 = the
+// full fixed Pavlov-inspired speed-25 input filter; intermediate values are a
+// wet/dry mix of that full filter's output over raw (never a slower filter).
+inline constexpr float kTwoHandSmoothingStrengthDefault = 0.0f;
+inline constexpr float kTwoHandSmoothingStrengthMinimum = 0.0f;
+inline constexpr float kTwoHandSmoothingStrengthMaximum = 25.0f;
+// Free two-hand (VS-OFF) support-steering authority: how much the support
+// (offhand) controller's directional aim steers the presented aim line while a
+// free two-hand hold is active. 0 = the primary controller's own aim is
+// authoritative; 1 = the support controller's aim carries equal authority.
+// Consumed only by the VS-OFF free two-hand directional solver; Virtual Stock
+// keeps its own offhand-influence setting.
+inline constexpr float kTwoHandOffhandInfluenceDefault = 0.5f;
+inline constexpr float kTwoHandOffhandInfluenceMinimum = 0.0f;
+inline constexpr float kTwoHandOffhandInfluenceMaximum = 1.0f;
+
+// The 200 ms VS-OFF acquire/release transition continuity is fixed internal
+// product behaviour: it always resolves enabled and has no player-facing
+// control. The historical `two_hand_transition_smoothing` key is still parsed
+// so old files load quietly, but it is dormant and can never resolve.
+inline constexpr bool TwoHandTransitionContinuityEnabled() noexcept
+{
+    return true;
+}
+
+// Applicability of that continuity seam to a frame: it owns every frame whose
+// two-handed aim is enabled. Consumers that layer an independent temporal
+// correction (the Two-Hand Lab) must stand down while this is true, so at most
+// one 200 ms correction can ever be applied.
+inline constexpr bool TwoHandTransitionContinuityAppliesToFrame(
+    bool twoHandedAimEnabled) noexcept
+{
+    return TwoHandTransitionContinuityEnabled() && twoHandedAimEnabled;
+}
+
+// Whether the diagnostic Two-Hand Lab temporal correction may engage for a
+// frame. Both the prepared-frame gate and its frame-thread mirror resolve
+// through this one predicate: the Lab may only run when Virtual Stock is off
+// and the product continuity seam does not own the frame, so the two 200 ms
+// corrections can never stack.
+inline constexpr bool TwoHandLabTemporalEngagedFor(
+    bool labEnabled, bool virtualStockEnabled, bool twoHandedAimEnabled) noexcept
+{
+    return labEnabled && !virtualStockEnabled &&
+        !TwoHandTransitionContinuityAppliesToFrame(twoHandedAimEnabled);
+}
 
 struct VirtualStockAimSettings
 {

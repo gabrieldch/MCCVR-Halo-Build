@@ -941,6 +941,34 @@ struct Config
     // Reduce support-hand rotation by using the grip-pose position as the
     // support endpoint. Position still steers two-handed aim.
     bool two_hand_support_grip_pose = kTwoHandSupportGripPoseDefault;
+    // Durable owner-bound support grip. New configurations enable it; parsing
+    // an existing explicit value keeps that user's choice without migration.
+    bool persistent_support_grip = true;
+    // Pavlov-inspired controller-input smoothing strength: the fixed speed-25
+    // response with the quaternion-native MCC rotational implementation is
+    // unchanged, and this value wet/dry mixes its output over raw directional
+    // input copies. 0 = off/raw; 25 = the full fixed filter; intermediate
+    // values blend. Consumed only by the VS-OFF free two-hand directional
+    // solver. Legacy boolean key two_hand_smoothing migrates to 0 or 25.
+    float two_hand_smoothing_strength = kTwoHandSmoothingStrengthDefault;
+    // Free two-hand (VS-OFF) support-steering authority: how much the support
+    // (offhand) controller's directional aim steers the presented aim line
+    // while a free two-hand hold is active. 0 = the primary controller's own
+    // aim is authoritative; 1 = equal authority. Consumed only by the VS-OFF
+    // free two-hand solver; Virtual Stock keeps its own offhand influence.
+    float two_hand_offhand_influence = kTwoHandOffhandInfluenceDefault;
+    // Retired 2026-09-29: the fixed 200 ms VS-OFF acquire/release transition
+    // continuity is internal product behaviour with no player control. This
+    // legacy field is still parsed so historical files load quietly, but it is
+    // dormant: no product or telemetry resolution may read it. The product
+    // truth is TwoHandTransitionContinuityEnabled().
+    bool two_hand_transition_smoothing = true;
+    // Persistent-grip weapon-switch option (PG ON only). When on, a proven
+    // weapon switch while the grip is engaged rebinds the two-hand hold to the
+    // new weapon immediately, with no re-orientation. Off: the switched weapon
+    // becomes grippable again through the normal spatial admission without
+    // releasing the grip button.
+    bool two_hand_switch_inherit = false;
     // Two-hand engage style: true = toggle (click left grip on/off), false =
     // hold (engaged only while the left grip is held).
     bool two_hand_toggle = true;

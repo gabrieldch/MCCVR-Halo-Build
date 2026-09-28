@@ -1,15 +1,19 @@
 #include "../common/vr_interaction_refinement_logic.h"
+#include "../common/support_grip_logic.h"
+#include "../common/support_grab_logic.h"
 #include "../common/weapon_hand_logic.h"
 #include "../common/weapon_interaction_logic.h"
 #include "../common/weapon_model_observation.h"
 #include "../common/weapon_reload_target.h"
 #include "weapon_accessory_renderer.h"
 #include "aim_pose_trace.h"
+#include "two_hand_lab_runtime.h"
 #include "telemetry_recorder.h"
 #include "../common/title_runtime_state.h"
 #include <windows.h>
 #include "../common/virtual_stock_logic.h"
 #include "../common/virtual_stock_aim_continuity.h"
+#include "../common/two_hand_input_smoothing.h"
 #include "../common/virtual_stock_neutral_capture.h"
 #include <tlhelp32.h>
 #include <d3d11.h>
@@ -919,11 +923,26 @@ namespace
     // separate is intentional: weapon steering and bullets stay on raw aim.
     XrPosef g_reticleAimPose{{0, 0, 0, 1}, {0, 0, 0}};
     bool g_reticleAimPoseValid = false;
+    // Relationship epoch of the last presented (smoothed) ray. The receipt
+    // travels with the smoothed result: the smoothing history reseeds across
+    // an owner/trust or relationship-epoch discontinuity instead of blending
+    // previous-owner geometry into the new ray (F14, §10). The trust bit of
+    // that receipt is published on the ray itself; the epoch history is the
+    // continuity state (a release or a bind always advances the epoch, so the
+    // epoch comparison separates every supported/unsupported transition).
+    uint64_t g_reticleSupportEpoch = 0;
     struct ReticleAimPosePublication
     {
         std::atomic<uint32_t> sequence{0};
         std::atomic<uint64_t> sampleMs{0};
         std::atomic<uint8_t> valid{0};
+        // Solve-time support receipt (F07/F14). Filled from the receipt frozen
+        // by the solve that produced this exact presented pose; never from a
+        // live durable re-read at the producer. 0/false when the feature is
+        // off.
+        std::atomic<uint64_t> supportEpoch{0};
+        std::atomic<uint8_t> supportTrusted{0};
+        std::atomic<uint64_t> preparedSerial{0};
         std::atomic<float> qx{0.0f};
         std::atomic<float> qy{0.0f};
         std::atomic<float> qz{0.0f};
@@ -934,7 +953,8 @@ namespace
     };
     ReticleAimPosePublication g_presentedReticleAimPose;
 
-    void PublishPresentedReticleAimPose(const XrPosef* pose)
+    void PublishPresentedReticleAimPose(const XrPosef* pose,
+        uint64_t supportEpoch, bool supportTrusted, uint64_t solveSerial)
     {
         auto& published = g_presentedReticleAimPose;
         published.sequence.fetch_add(1, std::memory_order_acq_rel);
@@ -942,6 +962,12 @@ namespace
         published.sampleMs.store(
             valid ? GetTickCount64() : 0, std::memory_order_relaxed);
         published.valid.store(valid ? 1u : 0u, std::memory_order_relaxed);
+        published.supportEpoch.store(
+            valid ? supportEpoch : 0, std::memory_order_relaxed);
+        published.supportTrusted.store(
+            valid && supportTrusted ? 1u : 0u, std::memory_order_relaxed);
+        published.preparedSerial.store(
+            valid ? solveSerial : 0, std::memory_order_relaxed);
         published.qx.store(valid ? pose->orientation.x : 0.0f,
                            std::memory_order_relaxed);
         published.qy.store(valid ? pose->orientation.y : 0.0f,
@@ -1758,6 +1784,278 @@ namespace
     };
     AimContinuityPublication g_aimContinuityPublication;
 
+    // VS-OFF two-hand controller-input smoothing is advanced by the prepared-
+    // frame owner only. Game/title consumers read its exact-serial filtered
+    // geometry through the small lock-free publication; raw capture and every
+    // grip-acquisition/retention path remain untouched.
+    struct TwoHandInputSmoothingLayerState
+    {
+        two_hand_input_smoothing::State filter{};
+        uint64_t lastPreparedSerial = 0;
+        uint64_t advanceCount = 0;
+        GameTitle title = GameTitle::None;
+        uint32_t generation = 0;
+        uint64_t contactSpaceEpoch = 0;
+        bool leftHanded = false;
+        bool haveIdentity = false;
+    };
+    TwoHandInputSmoothingLayerState g_twoHandInputSmoothingLayer;
+
+    struct TwoHandInputSmoothingPreparedOutput
+    {
+        uint64_t serial = 0;
+        bool active = false;
+        bool sampleValid = false;
+        // Frozen user strength (0..25) for this exact prepared serial.
+        // Consumers and telemetry read this instead of the live config, so one
+        // serial can never mix two slider values.
+        float strength = 0.0f;
+        two_hand_input_smoothing::Sample raw{};
+        two_hand_input_smoothing::Sample filtered{};
+        two_hand_input_smoothing::Sample mixed{};
+        // INTERNAL speed-25 temporal alpha = clamp(25*dt, 0, 1); never the
+        // user-facing strength amount.
+        float alpha = 0.0f;
+        float orientationErrorDeg = 0.0f;
+        float primaryPositionErrorM = 0.0f;
+        float supportPositionErrorM = 0.0f;
+    };
+    TwoHandInputSmoothingPreparedOutput g_twoHandInputSmoothingOutput;
+
+    struct TwoHandInputSmoothingPublication
+    {
+        std::atomic<uint32_t> sequence{0};
+        std::atomic<uint64_t> serial{0};
+        std::atomic<uint64_t> contactSpaceEpoch{0};
+        std::atomic<uint32_t> titleGeneration{0};
+        std::atomic<uint8_t> title{0};
+        std::atomic<uint8_t> leftHanded{0};
+        std::atomic<uint8_t> supportEndpointUsedGrip{0};
+        std::atomic<uint8_t> active{0};
+        std::atomic<float> rawQx{0.0f}, rawQy{0.0f}, rawQz{0.0f}, rawQw{1.0f};
+        std::atomic<float> filteredQx{0.0f}, filteredQy{0.0f};
+        std::atomic<float> filteredQz{0.0f}, filteredQw{1.0f};
+        std::atomic<float> rawPrimaryX{0.0f}, rawPrimaryY{0.0f}, rawPrimaryZ{0.0f};
+        std::atomic<float> filteredPrimaryX{0.0f}, filteredPrimaryY{0.0f}, filteredPrimaryZ{0.0f};
+        std::atomic<float> rawSupportX{0.0f}, rawSupportY{0.0f}, rawSupportZ{0.0f};
+        std::atomic<float> filteredSupportX{0.0f}, filteredSupportY{0.0f}, filteredSupportZ{0.0f};
+        std::atomic<float> rawPrimaryGripX{0.0f}, rawPrimaryGripY{0.0f}, rawPrimaryGripZ{0.0f};
+        std::atomic<float> filteredPrimaryGripX{0.0f}, filteredPrimaryGripY{0.0f}, filteredPrimaryGripZ{0.0f};
+        std::atomic<float> rawSupportGripX{0.0f}, rawSupportGripY{0.0f}, rawSupportGripZ{0.0f};
+        std::atomic<float> filteredSupportGripX{0.0f}, filteredSupportGripY{0.0f}, filteredSupportGripZ{0.0f};
+        std::atomic<uint8_t> primaryGripValid{0}, supportGripValid{0};
+        std::atomic<float> strength{0.0f};
+        std::atomic<float> mixedQx{0.0f}, mixedQy{0.0f};
+        std::atomic<float> mixedQz{0.0f}, mixedQw{1.0f};
+        std::atomic<float> mixedPrimaryX{0.0f}, mixedPrimaryY{0.0f}, mixedPrimaryZ{0.0f};
+        std::atomic<float> mixedSupportX{0.0f}, mixedSupportY{0.0f}, mixedSupportZ{0.0f};
+        std::atomic<float> mixedPrimaryGripX{0.0f}, mixedPrimaryGripY{0.0f}, mixedPrimaryGripZ{0.0f};
+        std::atomic<float> mixedSupportGripX{0.0f}, mixedSupportGripY{0.0f}, mixedSupportGripZ{0.0f};
+        std::atomic<float> alpha{0.0f};
+        std::atomic<float> orientationErrorDeg{0.0f};
+        std::atomic<float> primaryPositionErrorM{0.0f};
+        std::atomic<float> supportPositionErrorM{0.0f};
+    };
+    TwoHandInputSmoothingPublication g_twoHandInputSmoothingPublication;
+
+    void PublishTwoHandInputSmoothing(uint64_t serial, uint64_t contactSpaceEpoch,
+        GameTitle title, uint32_t titleGeneration, bool leftHanded,
+        bool supportEndpointUsedGrip, bool active,
+        const two_hand_input_smoothing::Result& result) noexcept
+    {
+        auto& published = g_twoHandInputSmoothingPublication;
+        published.sequence.fetch_add(1, std::memory_order_acq_rel);
+        published.serial.store(serial, std::memory_order_relaxed);
+        published.contactSpaceEpoch.store(contactSpaceEpoch,
+            std::memory_order_relaxed);
+        published.title.store(static_cast<uint8_t>(title),
+            std::memory_order_relaxed);
+        published.titleGeneration.store(titleGeneration,
+            std::memory_order_relaxed);
+        published.leftHanded.store(leftHanded ? 1u : 0u,
+            std::memory_order_relaxed);
+        published.supportEndpointUsedGrip.store(
+            supportEndpointUsedGrip ? 1u : 0u, std::memory_order_relaxed);
+        published.active.store(active ? 1u : 0u, std::memory_order_relaxed);
+        const auto storeVec = [](auto& x, auto& y, auto& z,
+                                 virtual_stock::Point3 value) {
+            x.store(value.x, std::memory_order_relaxed);
+            y.store(value.y, std::memory_order_relaxed);
+            z.store(value.z, std::memory_order_relaxed);
+        };
+        published.rawQx.store(result.raw.primaryOrientation.x, std::memory_order_relaxed);
+        published.rawQy.store(result.raw.primaryOrientation.y, std::memory_order_relaxed);
+        published.rawQz.store(result.raw.primaryOrientation.z, std::memory_order_relaxed);
+        published.rawQw.store(result.raw.primaryOrientation.w, std::memory_order_relaxed);
+        published.filteredQx.store(result.filtered.primaryOrientation.x, std::memory_order_relaxed);
+        published.filteredQy.store(result.filtered.primaryOrientation.y, std::memory_order_relaxed);
+        published.filteredQz.store(result.filtered.primaryOrientation.z, std::memory_order_relaxed);
+        published.filteredQw.store(result.filtered.primaryOrientation.w, std::memory_order_relaxed);
+        storeVec(published.rawPrimaryX, published.rawPrimaryY, published.rawPrimaryZ,
+            result.raw.primaryAimPosition);
+        storeVec(published.filteredPrimaryX, published.filteredPrimaryY,
+            published.filteredPrimaryZ, result.filtered.primaryAimPosition);
+        storeVec(published.rawSupportX, published.rawSupportY, published.rawSupportZ,
+            result.raw.supportAimPosition);
+        storeVec(published.filteredSupportX, published.filteredSupportY,
+            published.filteredSupportZ, result.filtered.supportAimPosition);
+        storeVec(published.rawPrimaryGripX, published.rawPrimaryGripY,
+            published.rawPrimaryGripZ, result.raw.primaryGripPosition);
+        storeVec(published.filteredPrimaryGripX, published.filteredPrimaryGripY,
+            published.filteredPrimaryGripZ, result.filtered.primaryGripPosition);
+        storeVec(published.rawSupportGripX, published.rawSupportGripY,
+            published.rawSupportGripZ, result.raw.supportGripPosition);
+        storeVec(published.filteredSupportGripX, published.filteredSupportGripY,
+            published.filteredSupportGripZ, result.filtered.supportGripPosition);
+        published.primaryGripValid.store(result.filtered.primaryGripValid ? 1u : 0u, std::memory_order_relaxed);
+        published.supportGripValid.store(result.filtered.supportGripValid ? 1u : 0u, std::memory_order_relaxed);
+        published.strength.store(result.strength, std::memory_order_relaxed);
+        published.mixedQx.store(result.mixed.primaryOrientation.x, std::memory_order_relaxed);
+        published.mixedQy.store(result.mixed.primaryOrientation.y, std::memory_order_relaxed);
+        published.mixedQz.store(result.mixed.primaryOrientation.z, std::memory_order_relaxed);
+        published.mixedQw.store(result.mixed.primaryOrientation.w, std::memory_order_relaxed);
+        storeVec(published.mixedPrimaryX, published.mixedPrimaryY,
+            published.mixedPrimaryZ, result.mixed.primaryAimPosition);
+        storeVec(published.mixedSupportX, published.mixedSupportY,
+            published.mixedSupportZ, result.mixed.supportAimPosition);
+        storeVec(published.mixedPrimaryGripX, published.mixedPrimaryGripY,
+            published.mixedPrimaryGripZ, result.mixed.primaryGripPosition);
+        storeVec(published.mixedSupportGripX, published.mixedSupportGripY,
+            published.mixedSupportGripZ, result.mixed.supportGripPosition);
+        published.alpha.store(result.alpha, std::memory_order_relaxed);
+        published.orientationErrorDeg.store(result.primaryOrientationErrorDeg, std::memory_order_relaxed);
+        published.primaryPositionErrorM.store(result.primaryPositionErrorM, std::memory_order_relaxed);
+        published.supportPositionErrorM.store(result.supportPositionErrorM, std::memory_order_relaxed);
+        published.sequence.fetch_add(1, std::memory_order_release);
+    }
+
+    void InvalidateTwoHandInputSmoothingLayer() noexcept
+    {
+        two_hand_input_smoothing::Reset(
+            g_twoHandInputSmoothingLayer.filter);
+        g_twoHandInputSmoothingLayer.lastPreparedSerial = 0;
+        g_twoHandInputSmoothingLayer.haveIdentity = false;
+        g_twoHandInputSmoothingOutput = TwoHandInputSmoothingPreparedOutput{};
+        PublishTwoHandInputSmoothing(0, 0, GameTitle::None, 0, false, false,
+            false, two_hand_input_smoothing::Result{});
+    }
+
+    bool ReadTwoHandInputSmoothing(uint64_t expectedSerial,
+        uint64_t expectedContactSpaceEpoch, GameTitle expectedTitle,
+        uint32_t expectedGeneration, bool expectedLeftHanded,
+        bool expectedSupportEndpointUsedGrip,
+        TwoHandInputSmoothingPreparedOutput& out) noexcept
+    {
+        out = TwoHandInputSmoothingPreparedOutput{};
+        if (!expectedSerial)
+            return false;
+        auto& published = g_twoHandInputSmoothingPublication;
+        for (int attempt = 0; attempt < 2; ++attempt)
+        {
+            const uint32_t before =
+                published.sequence.load(std::memory_order_acquire);
+            if (!before || (before & 1u))
+                continue;
+            TwoHandInputSmoothingPreparedOutput candidate{};
+            candidate.serial = published.serial.load(
+                std::memory_order_relaxed);
+            const uint64_t contactSpaceEpoch = published.contactSpaceEpoch.load(
+                std::memory_order_relaxed);
+            const GameTitle title = static_cast<GameTitle>(published.title.load(
+                std::memory_order_relaxed));
+            const uint32_t titleGeneration = published.titleGeneration.load(
+                std::memory_order_relaxed);
+            const bool leftHanded = published.leftHanded.load(
+                std::memory_order_relaxed) != 0;
+            const bool supportEndpointUsedGrip =
+                published.supportEndpointUsedGrip.load(
+                    std::memory_order_relaxed) != 0;
+            candidate.active = published.active.load(
+                std::memory_order_relaxed) != 0;
+            const auto readVec = [](const auto& x, const auto& y, const auto& z) {
+                return virtual_stock::Point3{x.load(std::memory_order_relaxed),
+                    y.load(std::memory_order_relaxed), z.load(std::memory_order_relaxed)};
+            };
+            candidate.raw.primaryOrientation = {
+                published.rawQx.load(std::memory_order_relaxed),
+                published.rawQy.load(std::memory_order_relaxed),
+                published.rawQz.load(std::memory_order_relaxed),
+                published.rawQw.load(std::memory_order_relaxed)};
+            candidate.filtered.primaryOrientation = {
+                published.filteredQx.load(std::memory_order_relaxed),
+                published.filteredQy.load(std::memory_order_relaxed),
+                published.filteredQz.load(std::memory_order_relaxed),
+                published.filteredQw.load(std::memory_order_relaxed)};
+            candidate.raw.primaryAimPosition = readVec(published.rawPrimaryX, published.rawPrimaryY, published.rawPrimaryZ);
+            candidate.filtered.primaryAimPosition = readVec(published.filteredPrimaryX, published.filteredPrimaryY, published.filteredPrimaryZ);
+            candidate.raw.supportAimPosition = readVec(published.rawSupportX, published.rawSupportY, published.rawSupportZ);
+            candidate.filtered.supportAimPosition = readVec(published.filteredSupportX, published.filteredSupportY, published.filteredSupportZ);
+            candidate.raw.primaryGripPosition = readVec(published.rawPrimaryGripX, published.rawPrimaryGripY, published.rawPrimaryGripZ);
+            candidate.filtered.primaryGripPosition = readVec(published.filteredPrimaryGripX, published.filteredPrimaryGripY, published.filteredPrimaryGripZ);
+            candidate.raw.supportGripPosition = readVec(published.rawSupportGripX, published.rawSupportGripY, published.rawSupportGripZ);
+            candidate.filtered.supportGripPosition = readVec(published.filteredSupportGripX, published.filteredSupportGripY, published.filteredSupportGripZ);
+            candidate.raw.primaryGripValid = candidate.filtered.primaryGripValid = published.primaryGripValid.load(std::memory_order_relaxed) != 0;
+            candidate.raw.supportGripValid = candidate.filtered.supportGripValid = published.supportGripValid.load(std::memory_order_relaxed) != 0;
+            // The applied blend always carries the raw sample's validity flags:
+            // BlendByMix only ever changes positions that are valid at both
+            // endpoints, so the mixed sample shares them with raw/filtered.
+            candidate.mixed.primaryGripValid = candidate.raw.primaryGripValid;
+            candidate.mixed.supportGripValid = candidate.raw.supportGripValid;
+            candidate.strength = published.strength.load(std::memory_order_relaxed);
+            candidate.mixed.primaryOrientation = {
+                published.mixedQx.load(std::memory_order_relaxed),
+                published.mixedQy.load(std::memory_order_relaxed),
+                published.mixedQz.load(std::memory_order_relaxed),
+                published.mixedQw.load(std::memory_order_relaxed)};
+            candidate.mixed.primaryAimPosition = readVec(published.mixedPrimaryX, published.mixedPrimaryY, published.mixedPrimaryZ);
+            candidate.mixed.supportAimPosition = readVec(published.mixedSupportX, published.mixedSupportY, published.mixedSupportZ);
+            candidate.mixed.primaryGripPosition = readVec(published.mixedPrimaryGripX, published.mixedPrimaryGripY, published.mixedPrimaryGripZ);
+            candidate.mixed.supportGripPosition = readVec(published.mixedSupportGripX, published.mixedSupportGripY, published.mixedSupportGripZ);
+            candidate.alpha = published.alpha.load(std::memory_order_relaxed);
+            candidate.orientationErrorDeg = published.orientationErrorDeg.load(std::memory_order_relaxed);
+            candidate.primaryPositionErrorM = published.primaryPositionErrorM.load(std::memory_order_relaxed);
+            candidate.supportPositionErrorM = published.supportPositionErrorM.load(std::memory_order_relaxed);
+            if (published.sequence.load(std::memory_order_acquire) != before)
+                continue;
+            const two_hand_input_smoothing::PublicationIdentity expected{
+                expectedSerial, expectedContactSpaceEpoch,
+                static_cast<uint8_t>(expectedTitle), expectedGeneration,
+                expectedLeftHanded, expectedSupportEndpointUsedGrip};
+            const two_hand_input_smoothing::PublicationIdentity actual{
+                candidate.serial, contactSpaceEpoch,
+                static_cast<uint8_t>(title), titleGeneration, leftHanded,
+                supportEndpointUsedGrip};
+            if (!candidate.active ||
+                !two_hand_input_smoothing::SamePublicationIdentity(
+                    expected, actual) ||
+                contactSpaceEpoch != g_contactSpaceEpoch.load(
+                    std::memory_order_acquire) ||
+                title != expectedTitle ||
+                title != TitleAdapter_GetActiveTitle() ||
+                titleGeneration != expectedGeneration ||
+                titleGeneration != TitleAdapter_GetGeneration(title) ||
+                leftHanded != expectedLeftHanded ||
+                supportEndpointUsedGrip != expectedSupportEndpointUsedGrip ||
+                !two_hand_input_smoothing::FiniteSample(candidate.raw) ||
+                !two_hand_input_smoothing::FiniteSample(candidate.filtered) ||
+                !two_hand_input_smoothing::FiniteSample(candidate.mixed) ||
+                !(candidate.strength > 0.0f) ||
+                candidate.strength >
+                    two_hand_input_smoothing::kStrengthMaximum ||
+                !std::isfinite(candidate.alpha) ||
+                !std::isfinite(candidate.orientationErrorDeg) ||
+                !std::isfinite(candidate.primaryPositionErrorM) ||
+                !std::isfinite(candidate.supportPositionErrorM) ||
+                g_preparedSerialPublished.load(std::memory_order_acquire) !=
+                    expectedSerial)
+                return false;
+            candidate.sampleValid = true;
+            out = candidate;
+            return true;
+        }
+        return false;
+    }
+
     void PublishAimContinuityCorrection(
         uint64_t serial, uint64_t contactSpaceEpoch, bool valid,
         bool stockHeadCoherent, bool supportEndpointUsedGrip,
@@ -1784,7 +2082,7 @@ namespace
     // after a reset, epoch change, title/handedness change or feature disable.
     // Consumers see identity afterwards because the packet is published
     // invalid, which is also what every fail-open path returns.
-    void InvalidateAimContinuityLayer() noexcept
+    void InvalidateAimContinuityState() noexcept
     {
         ResetAimContinuity(g_aimContinuityLayer.transition);
         g_aimContinuityLayer.lastPresentedValid = false;
@@ -1795,6 +2093,20 @@ namespace
         PublishAimContinuityCorrection(
             0, 0, false, false, false, virtual_stock::Quat4{});
     }
+
+    void InvalidateAimContinuityLayer() noexcept
+    {
+        InvalidateAimContinuityState();
+        InvalidateTwoHandInputSmoothingLayer();
+    }
+
+    // Two-Hand Lab temporal layer (tranche 2B): forward declaration so the
+    // exceptional lifecycle paths above (abort, fatal drain, reference-space
+    // change, session loss, handedness swap) mirror the VS invalidation even
+    // though the layer itself is defined beside the Lab seam below. The
+    // routine prepared-frame retire (ResetPreparedFrame) must NOT call it,
+    // exactly like the VS layer.
+    void InvalidateTwoHandLabTemporal() noexcept;
 
     // presented = live (x) correction, in exactly the frame finishAimPose
     // calibrated: the correction is local to the live pose, so the composition
@@ -7669,6 +7981,7 @@ float4 ps_scope_linearize(VSOut i):SV_Target { return paint(i.uv,true); }
         // frame must not leave a transition correction or history behind, so
         // both branches invalidate.
         InvalidateAimContinuityLayer();
+        InvalidateTwoHandLabTemporal();
         if (!g_preparedFrame.begun || g_session == XR_NULL_HANDLE)
         {
             ResetPreparedFrame();
@@ -7694,6 +8007,7 @@ float4 ps_scope_linearize(VSOut i):SV_Target { return paint(i.uv,true); }
         g_stockAimFresh.store(false, std::memory_order_release);
         g_supportGripPoseFresh.store(false, std::memory_order_release);
         InvalidateAimContinuityLayer();
+        InvalidateTwoHandLabTemporal();
         g_waitThreadStop.store(true, std::memory_order_release);
         if (g_waitConsumedEvent)
             SetEvent(g_waitConsumedEvent);
@@ -7787,6 +8101,7 @@ float4 ps_scope_linearize(VSOut i):SV_Target { return paint(i.uv,true); }
                     // old reference space; drop them before the new space is
                     // used. The seam also compares the epoch per serial.
                     InvalidateAimContinuityLayer();
+                    InvalidateTwoHandLabTemporal();
                 }
                 break;
             }
@@ -7868,6 +8183,7 @@ float4 ps_scope_linearize(VSOut i):SV_Target { return paint(i.uv,true); }
                     // prepared frame instead of letting it survive into a later
                     // session (the routine retire no longer does this).
                     InvalidateAimContinuityLayer();
+                    InvalidateTwoHandLabTemporal();
                     ResetPreparedFrame();
                     g_authoredReticlePreparationReady.store(
                         false, std::memory_order_release);
@@ -7880,6 +8196,7 @@ float4 ps_scope_linearize(VSOut i):SV_Target { return paint(i.uv,true); }
             case XR_TYPE_EVENT_DATA_INSTANCE_LOSS_PENDING:
                 StopControllerHaptics();
                 InvalidateAimContinuityLayer();
+                InvalidateTwoHandLabTemporal();
                 ResetPreparedFrame();
                 g_authoredReticlePreparationReady.store(
                     false, std::memory_order_release);
@@ -9525,11 +9842,97 @@ float4 ps_scope_linearize(VSOut i):SV_Target { return paint(i.uv,true); }
         XrVector3f supportPosition{0.0f, 0.0f, 0.0f};
         bool supportEndpointUsedGrip = false;
         bool supportGripPoseEnabled = false;
+        // Two-Hand Lab snapshot (tranche 2A). One coherent copy of the runtime
+        // store per solve, attached by CurrentStockAimPoseInputs and cleared
+        // (enable only) by AimPoseInputsForProfile so the A/B/C
+        // control/counterfactual solves stay Lab-inert. Plain scalars only:
+        // the offline fixtures compile this struct without the Lab header
+        // (two_hand_lab types resolve through aim_pose_trace.h for the solver
+        // body). Anchor/agreement/temporal ordinals match
+        // two_hand_lab::AnchorMode / AgreementMode / TemporalMode declaration
+        // order (Production / LegacyHard / None = 0).
+        bool twoHandLabEnabled = false;
+        int twoHandLabAnchor = 0;
+        float twoHandLabOffhandInfluence = 1.0f;
+        int twoHandLabAgreement = 0;
+        float twoHandLabSoftFullAgreement = 0.9f;
+        int twoHandLabTemporal = 0;
+        // Two-Hand Lab settings generation (tranche 2B race guard). Stamped
+        // by CurrentStockAimPoseInputs from the runtime store's process-wide
+        // generation counter, which increments on every publish. The Lab
+        // temporal packet carries the generation of the solve its correction
+        // belongs to; consumers fail open when it does not match their own
+        // solve, closing the same-serial settings-toggle class. Plain scalar:
+        // the offline fixtures compile this struct, and counterfactual
+        // copies (AimPoseInputsForProfile) inherit it unchanged.
+        uint64_t twoHandLabGeneration = 0;
+        // Raw grip endpoints, from the same controller sample as right/left
+        // (same-sample proof at the Lab store block below). They are the
+        // positional pivots of the free two-hand production geometry
+        // (Grip -> Grip) and of the Lab anchor matrix. The Virtual Stock
+        // support endpoint still comes from supportPosition above and is
+        // selected independently ("Reduce Support-Hand Rotation").
+        bool primaryGripValid = false;
+        XrVector3f primaryGripPosition{0.0f, 0.0f, 0.0f};
+        bool supportGripValid = false;
+        XrVector3f supportGripPosition{0.0f, 0.0f, 0.0f};
+        // Prepared-serial smoothed copies for the VS-OFF two-hand directional
+        // solve. Raw `right` remains authoritative for output/base position;
+        // these copies are consumed only by the two-hand solver branch.
+        bool twoHandSmoothingGeometryValid = false;
+        XrQuaternionf twoHandSmoothedPrimaryOrientation{0.0f, 0.0f, 0.0f, 1.0f};
+        XrVector3f twoHandSmoothedPrimaryAimPosition{0.0f, 0.0f, 0.0f};
+        XrVector3f twoHandSmoothedSupportAimPosition{0.0f, 0.0f, 0.0f};
+        bool twoHandSmoothedPrimaryGripValid = false;
+        XrVector3f twoHandSmoothedPrimaryGripPosition{0.0f, 0.0f, 0.0f};
+        bool twoHandSmoothedSupportGripValid = false;
+        XrVector3f twoHandSmoothedSupportGripPosition{0.0f, 0.0f, 0.0f};
         VirtualStockTestProfile testProfileUsed =
             VirtualStockTestProfile::Custom;
         bool twoHandEnabled = false;
         bool twoHandLatched = false;
         bool twoHandToggle = true;
+        // Free two-hand (VS-OFF) offhand directional authority (W3), stamped by
+        // CurrentStockAimPoseInputs from `two_hand_offhand_influence`. 0 = the
+        // primary controller's own aim is authoritative (exact primary
+        // orientation, no positional rebuild); 1 = the accepted support
+        // direction owns presentation entirely; intermediate values blend
+        // primary direction -> accepted B through the tested authority helper.
+        // The default here is full authority, so any caller that does not stamp
+        // it - the offline fixtures in particular - keeps the pre-W3 product
+        // shape. Virtual Stock solves never read it.
+        float twoHandOffhandInfluence = 1.0f;
+        // Persistent support grip solve-time qualification (T5b). Plain
+        // scalars only, exactly like the Lab fields above: the offline aim
+        // fixtures compile this struct without the support-grip or vr headers.
+        // `supportMayConsume` is the qualification's permission (this
+        // invocation proved the relationship owner); `supportEpoch` is the
+        // durable relationship epoch (0 = coherently disengaged, all-ones =
+        // the relationship could not be read); the assembly stamps
+        // `supportSolveSerial` unconditionally (the presented-ray publication
+        // needs it) while every other value stays zero/false when the feature
+        // is off, so a PG-off solve never reports support provenance.
+        bool supportMayConsume = false;
+        uint64_t supportEpoch = 0;
+        bool supportRelationshipReadable = false;
+        bool supportRelationshipEngaged = false;
+        uint64_t supportSolveSerial = 0;
+        // Persistent support grip steering retention (T13 corrective). True
+        // only when this invocation is qualified to consume support geometry:
+        // the SAME T5b qualification bit as supportMayConsume (wired title,
+        // readable + engaged relationship, proven same owner). With it, the
+        // VS-off legacy selection keeps the support-derived direction across
+        // the 0.35 agreement floor instead of silently dropping to one-hand
+        // while the durable relationship stays engaged. Default false keeps
+        // PG-off, unwired, unreadable, disengaged and untrusted invocations on
+        // the pre-fix legacy rule.
+        bool supportSteeringRetained = false;
+        // Persistent support grip provenance carry (data only). A verbatim copy
+        // of the frozen qualification's forceOneHand flag, which the assembly
+        // applies to `twoHandEnabled` above. It exists so same-frame telemetry
+        // can name EXPLICIT forcing separately from an ordinary two-hand-off
+        // frame; nothing in the solve reads it and it changes no control flow.
+        bool supportForceOneHand = false;
         float leftHandForwardM = 0.0f;
         float leftGripForwardM = 0.0f;
         float gunYawDeg = 0.0f;
@@ -9602,7 +10005,431 @@ float4 ps_scope_linearize(VSOut i):SV_Target { return paint(i.uv,true); }
         bool rejectedExtreme = false;
         float rejectedAgreement = 0.0f;
         XrPosef pose{{0, 0, 0, 1}, {0, 0, 0}};
+        // Solve-time support receipt (T5b, persistent support grip). Plain
+        // scalars for the same fixture reason as AimPoseInputs. `supportTrusted`
+        // is set only when this exact solve consumed support-capable two-hand
+        // geometry under a proven same-owner invocation; the epoch/coherence
+        // fields are the assembly's qualification so an engaged or unreadable
+        // relationship is never reported as epoch 0 (F14).
+        uint64_t supportEpoch = 0;
+        bool supportTrusted = false;
+        bool supportRelationshipReadable = false;
+        bool supportRelationshipEngaged = false;
+        uint64_t supportSolveSerial = 0;
+        // Data-only carry of the assembly's forcing flag (see AimPoseInputs).
+        // Copied straight from the frozen qualification for telemetry; no
+        // consumer treats it as a control input.
+        bool supportForceOneHand = false;
     };
+
+    // ---- Two-Hand Lab runtime store (tranche 2A) ----
+    //
+    // Runtime-only experimental rig: absent from Config, no persistence, and
+    // it resets to two_hand_lab::DefaultSettings() (disabled) on process
+    // start. A later tranche's menu UI writes through two_hand_lab_runtime.h;
+    // the frame/aim path takes a coherent snapshot without blocking (seqlock
+    // with torn-read retry, fail-open to defaults). UI writes (setters) and
+    // frame-thread reads (snapshot) never share a lock with the hot aim path.
+    //
+    // Same-sample coherence proof (mission section 8): the primary/support
+    // grip position+validity consumed by the Lab ALWAYS belong to the same
+    // controller sample as the AIM poses they solve with, with NO new
+    // serial/epoch marker.
+    // (1) The sole writer is CaptureRightControllerPose, which publishes the
+    // AIM poses, both grip endpoints and both validity flags together under
+    // one g_headCs hold on success, located for a single predicted time from
+    // one xrSyncActions sample.
+    // (2) Grip validity implies same-hand AIM validity from that same capture
+    // (g_supportGripPoseValid = leftValid && physical[0],
+    // g_primaryGripPoseValid = valid && physical[1]). The grip locates only
+    // weaken the AIM gate (position-only vs orientation+position), so the
+    // weaker grip gate can never admit a grip whose hand failed AIM: the
+    // validity conjunction fails first.
+    // (3) Every Lab-relevant assembly reads AIM poses and both grips under
+    // one g_headCs hold (VR_GetAimPose) or on the capturing frame thread
+    // after it returned (continuity seam, Lab seam, telemetry, presentation
+    // snapshots), so no torn cross-sample pair is observable. Handedness
+    // swaps the grip endpoints together with the AIM poses under the same
+    // hold, preserving the semantic primary/support roles.
+    // (4) The early-return paths clear g_primaryGripPoseValid (fail-open) and
+    // the support Fresh bit while leaving stale AIM validity behind for the
+    // legacy getters. Every grip consumer gates on validity+Fresh (support)
+    // or validity+padFresh, the capture's own return for this frame
+    // (primary), so a stale grip is never consumed with a newer AIM. The only
+    // lock-free grip writes are true->false clears; no valid grip from
+    // another sample can be fabricated. g_stockControllerPoseTime and
+    // g_stockHeadPoseTime remain writer-only with zero readers. A
+    // primary-grip Fresh mirror was considered and rejected: padFresh gates
+    // the frame-thread sites and g_headCs gates the getter, which is
+    // equivalent with no new state.
+    struct TwoHandLabPublication
+    {
+        std::atomic<uint32_t> sequence{0};
+        // Process-wide settings generation (tranche 2B race guard):
+        // incremented on every publish, sampled coherently with the settings
+        // under the seqlock below. Stamped into AimPoseInputs at assembly and
+        // published in the Lab temporal packet so consumers can fail open on
+        // a same-serial settings toggle. Never reset (monotonic).
+        std::atomic<uint64_t> generation{0};
+        std::atomic<uint8_t> enabled{0};
+        std::atomic<uint8_t> anchor{0};
+        std::atomic<float> offhandInfluence{1.0f};
+        std::atomic<uint8_t> agreement{0};
+        std::atomic<float> softFullAgreement{0.9f};
+        std::atomic<uint8_t> temporal{0};
+        std::atomic<float> dampingResponseMs{150.0f};
+        std::atomic<float> adaptiveSlowResponseMs{400.0f};
+        std::atomic<float> adaptiveFastResponseMs{50.0f};
+        std::atomic<float> adaptiveFullErrorDeg{8.0f};
+    };
+    // Coherent settings-plus-generation snapshot for the assembly sites.
+    // Defined before PublishTwoHandLabSettings so both publish and snapshot
+    // agree on the field order.
+    struct TwoHandLabSettingsSnapshot
+    {
+        two_hand_lab::Settings settings{};
+        uint64_t generation = 0;
+    };
+    TwoHandLabPublication g_twoHandLabPublication;
+
+    two_hand_lab::AnchorMode NormalizeTwoHandLabAnchor(int value) noexcept
+    {
+        switch (value)
+        {
+        case 1:
+            return two_hand_lab::AnchorMode::AA;
+        case 2:
+            return two_hand_lab::AnchorMode::AG;
+        case 3:
+            return two_hand_lab::AnchorMode::GA;
+        case 4:
+            return two_hand_lab::AnchorMode::GG;
+        case 0:
+        default:
+            return two_hand_lab::AnchorMode::Production;
+        }
+    }
+
+    two_hand_lab::AgreementMode NormalizeTwoHandLabAgreement(
+        int value) noexcept
+    {
+        return value == 1 ? two_hand_lab::AgreementMode::SoftAuthority
+                          : two_hand_lab::AgreementMode::LegacyHard;
+    }
+
+    two_hand_lab::TemporalMode NormalizeTwoHandLabTemporal(
+        int value) noexcept
+    {
+        switch (value)
+        {
+        case 1:
+            // Product continuity owns the accepted 200 ms latch transition in
+            // both Virtual Stock modes. Keep ordinal 1 readable for old
+            // runtime-only settings, but never run a duplicate Lab layer.
+            return two_hand_lab::TemporalMode::None;
+        case 2:
+            return two_hand_lab::TemporalMode::ConstantDamping;
+        case 3:
+            return two_hand_lab::TemporalMode::AdaptiveDamping;
+        case 0:
+        default:
+            return two_hand_lab::TemporalMode::None;
+        }
+    }
+
+    void PublishTwoHandLabSettings(
+        const two_hand_lab::Settings& settings) noexcept
+    {
+        const two_hand_lab::Settings replica =
+            two_hand_lab::Normalize(settings);
+        auto& published = g_twoHandLabPublication;
+        published.sequence.fetch_add(1, std::memory_order_acq_rel);
+        published.generation.fetch_add(1, std::memory_order_relaxed);
+        published.enabled.store(
+            replica.enabled ? 1u : 0u, std::memory_order_relaxed);
+        published.anchor.store(
+            static_cast<uint8_t>(replica.anchor), std::memory_order_relaxed);
+        published.offhandInfluence.store(
+            replica.offhandInfluence, std::memory_order_relaxed);
+        published.agreement.store(
+            static_cast<uint8_t>(replica.agreement),
+            std::memory_order_relaxed);
+        published.softFullAgreement.store(
+            replica.softFullAgreement, std::memory_order_relaxed);
+        published.temporal.store(
+            static_cast<uint8_t>(replica.temporal), std::memory_order_relaxed);
+        published.dampingResponseMs.store(
+            replica.dampingResponseMs, std::memory_order_relaxed);
+        published.adaptiveSlowResponseMs.store(
+            replica.adaptiveSlowResponseMs, std::memory_order_relaxed);
+        published.adaptiveFastResponseMs.store(
+            replica.adaptiveFastResponseMs, std::memory_order_relaxed);
+        published.adaptiveFullErrorDeg.store(
+            replica.adaptiveFullErrorDeg, std::memory_order_relaxed);
+        published.sequence.fetch_add(1, std::memory_order_release);
+    }
+
+    // Same-sample snapshot plus the generation of the publish it came from
+    // (0 when no publish has completed yet, or on a torn read, which fails
+    // open to defaults). CurrentStockAimPoseInputs stamps both into the
+    // solve; the temporal packet echoes the generation.
+    TwoHandLabSettingsSnapshot SnapshotTwoHandLabSettingsWithGeneration() noexcept
+    {
+        // Floats are published already normalized; only the enum ordinals
+        // need range repair here. A torn read fails open to defaults.
+        const two_hand_lab::Settings defaults =
+            two_hand_lab::DefaultSettings();
+        auto& published = g_twoHandLabPublication;
+        for (int attempt = 0; attempt < 2; ++attempt)
+        {
+            const uint32_t before =
+                published.sequence.load(std::memory_order_acquire);
+            if (!before || (before & 1u))
+                continue;
+            const uint64_t generation =
+                published.generation.load(std::memory_order_relaxed);
+            const bool enabled =
+                published.enabled.load(std::memory_order_relaxed) != 0;
+            const int anchor =
+                published.anchor.load(std::memory_order_relaxed);
+            const float offhandInfluence =
+                published.offhandInfluence.load(std::memory_order_relaxed);
+            const int agreement =
+                published.agreement.load(std::memory_order_relaxed);
+            const float softFullAgreement =
+                published.softFullAgreement.load(std::memory_order_relaxed);
+            const int temporal =
+                published.temporal.load(std::memory_order_relaxed);
+            const float dampingResponseMs =
+                published.dampingResponseMs.load(std::memory_order_relaxed);
+            const float adaptiveSlowResponseMs =
+                published.adaptiveSlowResponseMs.load(
+                    std::memory_order_relaxed);
+            const float adaptiveFastResponseMs =
+                published.adaptiveFastResponseMs.load(
+                    std::memory_order_relaxed);
+            const float adaptiveFullErrorDeg =
+                published.adaptiveFullErrorDeg.load(std::memory_order_relaxed);
+            if (published.sequence.load(std::memory_order_acquire) != before)
+                continue;
+            two_hand_lab::Settings out = defaults;
+            out.enabled = enabled;
+            out.anchor = NormalizeTwoHandLabAnchor(anchor);
+            out.offhandInfluence = std::isfinite(offhandInfluence)
+                ? std::clamp(offhandInfluence, 0.0f, 1.0f)
+                : defaults.offhandInfluence;
+            out.agreement = NormalizeTwoHandLabAgreement(agreement);
+            out.softFullAgreement = std::isfinite(softFullAgreement)
+                ? std::clamp(softFullAgreement,
+                      two_hand_lab::kSoftFullAgreementMinimum,
+                      two_hand_lab::kSoftFullAgreementMaximum)
+                : defaults.softFullAgreement;
+            out.temporal = NormalizeTwoHandLabTemporal(temporal);
+            out.dampingResponseMs = dampingResponseMs;
+            out.adaptiveSlowResponseMs = adaptiveSlowResponseMs;
+            out.adaptiveFastResponseMs = adaptiveFastResponseMs;
+            out.adaptiveFullErrorDeg = adaptiveFullErrorDeg;
+            TwoHandLabSettingsSnapshot snapshot{};
+            snapshot.settings = out;
+            snapshot.generation = generation;
+            return snapshot;
+        }
+        return TwoHandLabSettingsSnapshot{};
+    }
+
+    two_hand_lab::Settings SnapshotTwoHandLabSettings() noexcept
+    {
+        return SnapshotTwoHandLabSettingsWithGeneration().settings;
+    }
+
+    // Cross-thread Lab diagnostics for the UI. Same seqlock shape as
+    // AimContinuityPublication: the frame thread publishes, any thread reads
+    // without a lock. Tranche 2B publishes the full Lab observation for every
+    // Lab-applicable frame (including one-hand solves) plus the temporal
+    // presentation state.
+    struct TwoHandLabDiagnosticsPublication
+    {
+        std::atomic<uint32_t> sequence{0};
+        std::atomic<uint64_t> serial{0};
+        std::atomic<uint8_t> valid{0};
+        std::atomic<uint8_t> labEnabledStored{0};
+        std::atomic<uint8_t> labActiveThisFrame{0};
+        std::atomic<uint8_t> requestedAnchor{0};
+        std::atomic<uint8_t> resolvedAnchor{0};
+        std::atomic<uint8_t> fallback{0};
+        std::atomic<uint8_t> primaryGripValid{0};
+        std::atomic<uint8_t> supportGripValid{0};
+        std::atomic<uint8_t> bValid{0};
+        std::atomic<float> agreement{0.0f};
+        std::atomic<uint8_t> agreementMode{0};
+        std::atomic<float> confidence{0.0f};
+        std::atomic<float> requestedInfluence{0.0f};
+        std::atomic<float> effectiveInfluence{0.0f};
+        std::atomic<uint8_t> temporalMode{0};
+        std::atomic<uint8_t> temporalActive{0};
+        std::atomic<float> errorDeg{0.0f};
+        // Selected pivot positions (tranche 2B, additive): the pair the live
+        // selection consumed. Meaningful only while pivotsValid is set.
+        std::atomic<uint8_t> pivotsValid{0};
+        std::atomic<float> primaryPivotX{0.0f};
+        std::atomic<float> primaryPivotY{0.0f};
+        std::atomic<float> primaryPivotZ{0.0f};
+        std::atomic<float> supportPivotX{0.0f};
+        std::atomic<float> supportPivotY{0.0f};
+        std::atomic<float> supportPivotZ{0.0f};
+    };
+    TwoHandLabDiagnosticsPublication g_twoHandLabDiagnostics;
+
+    void PublishTwoHandLabDiagnostics(uint64_t serial, bool valid,
+        const two_hand_lab::Diagnostics& diagnostics) noexcept
+    {
+        auto& published = g_twoHandLabDiagnostics;
+        published.sequence.fetch_add(1, std::memory_order_acq_rel);
+        published.serial.store(serial, std::memory_order_relaxed);
+        published.valid.store(valid ? 1u : 0u, std::memory_order_relaxed);
+        published.labEnabledStored.store(
+            diagnostics.labEnabledStored ? 1u : 0u,
+            std::memory_order_relaxed);
+        published.labActiveThisFrame.store(
+            diagnostics.labActiveThisFrame ? 1u : 0u,
+            std::memory_order_relaxed);
+        published.requestedAnchor.store(
+            static_cast<uint8_t>(diagnostics.requestedAnchor),
+            std::memory_order_relaxed);
+        published.resolvedAnchor.store(
+            static_cast<uint8_t>(diagnostics.resolvedAnchor),
+            std::memory_order_relaxed);
+        published.fallback.store(
+            static_cast<uint8_t>(diagnostics.fallback),
+            std::memory_order_relaxed);
+        published.primaryGripValid.store(
+            diagnostics.primaryGripValid ? 1u : 0u,
+            std::memory_order_relaxed);
+        published.supportGripValid.store(
+            diagnostics.supportGripValid ? 1u : 0u,
+            std::memory_order_relaxed);
+        published.bValid.store(
+            diagnostics.bValid ? 1u : 0u, std::memory_order_relaxed);
+        published.agreement.store(
+            diagnostics.agreement, std::memory_order_relaxed);
+        published.agreementMode.store(
+            static_cast<uint8_t>(diagnostics.agreementMode),
+            std::memory_order_relaxed);
+        published.confidence.store(
+            diagnostics.confidence, std::memory_order_relaxed);
+        published.requestedInfluence.store(
+            diagnostics.requestedInfluence, std::memory_order_relaxed);
+        published.effectiveInfluence.store(
+            diagnostics.effectiveInfluence, std::memory_order_relaxed);
+        published.temporalMode.store(
+            static_cast<uint8_t>(diagnostics.temporalMode),
+            std::memory_order_relaxed);
+        published.temporalActive.store(
+            diagnostics.temporalActive ? 1u : 0u,
+            std::memory_order_relaxed);
+        published.errorDeg.store(
+            diagnostics.errorDeg, std::memory_order_relaxed);
+        published.pivotsValid.store(
+            diagnostics.pivotsValid ? 1u : 0u, std::memory_order_relaxed);
+        published.primaryPivotX.store(
+            diagnostics.primaryPivot.x, std::memory_order_relaxed);
+        published.primaryPivotY.store(
+            diagnostics.primaryPivot.y, std::memory_order_relaxed);
+        published.primaryPivotZ.store(
+            diagnostics.primaryPivot.z, std::memory_order_relaxed);
+        published.supportPivotX.store(
+            diagnostics.supportPivot.x, std::memory_order_relaxed);
+        published.supportPivotY.store(
+            diagnostics.supportPivot.y, std::memory_order_relaxed);
+        published.supportPivotZ.store(
+            diagnostics.supportPivot.z, std::memory_order_relaxed);
+        published.sequence.fetch_add(1, std::memory_order_release);
+    }
+
+    bool ReadTwoHandLabDiagnostics(
+        two_hand_lab::Diagnostics& out) noexcept
+    {
+        out = two_hand_lab::Diagnostics{};
+        auto& published = g_twoHandLabDiagnostics;
+        for (int attempt = 0; attempt < 2; ++attempt)
+        {
+            const uint32_t before =
+                published.sequence.load(std::memory_order_acquire);
+            if (!before || (before & 1u))
+                continue;
+            const uint64_t serial =
+                published.serial.load(std::memory_order_relaxed);
+            const bool valid =
+                published.valid.load(std::memory_order_relaxed) != 0;
+            two_hand_lab::Diagnostics candidate{};
+            candidate.labEnabledStored =
+                published.labEnabledStored.load(
+                    std::memory_order_relaxed) != 0;
+            candidate.labActiveThisFrame =
+                published.labActiveThisFrame.load(
+                    std::memory_order_relaxed) != 0;
+            candidate.requestedAnchor = NormalizeTwoHandLabAnchor(
+                published.requestedAnchor.load(std::memory_order_relaxed));
+            // ResolvedAnchor shares the Production/AA/AG/GA/GG declaration
+            // order with AnchorMode, so the same normalizer applies.
+            candidate.resolvedAnchor =
+                static_cast<two_hand_lab::ResolvedAnchor>(
+                    NormalizeTwoHandLabAnchor(
+                        published.resolvedAnchor.load(
+                            std::memory_order_relaxed)));
+            const int fallbackRaw =
+                published.fallback.load(std::memory_order_relaxed);
+            candidate.fallback =
+                (fallbackRaw >= 0 && fallbackRaw <= 3)
+                ? static_cast<two_hand_lab::FallbackReason>(fallbackRaw)
+                : two_hand_lab::FallbackReason::None;
+            candidate.primaryGripValid =
+                published.primaryGripValid.load(
+                    std::memory_order_relaxed) != 0;
+            candidate.supportGripValid =
+                published.supportGripValid.load(
+                    std::memory_order_relaxed) != 0;
+            candidate.bValid =
+                published.bValid.load(std::memory_order_relaxed) != 0;
+            candidate.agreement =
+                published.agreement.load(std::memory_order_relaxed);
+            candidate.agreementMode = NormalizeTwoHandLabAgreement(
+                published.agreementMode.load(std::memory_order_relaxed));
+            candidate.confidence =
+                published.confidence.load(std::memory_order_relaxed);
+            candidate.requestedInfluence =
+                published.requestedInfluence.load(std::memory_order_relaxed);
+            candidate.effectiveInfluence =
+                published.effectiveInfluence.load(std::memory_order_relaxed);
+            candidate.temporalMode = NormalizeTwoHandLabTemporal(
+                published.temporalMode.load(std::memory_order_relaxed));
+            candidate.temporalActive =
+                published.temporalActive.load(std::memory_order_relaxed) != 0;
+            candidate.errorDeg =
+                published.errorDeg.load(std::memory_order_relaxed);
+            candidate.pivotsValid =
+                published.pivotsValid.load(std::memory_order_relaxed) != 0;
+            candidate.primaryPivot.x =
+                published.primaryPivotX.load(std::memory_order_relaxed);
+            candidate.primaryPivot.y =
+                published.primaryPivotY.load(std::memory_order_relaxed);
+            candidate.primaryPivot.z =
+                published.primaryPivotZ.load(std::memory_order_relaxed);
+            candidate.supportPivot.x =
+                published.supportPivotX.load(std::memory_order_relaxed);
+            candidate.supportPivot.y =
+                published.supportPivotY.load(std::memory_order_relaxed);
+            candidate.supportPivot.z =
+                published.supportPivotZ.load(std::memory_order_relaxed);
+            if (published.sequence.load(std::memory_order_acquire) != before)
+                continue;
+            if (!serial || !valid)
+                return false;
+            out = candidate;
+            return true;
+        }
+        return false;
+    }
 
     AimPoseInputs CurrentAimPoseInputs(
         bool rightValid, const XrPosef& right,
@@ -9627,20 +10454,209 @@ float4 ps_scope_linearize(VSOut i):SV_Target { return paint(i.uv,true); }
         return inputs;
     }
 
+    // Per-thread, per-invocation override set by a title hook that proved the
+    // currently executing weapon invocation is not the durable relationship
+    // owner. Meaningful only while `persistent_support_grip` is on: with the
+    // feature off it is never consulted (PG-off parity). It never mutates the
+    // durable relationship.
+    thread_local bool g_supportInvocationUntrusted = false;
+
+    // Defined with the durable relationship publication further below; the
+    // stock-aware aim assembly above it (virtual_stock_aim.inl) needs the
+    // coherent reader before that point.
+    bool ReadSupportGripRelationshipInternal(
+        SupportGripRelationshipSnapshot& snapshot) noexcept;
+
+    // Freeze this invocation's support qualification BEFORE any support-
+    // capable raw aim is selected (F14). PG off short-circuits to the default
+    // qualification: no durable read, no forcing, no receipt. An unreadable
+    // relationship or an explicitly denied invocation forces the ordinary
+    // one-hand path and marks the epoch unknown, so a consumer can never read
+    // a denied assembly as a coherently disengaged epoch-0 ray.
+    support_grip::SolveSupportQualification ResolveAimSupportQualification() noexcept
+    {
+        support_grip::SolveSupportQualification qualification{};
+        if (!VR_SupportGripWiredForTitle(TitleAdapter_GetActiveTitle()))
+            return qualification;
+        SupportGripRelationshipSnapshot snapshot{};
+        const bool readable = ReadSupportGripRelationshipInternal(snapshot);
+        return support_grip::QualifySolveSupport(true, readable,
+            snapshot.engaged, snapshot.epoch, g_supportInvocationUntrusted);
+    }
+
     #include "virtual_stock_aim.inl"
 
     // The OpenXR frame thread owns these globals at snapshot publication. The
     // public getter below instead passes one copy taken under g_headCs.
+    void ApplyPreparedTwoHandInputSmoothing(
+        AimPoseInputs& inputs, uint64_t preparedSerial) noexcept;
+
+    void ApplyTwoHandSmoothingGeometry(AimPoseInputs& inputs,
+        const two_hand_input_smoothing::Sample& sample) noexcept
+    {
+        inputs.twoHandSmoothingGeometryValid = true;
+        inputs.twoHandSmoothedPrimaryOrientation = {
+            sample.primaryOrientation.x, sample.primaryOrientation.y,
+            sample.primaryOrientation.z, sample.primaryOrientation.w};
+        const auto toXr = [](virtual_stock::Point3 p) {
+            return XrVector3f{p.x, p.y, p.z};
+        };
+        inputs.twoHandSmoothedPrimaryAimPosition = toXr(sample.primaryAimPosition);
+        inputs.twoHandSmoothedSupportAimPosition = toXr(sample.supportAimPosition);
+        inputs.twoHandSmoothedPrimaryGripValid = sample.primaryGripValid;
+        inputs.twoHandSmoothedPrimaryGripPosition = toXr(sample.primaryGripPosition);
+        inputs.twoHandSmoothedSupportGripValid = sample.supportGripValid;
+        inputs.twoHandSmoothedSupportGripPosition = toXr(sample.supportGripPosition);
+    }
+
     AimPoseInputs CurrentFrameStockAimPoseInputs(
         bool rightValid, const XrPosef& right,
         bool leftValid, const XrPosef& left) noexcept
     {
-        return CurrentStockAimPoseInputs(rightValid, right, leftValid, left,
+        AimPoseInputs inputs = CurrentStockAimPoseInputs(
+            rightValid, right, leftValid, left,
             g_headPoseValid && g_stockAimFresh.load(std::memory_order_acquire),
             g_headPose.position, g_headPose.orientation,
             g_supportGripPoseValid &&
                 g_supportGripPoseFresh.load(std::memory_order_acquire),
-            g_supportGripPosePosition);
+            g_supportGripPosePosition,
+            // Same-sample primary grip (see the Lab store proof above): the
+            // frame thread reads its own capture, so padFresh-equivalent
+            // gating (rightValid here) plus validity is sufficient; there is
+            // no primary Fresh bit by design.
+            rightValid && g_primaryGripPoseValid,
+            g_primaryGripPosePosition);
+        ApplyPreparedTwoHandInputSmoothing(
+            inputs, g_preparedFrame.serial);
+        return inputs;
+    }
+
+    void ApplyPreparedTwoHandInputSmoothing(
+        AimPoseInputs& inputs, uint64_t preparedSerial) noexcept
+    {
+        const TwoHandInputSmoothingPreparedOutput& smoothing =
+            g_twoHandInputSmoothingOutput;
+        // The strength is the frozen per-serial value the packet was produced
+        // with, never a live config read. Strength 0 makes the packet inactive,
+        // so the raw path is taken exactly.
+        if (smoothing.strength > 0.0f && smoothing.active &&
+            smoothing.sampleValid &&
+            smoothing.serial == preparedSerial &&
+            inputs.twoHandEnabled && inputs.twoHandLatched &&
+            inputs.leftValid && !inputs.virtualStockEnabled)
+        {
+            ApplyTwoHandSmoothingGeometry(inputs, smoothing.mixed);
+        }
+    }
+
+    void AdvanceTwoHandInputSmoothingForPreparedFrame(
+        uint64_t preparedSerial, bool padFresh, float dtSeconds) noexcept
+    {
+        if (!preparedSerial ||
+            preparedSerial == g_twoHandInputSmoothingLayer.lastPreparedSerial)
+            return;
+
+        TwoHandInputSmoothingLayerState& layer =
+            g_twoHandInputSmoothingLayer;
+        const GameTitle title = TitleAdapter_GetActiveTitle();
+        const uint32_t generation = TitleAdapter_GetGeneration(title);
+        const uint64_t contactSpaceEpoch =
+            g_contactSpaceEpoch.load(std::memory_order_acquire);
+        if (layer.haveIdentity &&
+            (layer.title != title || layer.generation != generation ||
+                layer.contactSpaceEpoch != contactSpaceEpoch))
+            two_hand_input_smoothing::Reset(layer.filter);
+        layer.title = title;
+        layer.generation = generation;
+        layer.contactSpaceEpoch = contactSpaceEpoch;
+        layer.haveIdentity = true;
+
+        const bool rightFresh = padFresh && g_rightAimPoseValid;
+        const bool leftFresh = padFresh && g_leftAimPoseValid;
+        const AimPoseInputs inputs = CurrentStockAimPoseInputs(
+            rightFresh, g_rightAimPose, leftFresh, g_leftAimPose,
+            g_headPoseValid && g_stockAimFresh.load(std::memory_order_acquire),
+            g_headPose.position, g_headPose.orientation,
+            g_supportGripPoseValid &&
+                g_supportGripPoseFresh.load(std::memory_order_acquire),
+            g_supportGripPosePosition,
+            rightFresh && g_primaryGripPoseValid,
+            g_primaryGripPosePosition);
+
+        if (layer.haveIdentity &&
+            layer.leftHanded != inputs.virtualStockLeftHanded)
+            two_hand_input_smoothing::Reset(layer.filter);
+        layer.leftHanded = inputs.virtualStockLeftHanded;
+
+        // One config read per prepared serial freezes the user strength for
+        // this whole packet: the filter gate, the wet/dry mix, every consumer
+        // and telemetry all see the same value.
+        const float strength = two_hand_input_smoothing::ClampStrength(
+            g_config.two_hand_smoothing_strength);
+        const bool applicable = strength > 0.0f &&
+            inputs.twoHandEnabled && inputs.twoHandLatched &&
+            inputs.rightValid && inputs.leftValid &&
+            !inputs.virtualStockEnabled;
+        if (!applicable)
+        {
+            two_hand_input_smoothing::Reset(layer.filter);
+            layer.lastPreparedSerial = preparedSerial;
+            // The inactive packet still reports the configured strength so a
+            // recording can tell "user chose 25, path not eligible" from "user
+            // chose 0". active/advanced stay false, so no geometry is used.
+            two_hand_input_smoothing::Result inactive{};
+            inactive.strength = strength;
+            g_twoHandInputSmoothingOutput =
+                TwoHandInputSmoothingPreparedOutput{};
+            g_twoHandInputSmoothingOutput.serial = preparedSerial;
+            g_twoHandInputSmoothingOutput.strength = inactive.strength;
+            PublishTwoHandInputSmoothing(preparedSerial, contactSpaceEpoch,
+                title, generation, inputs.virtualStockLeftHanded,
+                inputs.supportEndpointUsedGrip, false, inactive);
+            return;
+        }
+
+        two_hand_input_smoothing::Sample raw{};
+        raw.primaryOrientation = {inputs.right.orientation.x,
+            inputs.right.orientation.y, inputs.right.orientation.z,
+            inputs.right.orientation.w};
+        raw.primaryAimPosition = {inputs.right.position.x,
+            inputs.right.position.y, inputs.right.position.z};
+        raw.supportAimPosition = {inputs.left.position.x,
+            inputs.left.position.y, inputs.left.position.z};
+        raw.primaryGripValid = inputs.primaryGripValid;
+        raw.primaryGripPosition = {inputs.primaryGripPosition.x,
+            inputs.primaryGripPosition.y, inputs.primaryGripPosition.z};
+        raw.supportGripValid = inputs.supportGripValid;
+        raw.supportGripPosition = {inputs.supportGripPosition.x,
+            inputs.supportGripPosition.y, inputs.supportGripPosition.z};
+        const two_hand_input_smoothing::Result result =
+            two_hand_input_smoothing::Advance(
+                layer.filter, preparedSerial, dtSeconds, raw, strength);
+        layer.lastPreparedSerial = preparedSerial;
+        if (result.advanced)
+            ++layer.advanceCount;
+
+        TwoHandInputSmoothingPreparedOutput output{};
+        output.serial = preparedSerial;
+        output.active = result.valid && result.advanced;
+        output.sampleValid = result.valid;
+        output.strength = result.strength;
+        output.raw = result.valid ? result.raw : two_hand_input_smoothing::Sample{};
+        output.filtered = result.valid
+            ? result.filtered : two_hand_input_smoothing::Sample{};
+        output.mixed = result.valid
+            ? result.mixed : two_hand_input_smoothing::Sample{};
+        output.alpha = result.valid ? result.alpha : 0.0f;
+        output.orientationErrorDeg = result.valid ? result.primaryOrientationErrorDeg : 0.0f;
+        output.primaryPositionErrorM = result.valid ? result.primaryPositionErrorM : 0.0f;
+        output.supportPositionErrorM = result.valid ? result.supportPositionErrorM : 0.0f;
+        g_twoHandInputSmoothingOutput = output;
+        PublishTwoHandInputSmoothing(preparedSerial, contactSpaceEpoch,
+            title, generation, inputs.virtualStockLeftHanded,
+            inputs.supportEndpointUsedGrip, output.active, result);
+        if (!result.valid)
+            two_hand_input_smoothing::Reset(layer.filter);
     }
 
     // Pure aim calculation shared by the lock-taking public getter and Reach's
@@ -9659,6 +10675,7 @@ float4 ps_scope_linearize(VSOut i):SV_Target { return paint(i.uv,true); }
     }
 
     #include "virtual_stock_aim_continuity_runtime.inl"
+    #include "two_hand_lab_temporal_runtime.inl"
 
     // Live advance seam: exactly once per prepared serial, on the OpenXR frame
     // thread, after input capture (including UpdateTwoHandLatch) and head
@@ -9666,12 +10683,11 @@ float4 ps_scope_linearize(VSOut i):SV_Target { return paint(i.uv,true); }
     // deliberately outside CapturePreparedFrameTelemetry, so the feature works
     // with recording off.
     //
-    // Engagement: g_config.virtual_stock && g_config.two_handed_aim. Standard
-    // (rear reference 0/1/2) and Plus (rear reference 3) both get the same
-    // fixed continuity law; ordinary non-Virtual-Stock two-hand aim does not.
-    // Anything else is inert: no extra solve, no state change, identity for
-    // every consumer. A running transition always finishes even if the mode,
-    // menu or config changed meanwhile.
+    // Engagement: g_config.two_handed_aim, for both Virtual Stock on and off.
+    // Durable latch acquisition/release is the only transition edge source.
+    // A running transition keeps following the live solve regardless of stock
+    // mode, menu or configuration changes; tracking/title identity loss still
+    // invalidates it conservatively.
     //
     // Switching Plus<->Standard mid-transition deliberately does NOT
     // invalidate: it is a menu-driven geometry change, not a latch edge, and
@@ -9687,8 +10703,9 @@ float4 ps_scope_linearize(VSOut i):SV_Target { return paint(i.uv,true); }
             g_contactSpaceEpoch.load(std::memory_order_acquire);
 
         // Title/generation and reference-space identity changes invalidate the
-        // layer even when a transition is active; a new session must never
-        // resume a previous anchor.
+        // whole continuity layer even when a transition is active; a new
+        // session must never resume a previous anchor, and no filtered
+        // two-hand geometry may cross the identity boundary either.
         if (layer.haveIdentity &&
             (layer.title != title || layer.generation != generation ||
                 layer.contactSpaceEpoch != contactSpaceEpoch))
@@ -9699,7 +10716,7 @@ float4 ps_scope_linearize(VSOut i):SV_Target { return paint(i.uv,true); }
         layer.haveIdentity = true;
 
         const bool applicable =
-            g_config.virtual_stock && g_config.two_handed_aim;
+            TwoHandTransitionContinuityAppliesToFrame(g_config.two_handed_aim);
         if (!applicable)
         {
             if (layer.transition.initialized || layer.transition.active ||
@@ -9719,6 +10736,20 @@ float4 ps_scope_linearize(VSOut i):SV_Target { return paint(i.uv,true); }
         const bool leftFresh = padFresh && g_leftAimPoseValid;
         const AimPoseInputs stockInputs = CurrentFrameStockAimPoseInputs(
             rightFresh, g_rightAimPose, leftFresh, g_leftAimPose);
+        // Virtual Stock's existing Standard/Plus continuity remains unchanged.
+        // The retired two_hand_transition_smoothing key can no longer disable
+        // the VS-OFF 200 ms acquire/release continuity: resolution is fixed-on
+        // product behaviour, so this branch is permanently unreachable product
+        // code (kept inert rather than deleted).
+        if (!stockInputs.virtualStockEnabled &&
+            !TwoHandTransitionContinuityEnabled())
+        {
+            if (layer.transition.initialized || layer.transition.active ||
+                layer.lastPresentedValid || layer.publishedValid ||
+                g_aimContinuityOutput.serial)
+                InvalidateAimContinuityState();
+            return;
+        }
 
         const AimContinuityFrameSolve solve = AdvanceAimContinuityFrame(
             layer.transition, stockInputs, g_preparedFrame.serial,
@@ -9746,6 +10777,387 @@ float4 ps_scope_linearize(VSOut i):SV_Target { return paint(i.uv,true); }
             g_preparedFrame.serial, contactSpaceEpoch, publishValid,
             stockInputs.headValid, stockInputs.supportEndpointUsedGrip,
             solve.correction);
+    }
+
+    // Two-Hand Lab frame seam (tranche 2B): exactly once per prepared serial,
+    // on the OpenXR frame thread, next to the product continuity advance
+    // above. VS-off Constant/Adaptive experiments use the product layer's
+    // presented orientation as their target when a matching product output
+    // exists for the serial, and never own/reseed a second 200 ms latch
+    // transition.
+    //
+    // Engagement (shared predicate TwoHandLabTemporalEngagedFor):
+    // stored-enabled AND the frame's own resolved inputs have Virtual Stock
+    // off (the Lab never steers Virtual Stock paths) AND two-handed aim is
+    // off. The product continuity seam owns every frame whose two-handed aim
+    // is enabled, so the Lab temporal stands down there; an engaged frame has
+    // no matching product output, so the damping target is the frame's raw
+    // stateless Lab orientation. While engaged the seam re-solves those same
+    // stock inputs (no new XR sampling) through the temporal fragment, which
+    // advances at most once per prepared serial on the prepared-frame dt and
+    // publishes the solve's Lab diagnostics for the UI and telemetry.
+    // Diagnostics publish for EVERY Lab-applicable frame, including
+    // one-hand/exact-A solves (bValid=false there), so the UI shows honest
+    // status. Otherwise everything publishes inactive so no stale observation
+    // survives, and any held temporal history is dropped. Resets: the mirrored
+    // lifecycle invalidations (abort, fatal drain, reference-space change,
+    // session/instance loss, handedness swap, title/epoch identity change,
+    // inapplicability), plus mode change, Lab enable/disable, VS on/off and
+    // two-handed-aim applicability, and Lab Reset (which publishes disabled,
+    // so the next serial takes the inactive path). The routine prepared-frame
+    // retire deliberately does NOT invalidate, exactly like the VS layer.
+    struct TwoHandLabTemporalLayerState
+    {
+        TwoHandLabTemporalState temporal{};
+        // The layer's own last presented orientation, i.e. the fragment
+        // output actually emitted for the previous engaged serial. Duplicate
+        // serial reads re-present this exact value.
+        bool lastPresentedValid = false;
+        virtual_stock::Quat4 lastPresented{};
+        // Process-lifetime monotonic count of prepared serials that advanced
+        // the layer (the fragment's own duplicate-serial and non-positive-dt
+        // guards leave it untouched). Telemetry evidence; never reset.
+        uint64_t advanceCount = 0;
+        GameTitle title = GameTitle::None;
+        uint32_t titleGeneration = 0;
+        uint64_t contactSpaceEpoch = 0;
+        bool haveIdentity = false;
+    };
+    TwoHandLabTemporalLayerState g_twoHandLabTemporalLayer;
+
+    // Same-thread (prepared-frame) view of the last serial the layer ran
+    // for, with the exact orientations the seam solved. Consumed by the
+    // frame-thread presentation publishers and by telemetry capture in that
+    // same prepared serial.
+    struct TwoHandLabTemporalPreparedOutput
+    {
+        uint64_t serial = 0;
+        // Generation of the Lab snapshot the seam's solve was assembled with.
+        // A publisher whose own solve used a newer snapshot fails open.
+        uint64_t labGeneration = 0;
+        bool baseValid = false;
+        virtual_stock::Quat4 base{};
+        bool presentedValid = false;
+        virtual_stock::Quat4 presented{};
+        bool temporalActive = false;
+        two_hand_lab::TemporalMode temporalMode =
+            two_hand_lab::TemporalMode::None;
+        float errorDeg = 0.0f;
+        // Local-frame correction: presented = product-presented base (x)
+        // correction.
+        virtual_stock::Quat4 correction{};
+    };
+    TwoHandLabTemporalPreparedOutput g_twoHandLabTemporalOutput;
+
+    // Cross-thread publication for VR_GetAimPose. Seqlock shape mirrors
+    // AimContinuityPublication: no locks, no allocation, trivially small. In
+    // addition to serial/epoch the packet carries the settings generation
+    // AND the product-presented base orientation the Lab correction belongs
+    // to: a reader whose own presented solve differs in any of the three
+    // fails open.
+    struct TwoHandLabTemporalPublication
+    {
+        std::atomic<uint32_t> sequence{0};
+        std::atomic<uint64_t> serial{0};
+        std::atomic<uint64_t> contactSpaceEpoch{0};
+        std::atomic<uint64_t> generation{0};
+        std::atomic<uint8_t> valid{0};
+        std::atomic<float> sx{0.0f};
+        std::atomic<float> sy{0.0f};
+        std::atomic<float> sz{0.0f};
+        std::atomic<float> sw{1.0f};
+        std::atomic<float> cx{0.0f};
+        std::atomic<float> cy{0.0f};
+        std::atomic<float> cz{0.0f};
+        std::atomic<float> cw{1.0f};
+    };
+    TwoHandLabTemporalPublication g_twoHandLabTemporalPublication;
+
+    void PublishTwoHandLabTemporalPacket(uint64_t serial,
+        uint64_t contactSpaceEpoch, uint64_t generation, bool valid,
+        virtual_stock::Quat4 base,
+        virtual_stock::Quat4 correction) noexcept
+    {
+        auto& published = g_twoHandLabTemporalPublication;
+        published.sequence.fetch_add(1, std::memory_order_acq_rel);
+        published.serial.store(serial, std::memory_order_relaxed);
+        published.contactSpaceEpoch.store(
+            contactSpaceEpoch, std::memory_order_relaxed);
+        published.generation.store(generation, std::memory_order_relaxed);
+        published.valid.store(valid ? 1u : 0u, std::memory_order_relaxed);
+        published.sx.store(base.x, std::memory_order_relaxed);
+        published.sy.store(base.y, std::memory_order_relaxed);
+        published.sz.store(base.z, std::memory_order_relaxed);
+        published.sw.store(base.w, std::memory_order_relaxed);
+        published.cx.store(correction.x, std::memory_order_relaxed);
+        published.cy.store(correction.y, std::memory_order_relaxed);
+        published.cz.store(correction.z, std::memory_order_relaxed);
+        published.cw.store(correction.w, std::memory_order_relaxed);
+        published.sequence.fetch_add(1, std::memory_order_release);
+    }
+
+    // Conservative, deterministic invalidation: no stale history may replay
+    // after a reset, epoch change, title/handedness change, feature disable,
+    // mode change or applicability change. Consumers see identity afterwards
+    // because the packet publishes invalid, which is also what every
+    // fail-open path returns. The process-lifetime advanceCount persists, as
+    // with the VS layer.
+    void InvalidateTwoHandLabTemporal() noexcept
+    {
+        ResetTwoHandLabTemporal(g_twoHandLabTemporalLayer.temporal);
+        g_twoHandLabTemporalLayer.lastPresentedValid = false;
+        g_twoHandLabTemporalLayer.lastPresented = virtual_stock::Quat4{};
+        g_twoHandLabTemporalLayer.haveIdentity = false;
+        g_twoHandLabTemporalOutput = TwoHandLabTemporalPreparedOutput{};
+        PublishTwoHandLabTemporalPacket(
+            0, 0, 0, false, virtual_stock::Quat4{},
+            virtual_stock::Quat4{});
+    }
+
+    // Frame-thread presentation publishers (contact/Halo 2/Halo 4/Reach/CE
+    // tracking snapshots) run on the thread that advanced the layer, so they
+    // read that serial's own output directly. Called AFTER the existing VS
+    // presentation at each site; at most one correction is ever active, and
+    // both inactive is identity. Only the emitted orientation changes;
+    // positions and every control path stay raw.
+    XrQuaternionf PresentTwoHandLabTemporal(
+        XrQuaternionf orientation, uint64_t preparedSerial,
+        uint64_t labGeneration) noexcept
+    {
+        const TwoHandLabTemporalPreparedOutput& output =
+            g_twoHandLabTemporalOutput;
+        if (!output.temporalActive || output.serial != preparedSerial ||
+            output.labGeneration != labGeneration ||
+            !output.presentedValid || !output.baseValid)
+            return orientation;
+        // Own-solve match: the correction is local to the product-presented
+        // orientation. A consumer whose own orientation is anything else
+        // fails open instead of composing a mismatched correction.
+        virtual_stock::Quat4 consumer{};
+        if (!virtual_stock::TryNormalizeQuaternion(
+                virtual_stock::Quat4{orientation.x, orientation.y,
+                    orientation.z, orientation.w},
+                consumer) ||
+            consumer.x != output.base.x ||
+            consumer.y != output.base.y ||
+            consumer.z != output.base.z ||
+            consumer.w != output.base.w)
+            return orientation;
+        return ComposeAimContinuityCorrection(
+            orientation, output.correction);
+    }
+
+    // Orientation-only variant for the per-title snapshots that publish a
+    // whole pose: the position is always the untouched solver output.
+    XrPosef PresentedTwoHandLabTemporalPose(
+        XrPosef pose, uint64_t preparedSerial,
+        uint64_t labGeneration) noexcept
+    {
+        pose.orientation = PresentTwoHandLabTemporal(
+            pose.orientation, preparedSerial, labGeneration);
+        return pose;
+    }
+
+    // Cross-thread packet read for VR_GetAimPose. Any inconsistency (torn
+    // read, inactive, other serial, epoch change, settings generation
+    // change, non-finite) fails open to identity.
+    bool ReadTwoHandLabTemporalPacket(uint64_t expectedSerial,
+        uint64_t expectedGeneration, virtual_stock::Quat4& outStateless,
+        virtual_stock::Quat4& outCorrection) noexcept
+    {
+        // Serial zero means no prepared frame has published yet: nothing to
+        // match, and the packet must not be trusted.
+        if (!expectedSerial)
+            return false;
+        auto& published = g_twoHandLabTemporalPublication;
+        for (int attempt = 0; attempt < 2; ++attempt)
+        {
+            const uint32_t before =
+                published.sequence.load(std::memory_order_acquire);
+            if (!before || (before & 1u))
+                continue;
+            const bool valid =
+                published.valid.load(std::memory_order_relaxed) != 0;
+            const uint64_t serial =
+                published.serial.load(std::memory_order_relaxed);
+            const uint64_t epoch =
+                published.contactSpaceEpoch.load(std::memory_order_relaxed);
+            const uint64_t generation =
+                published.generation.load(std::memory_order_relaxed);
+            const virtual_stock::Quat4 stateless{
+                published.sx.load(std::memory_order_relaxed),
+                published.sy.load(std::memory_order_relaxed),
+                published.sz.load(std::memory_order_relaxed),
+                published.sw.load(std::memory_order_relaxed)};
+            const virtual_stock::Quat4 correction{
+                published.cx.load(std::memory_order_relaxed),
+                published.cy.load(std::memory_order_relaxed),
+                published.cz.load(std::memory_order_relaxed),
+                published.cw.load(std::memory_order_relaxed)};
+            if (published.sequence.load(std::memory_order_acquire) != before)
+                continue;
+            if (!valid || !serial)
+                return false;
+            if (serial != expectedSerial)
+                return false;
+            if (epoch != g_contactSpaceEpoch.load(std::memory_order_acquire))
+                return false;
+            if (generation != expectedGeneration)
+                return false;
+            virtual_stock::Quat4 normalizedStateless{};
+            virtual_stock::Quat4 normalizedCorrection{};
+            if (!virtual_stock::TryNormalizeQuaternion(
+                    stateless, normalizedStateless) ||
+                !virtual_stock::TryNormalizeQuaternion(
+                    correction, normalizedCorrection))
+                return false;
+            // Re-read the published serial immediately after the packet read:
+            // if a prepare completed under this call, both the packet and the
+            // poses now describe a serial this call never solved, so the
+            // correction must not be composed with them.
+            if (g_preparedSerialPublished.load(std::memory_order_acquire) !=
+                expectedSerial)
+                return false;
+            outStateless = normalizedStateless;
+            outCorrection = normalizedCorrection;
+            return true;
+        }
+        return false;
+    }
+
+    XrQuaternionf PresentTwoHandLabTemporalFromPublication(
+        XrQuaternionf orientation, uint64_t expectedSerial,
+        uint64_t expectedGeneration) noexcept
+    {
+        virtual_stock::Quat4 stateless{};
+        virtual_stock::Quat4 correction{};
+        if (!ReadTwoHandLabTemporalPacket(expectedSerial, expectedGeneration,
+                stateless, correction))
+            return orientation;
+        // Own-solve match, as on the frame-thread path above.
+        virtual_stock::Quat4 consumer{};
+        if (!virtual_stock::TryNormalizeQuaternion(
+                virtual_stock::Quat4{orientation.x, orientation.y,
+                    orientation.z, orientation.w},
+                consumer) ||
+            consumer.x != stateless.x || consumer.y != stateless.y ||
+            consumer.z != stateless.z || consumer.w != stateless.w)
+            return orientation;
+        return ComposeAimContinuityCorrection(orientation, correction);
+    }
+
+    void AdvanceTwoHandLabForPreparedFrame(
+        bool padFresh, float dtSeconds) noexcept
+    {
+        TwoHandLabTemporalLayerState& layer = g_twoHandLabTemporalLayer;
+        const GameTitle title = TitleAdapter_GetActiveTitle();
+        const uint32_t titleGeneration = TitleAdapter_GetGeneration(title);
+        const uint64_t contactSpaceEpoch =
+            g_contactSpaceEpoch.load(std::memory_order_acquire);
+
+        // Title/generation and reference-space identity changes invalidate
+        // the layer even when temporal is engaged; a new session must never
+        // resume a previous correction or damping history.
+        if (layer.haveIdentity &&
+            (layer.title != title ||
+                layer.titleGeneration != titleGeneration ||
+                layer.contactSpaceEpoch != contactSpaceEpoch))
+            InvalidateTwoHandLabTemporal();
+        layer.title = title;
+        layer.titleGeneration = titleGeneration;
+        layer.contactSpaceEpoch = contactSpaceEpoch;
+        layer.haveIdentity = true;
+
+        const TwoHandLabSettingsSnapshot snap =
+            SnapshotTwoHandLabSettingsWithGeneration();
+        // Same-frame stock-aware inputs: the exact assembly the continuity
+        // seam uses for this prepared serial. The Lab snapshot (stamped with
+        // its generation) and the grip endpoints ride inside
+        // CurrentStockAimPoseInputs.
+        const bool rightFresh = padFresh && g_rightAimPoseValid;
+        const bool leftFresh = padFresh && g_leftAimPoseValid;
+        const AimPoseInputs stockInputs = CurrentFrameStockAimPoseInputs(
+            rightFresh, g_rightAimPose, leftFresh, g_leftAimPose);
+        // Resolved VS-off is required: the Lab never steers Virtual Stock
+        // paths, so a VS-on frame publishes invalid diagnostics even when
+        // stored-enabled. The temporal presentation resolves through the same
+        // shared predicate as its frame-thread mirror (and the product
+        // continuity seam), so at most one 200 ms correction is ever active.
+        const bool labApplicable = snap.settings.enabled &&
+            !stockInputs.virtualStockEnabled;
+        const bool temporalEngaged = TwoHandLabTemporalEngagedFor(
+            snap.settings.enabled, stockInputs.virtualStockEnabled,
+            g_config.two_handed_aim);
+        AimPoseTrace trace{};
+        if (!temporalEngaged)
+        {
+            if (layer.temporal.initialized || layer.lastPresentedValid ||
+                g_twoHandLabTemporalOutput.serial)
+                InvalidateTwoHandLabTemporal();
+            if (labApplicable)
+                (void)ComputeAimPose(stockInputs, &trace);
+            PublishTwoHandLabDiagnostics(
+                g_preparedFrame.serial, trace.labValid, trace.lab);
+            return;
+        }
+
+        TwoHandLabProductPresentation product{};
+        if (g_aimContinuityOutput.serial == g_preparedFrame.serial)
+        {
+            product.liveValid = g_aimContinuityOutput.liveValid;
+            product.live = g_aimContinuityOutput.live;
+            product.presentedValid = g_aimContinuityOutput.presentedValid;
+            product.presented = g_aimContinuityOutput.presented;
+        }
+        const TwoHandLabTemporalFrameSolve solve =
+            AdvanceTwoHandLabTemporalFrame(layer.temporal, stockInputs,
+                snap.settings, g_preparedFrame.serial, dtSeconds,
+                layer.lastPresentedValid, layer.lastPresented, product, &trace);
+        if (solve.advanceConsumed)
+            ++layer.advanceCount;
+
+        if (solve.presentedValid)
+        {
+            layer.lastPresentedValid = true;
+            layer.lastPresented = solve.presented;
+        }
+        virtual_stock::Quat4 correction{};
+        const bool correctionValid = solve.presentationBaseValid &&
+            solve.presentedValid &&
+            virtual_stock::TryNormalizeQuaternion(
+                virtual_stock::MultiplyQuat4(
+                    virtual_stock::ConjugateQuat4(solve.presentationBase),
+                    solve.presented),
+                correction);
+        const bool temporalActive =
+            solve.temporalActive && correctionValid;
+        g_twoHandLabTemporalOutput.serial = g_preparedFrame.serial;
+        g_twoHandLabTemporalOutput.labGeneration =
+            stockInputs.twoHandLabGeneration;
+        g_twoHandLabTemporalOutput.baseValid = solve.presentationBaseValid;
+        g_twoHandLabTemporalOutput.base = solve.presentationBase;
+        g_twoHandLabTemporalOutput.presentedValid = solve.presentedValid;
+        g_twoHandLabTemporalOutput.presented = solve.presented;
+        g_twoHandLabTemporalOutput.temporalActive = temporalActive;
+        g_twoHandLabTemporalOutput.temporalMode = solve.mode;
+        g_twoHandLabTemporalOutput.errorDeg = std::isfinite(solve.errorDeg)
+            ? solve.errorDeg : 0.0f;
+        g_twoHandLabTemporalOutput.correction =
+            correctionValid ? correction : virtual_stock::Quat4{};
+        PublishTwoHandLabTemporalPacket(g_preparedFrame.serial,
+            contactSpaceEpoch, stockInputs.twoHandLabGeneration,
+            temporalActive, solve.presentationBase,
+            g_twoHandLabTemporalOutput.correction);
+
+        // Diagnostics: the frame's stateless Lab observation (trace payload)
+        // plus the temporal presentation state. Raw stateless telemetry stays
+        // raw; the presented orientation is reported separately via the
+        // telemetry family below.
+        two_hand_lab::Diagnostics enriched = trace.lab;
+        enriched.temporalActive = temporalActive;
+        enriched.errorDeg = g_twoHandLabTemporalOutput.errorDeg;
+        PublishTwoHandLabDiagnostics(
+            g_preparedFrame.serial, trace.labValid, enriched);
     }
 
 
@@ -9809,6 +11221,16 @@ float4 ps_scope_linearize(VSOut i):SV_Target { return paint(i.uv,true); }
         settings.supportGripPoseEnabled = inputs.supportGripPoseEnabled;
         settings.supportEndpointUsedGrip = inputs.supportEndpointUsedGrip;
         settings.leftHanded = inputs.virtualStockLeftHanded;
+        // Effective (production-consumed) reticle/steering knobs: clamped
+        // exactly like the production uses (cf. the reticle block), so the
+        // frame explains its own configuration context.
+        settings.aimStabilization =
+            std::clamp(g_config.aim_stabilization, 0.0f, 0.95f);
+        settings.crosshairDistanceM =
+            std::clamp(g_config.crosshair_distance_m, 2.0f, 50.0f);
+        settings.crosshairSizeDeg = g_config.crosshair_size_deg;
+        settings.crosshair = g_config.crosshair;
+        settings.killReticle = g_config.kill_reticle;
         return settings;
     }
 
@@ -9895,6 +11317,45 @@ float4 ps_scope_linearize(VSOut i):SV_Target { return paint(i.uv,true); }
         frame.transitionAdvanceCount = g_aimContinuityLayer.advanceCount;
         frame.transitionLastPreparedSerial =
             diagnostics.last_prepared_serial;
+        // The retired two_hand_transition_smoothing key no longer resolves:
+        // "configured" reports the effective (always-on) product truth while
+        // the field itself stays emitted as the analyser's family marker.
+        frame.twoHandTransitionSmoothingConfigured =
+            TwoHandTransitionContinuityEnabled();
+        frame.twoHandTransitionActive =
+            TwoHandTransitionContinuityEnabled() &&
+            !frame.effectiveSettings.virtualStockEnabled && diagnostics.active &&
+            g_aimContinuityOutput.serial == g_preparedFrame.serial;
+        const TwoHandInputSmoothingPreparedOutput& smoothing =
+            g_twoHandInputSmoothingOutput;
+        const bool smoothingCurrent = smoothing.serial == g_preparedFrame.serial &&
+            smoothing.active && smoothing.sampleValid;
+        // Frozen per-serial strength/mix from the packet this frame prepared;
+        // 0 when the packet belongs to another serial (feature absent).
+        const bool smoothingSerialCurrent =
+            smoothing.serial == g_preparedFrame.serial;
+        frame.twoHandSmoothingStrength =
+            smoothingSerialCurrent ? smoothing.strength : 0.0f;
+        // configured means the user asked for a non-zero strength. applied
+        // additionally requires this frame's eligible VS-OFF two-hand path to
+        // have consumed the strength this serial.
+        frame.twoHandSmoothingConfigured =
+            frame.twoHandSmoothingStrength > 0.0f;
+        frame.twoHandSmoothingApplied = smoothingCurrent &&
+            frame.twoHandSmoothingStrength > 0.0f &&
+            frame.effectiveSettings.twoHandEnabled &&
+            frame.effectiveSettings.twoHandLatched &&
+            !frame.effectiveSettings.virtualStockEnabled;
+        if (smoothingCurrent)
+        {
+            frame.twoHandSmoothingAlpha = smoothing.alpha;
+            frame.twoHandSmoothingPrimaryOrientationErrorDeg =
+                smoothing.orientationErrorDeg;
+            frame.twoHandSmoothingPrimaryPositionErrorM =
+                smoothing.primaryPositionErrorM;
+            frame.twoHandSmoothingSupportPositionErrorM =
+                smoothing.supportPositionErrorM;
+        }
 
         // Everything below is only meaningful when the layer actually ran for
         // this prepared serial. Absence is recorded as invalid, never as a
@@ -9929,6 +11390,673 @@ float4 ps_scope_linearize(VSOut i):SV_Target { return paint(i.uv,true); }
         }
     }
 
+    // Two-Hand Lab telemetry for this prepared serial. Sources: the frame's
+    // canonical solve trace Lab payload (stateless observation) plus the Lab
+    // temporal layer's same-thread output (presented orientation) — never
+    // recomputed geometry in the recorder, no live-global reads from the
+    // recorder thread (this runs on the frame thread right after the seam),
+    // no new OpenXR sampling. Raw live aim evidence
+    // (aim_trace.final_direction, canonical_aim) is untouched by this
+    // function, and existing raw fields stay intact.
+    void FillTwoHandLabTelemetry(
+        TelemetryFrame& frame, const AimPoseInputs& inputs) noexcept
+    {
+        const two_hand_lab::Diagnostics& lab = frame.aimTrace.lab;
+        const bool enabled = frame.aimTrace.labValid;
+        frame.twoHandLabEnabled = enabled;
+        if (enabled)
+        {
+            frame.twoHandLabAnchorRequested =
+                static_cast<uint8_t>(lab.requestedAnchor);
+            frame.twoHandLabAnchorResolved =
+                static_cast<uint8_t>(lab.resolvedAnchor);
+            frame.twoHandLabAnchorFallback =
+                static_cast<uint8_t>(lab.fallback);
+            frame.twoHandLabOffhandInfluence = std::isfinite(
+                lab.requestedInfluence) ? lab.requestedInfluence : 0.0f;
+            frame.twoHandLabAgreementMode =
+                static_cast<uint8_t>(lab.agreementMode);
+            frame.twoHandLabAgreement =
+                std::isfinite(lab.agreement) ? lab.agreement : 0.0f;
+            frame.twoHandLabAgreementConfidence = std::isfinite(
+                lab.confidence) ? lab.confidence : 0.0f;
+            frame.twoHandLabEffectiveInfluence = std::isfinite(
+                lab.effectiveInfluence) ? lab.effectiveInfluence : 0.0f;
+            frame.twoHandLabTemporalMode =
+                static_cast<uint8_t>(lab.temporalMode);
+            frame.twoHandLabPrimaryPivotValid = lab.pivotsValid;
+            frame.twoHandLabSupportPivotValid = lab.pivotsValid;
+            if (lab.pivotsValid)
+            {
+                frame.twoHandLabPrimaryPivot = {
+                    lab.primaryPivot.x, lab.primaryPivot.y,
+                    lab.primaryPivot.z};
+                frame.twoHandLabSupportPivot = {
+                    lab.supportPivot.x, lab.supportPivot.y,
+                    lab.supportPivot.z};
+            }
+            // Stateless direction: the recorded output of the Lab-active
+            // canonical solve itself (already computed above), valid exactly
+            // when that solve was valid.
+            if (frame.canonicalAim.valid)
+            {
+                frame.twoHandLabStatelessDirectionValid = true;
+                frame.twoHandLabStatelessDirection =
+                    frame.canonicalAim.forward;
+            }
+        }
+        // Presented direction: the temporal layer's same-thread output for
+        // this exact serial, gated on the generation of the solve the
+        // telemetry inputs were assembled with. A settings toggle between
+        // the seam and this capture leaves the presented direction invalid
+        // rather than describing the wrong solve.
+        const TwoHandLabTemporalPreparedOutput& temporal =
+            g_twoHandLabTemporalOutput;
+        if (enabled && temporal.serial == frame.preparedSerial &&
+            temporal.labGeneration == inputs.twoHandLabGeneration &&
+            temporal.temporalActive && temporal.presentedValid)
+        {
+            const virtual_stock::Point3 direction =
+                virtual_stock::RotatePoint(
+                    temporal.presented, {0.0f, 0.0f, -1.0f});
+            if (virtual_stock::Finite(direction))
+            {
+                frame.twoHandLabPresentedDirectionValid = true;
+                frame.twoHandLabPresentedDirection = {
+                    direction.x, direction.y, direction.z};
+                frame.twoHandLabTemporalActive = true;
+                frame.twoHandLabTemporalErrorDeg = std::isfinite(
+                    temporal.errorDeg) ? temporal.errorDeg : 0.0f;
+            }
+        }
+    }
+
+    // Persistent support grip (PG) frame telemetry for this prepared serial:
+    // the FROZEN solve-time provenance of the frame-local canonical assembly
+    // (the AimPoseInputs the solve below consumed), plus the config knob and
+    // the pure title gate as read for this same frame. This function re-reads
+    // only those two scalars and copies everything else from `inputs`; it
+    // never re-reads mutable PG relationship state, never runs a
+    // qualification and never touches the durable writer or any PG getter, so
+    // it cannot observe a relationship newer than the one this frame solved
+    // with.
+    // absent-observation semantics: with the feature off, the qualification
+    // short-circuits and the copied fields are the frozen zero/false values,
+    // so the family never reports a stale or fabricated receipt.
+    void FillPersistentSupportGripTelemetry(
+        TelemetryFrame& frame, const AimPoseInputs& inputs,
+        GameTitle activeTitle) noexcept
+    {
+        frame.persistentSupportGripConfigured = g_config.persistent_support_grip;
+        frame.persistentSupportGripApplicable =
+            support_grip::PersistentSupportGripApplies(activeTitle);
+        frame.supportRelationshipReadable = inputs.supportRelationshipReadable;
+        frame.supportRelationshipEngaged = inputs.supportRelationshipEngaged;
+        frame.supportEpoch = inputs.supportEpoch;
+        // The PERMISSION bit of this assembly's qualification (the same value
+        // T13 retention is sourced from). Deliberately not
+        // `canonical.supportTrusted`: that receipt is narrowed by what the
+        // solve actually consumed and would conflate permission with
+        // consumption.
+        frame.supportSolveTrusted = inputs.supportMayConsume;
+        frame.supportForceOneHand = inputs.supportForceOneHand;
+        frame.supportSolveSerial = inputs.supportSolveSerial;
+    }
+
+    // ---- Shots-vs-reticle frame tranche: presented-aim composition ----
+    // Frame-thread counterparts of the VR_GetAimPoseWithSupportProvenance
+    // presentation stages for the telemetry capture site. The public getter
+    // is forbidden here (takes g_headCs, mutates g_twoHandActive, LOGs); the
+    // reads below consume the same lock-free packets on the frame-local solve
+    // WITHOUT the g_preparedSerialPublished re-check, which is vacuous on
+    // this thread: the seam published for this serial immediately above and
+    // no other thread can complete a prepare concurrently. A torn read, or a
+    // packet that does not belong to this serial, yields Unknown; only a
+    // clean same-serial read yields Identity (no correction for this
+    // assembly) or Apply (correction composed exactly as the getter does, via
+    // ComposeAimContinuityCorrection, including its fail-open).
+    enum class FrameThreadPresentStage : uint8_t { Unknown, Identity, Apply };
+    struct FrameThreadContinuityRead
+    {
+        FrameThreadPresentStage stage = FrameThreadPresentStage::Unknown;
+        virtual_stock::Quat4 correction{};
+    };
+    FrameThreadContinuityRead ReadContinuityPacketForFrameThread(
+        uint64_t expectedSerial, bool stockHeadCoherent,
+        bool supportEndpointUsedGrip) noexcept
+    {
+        FrameThreadContinuityRead out{};
+        if (!expectedSerial)
+            return out;
+        auto& published = g_aimContinuityPublication;
+        for (int attempt = 0; attempt < 2; ++attempt)
+        {
+            const uint32_t before =
+                published.sequence.load(std::memory_order_acquire);
+            if (!before || (before & 1u))
+                continue;
+            const bool valid =
+                published.valid.load(std::memory_order_relaxed) != 0;
+            const uint64_t serial =
+                published.serial.load(std::memory_order_relaxed);
+            const uint64_t epoch =
+                published.contactSpaceEpoch.load(std::memory_order_relaxed);
+            const bool packetHead =
+                published.stockHeadCoherent.load(
+                    std::memory_order_relaxed) != 0;
+            const bool packetGrip =
+                published.supportEndpointUsedGrip.load(
+                    std::memory_order_relaxed) != 0;
+            const virtual_stock::Quat4 correction{
+                published.cx.load(std::memory_order_relaxed),
+                published.cy.load(std::memory_order_relaxed),
+                published.cz.load(std::memory_order_relaxed),
+                published.cw.load(std::memory_order_relaxed)};
+            if (published.sequence.load(std::memory_order_acquire) != before)
+                continue;
+            // A packet from any other serial (including the serial-0
+            // invalidated packet) describes a different live pose, so the
+            // stage cannot be proven from the packet. The caller falls back
+            // to the seam's own engagement state (same rule as the getter's
+            // serial gate, evaluated fresh on this thread).
+            if (!serial || serial != expectedSerial ||
+                epoch != g_contactSpaceEpoch.load(std::memory_order_acquire))
+                return out;
+            // The correction is local to the live pose it was derived from
+            // (same rule as the getter): a differently assembled frame-local
+            // solve must not compose it, and identity would misreport an
+            // active correction, so this is Unknown rather than Identity.
+            if (packetHead != stockHeadCoherent ||
+                packetGrip != supportEndpointUsedGrip)
+                return out;
+            if (!valid)
+            {
+                out.stage = FrameThreadPresentStage::Identity;
+                return out;
+            }
+            out.stage = FrameThreadPresentStage::Apply;
+            out.correction = correction;
+            return out;
+        }
+        return out;
+    }
+
+    struct FrameThreadLabRead
+    {
+        FrameThreadPresentStage stage = FrameThreadPresentStage::Unknown;
+        virtual_stock::Quat4 stateless{};
+        virtual_stock::Quat4 correction{};
+    };
+    FrameThreadLabRead ReadLabPacketForFrameThread(
+        uint64_t expectedSerial, uint64_t expectedGeneration) noexcept
+    {
+        FrameThreadLabRead out{};
+        if (!expectedSerial)
+            return out;
+        auto& published = g_twoHandLabTemporalPublication;
+        for (int attempt = 0; attempt < 2; ++attempt)
+        {
+            const uint32_t before =
+                published.sequence.load(std::memory_order_acquire);
+            if (!before || (before & 1u))
+                continue;
+            const bool valid =
+                published.valid.load(std::memory_order_relaxed) != 0;
+            const uint64_t serial =
+                published.serial.load(std::memory_order_relaxed);
+            const uint64_t epoch =
+                published.contactSpaceEpoch.load(std::memory_order_relaxed);
+            const uint64_t generation =
+                published.generation.load(std::memory_order_relaxed);
+            const virtual_stock::Quat4 stateless{
+                published.sx.load(std::memory_order_relaxed),
+                published.sy.load(std::memory_order_relaxed),
+                published.sz.load(std::memory_order_relaxed),
+                published.sw.load(std::memory_order_relaxed)};
+            const virtual_stock::Quat4 correction{
+                published.cx.load(std::memory_order_relaxed),
+                published.cy.load(std::memory_order_relaxed),
+                published.cz.load(std::memory_order_relaxed),
+                published.cw.load(std::memory_order_relaxed)};
+            if (published.sequence.load(std::memory_order_acquire) != before)
+                continue;
+            if (!serial || serial != expectedSerial ||
+                epoch != g_contactSpaceEpoch.load(std::memory_order_acquire) ||
+                generation != expectedGeneration)
+                return out;
+            if (!valid)
+            {
+                out.stage = FrameThreadPresentStage::Identity;
+                return out;
+            }
+            // Normalized here so the caller can exact-match stateless exactly
+            // as PresentTwoHandLabTemporalFromPublication does; a
+            // non-normalizable packet fails open to Identity in the getter.
+            virtual_stock::Quat4 normalizedStateless{};
+            virtual_stock::Quat4 normalizedCorrection{};
+            if (!virtual_stock::TryNormalizeQuaternion(
+                    stateless, normalizedStateless) ||
+                !virtual_stock::TryNormalizeQuaternion(
+                    correction, normalizedCorrection))
+            {
+                out.stage = FrameThreadPresentStage::Identity;
+                return out;
+            }
+            out.stage = FrameThreadPresentStage::Apply;
+            out.stateless = normalizedStateless;
+            out.correction = normalizedCorrection;
+            return out;
+        }
+        return out;
+    }
+
+    bool LabTemporalEngagedForFrameThread(bool virtualStockEnabled) noexcept
+    {
+        const TwoHandLabSettingsSnapshot snap =
+            SnapshotTwoHandLabSettingsWithGeneration();
+        return TwoHandLabTemporalEngagedFor(
+            snap.settings.enabled, virtualStockEnabled,
+            g_config.two_handed_aim);
+    }
+
+    // Composes the presented/steering orientation for this frame's own solve,
+    // exactly as VR_GetAimPoseWithSupportProvenance does (frame-local solve
+    // orientation, then VS continuity presentation, then Lab temporal
+    // presentation). Returns false when any stage is not provably the
+    // getter's output for this frame's assembly; the caller then records
+    // presented_aim_valid=false while the transition_* / two_hand_lab_*
+    // piece fields carry the evidence (never faked).
+    bool ComposePresentedAimForFrameThread(
+        const XrQuaternionf& liveOrientation, uint64_t preparedSerial,
+        bool stockHeadCoherent, bool supportEndpointUsedGrip,
+        uint64_t labGeneration, bool virtualStockEnabled,
+        XrQuaternionf& outPresented) noexcept
+    {
+        XrQuaternionf continuityPresented = liveOrientation;
+        const FrameThreadContinuityRead continuity =
+            ReadContinuityPacketForFrameThread(
+                preparedSerial, stockHeadCoherent, supportEndpointUsedGrip);
+        if (continuity.stage == FrameThreadPresentStage::Apply)
+        {
+            continuityPresented = ComposeAimContinuityCorrection(
+                liveOrientation, continuity.correction);
+        }
+        else if (continuity.stage == FrameThreadPresentStage::Unknown)
+        {
+            // No packet for this serial: identity is provable only when the
+            // seam did not run for it (VS engagement off, read fresh on this
+            // same thread microseconds after the seam). An engaged seam
+            // without its packet is inconsistent: fail open to invalid.
+            if (g_config.virtual_stock && g_config.two_handed_aim)
+                return false;
+        }
+
+        const FrameThreadLabRead lab = ReadLabPacketForFrameThread(
+            preparedSerial, labGeneration);
+        if (lab.stage == FrameThreadPresentStage::Identity)
+        {
+            outPresented = continuityPresented;
+            return true;
+        }
+        if (lab.stage == FrameThreadPresentStage::Unknown)
+        {
+            if (LabTemporalEngagedForFrameThread(virtualStockEnabled))
+                return false;
+            outPresented = continuityPresented;
+            return true;
+        }
+        // Apply: the own-solve match, exactly as the getter. A differently
+        // assembled solve must not compose this correction (Unknown, never a
+        // fabricated presented ray).
+        virtual_stock::Quat4 consumer{};
+        if (!virtual_stock::TryNormalizeQuaternion(
+                virtual_stock::Quat4{continuityPresented.x,
+                    continuityPresented.y, continuityPresented.z,
+                    continuityPresented.w},
+                consumer) ||
+            consumer.x != lab.stateless.x ||
+            consumer.y != lab.stateless.y ||
+            consumer.z != lab.stateless.z ||
+            consumer.w != lab.stateless.w)
+            return false;
+        outPresented = ComposeAimContinuityCorrection(
+            continuityPresented, lab.correction);
+        return true;
+    }
+
+    bool TelemetryFinite3(const float value[3]) noexcept
+    {
+        return std::isfinite(value[0]) && std::isfinite(value[1]) &&
+            std::isfinite(value[2]);
+    }
+
+    // An engine forward is only feedback when it is finite AND carries a
+    // direction: a zero vector is unusable as aim, so it records invalid
+    // (with zero payload) rather than a valid non-direction. Positions use
+    // TelemetryFinite3 only; the origin is a legitimate position.
+    bool TelemetryDirectionUsable(const float value[3]) noexcept
+    {
+        if (!TelemetryFinite3(value))
+            return false;
+        const double lengthSquared = static_cast<double>(value[0]) * value[0] +
+            static_cast<double>(value[1]) * value[1] +
+            static_cast<double>(value[2]) * value[2];
+        return lengthSquared > 1e-12;
+    }
+
+    void FillPresentedAimTelemetry(TelemetryFrame& frame,
+        const AimPoseInputs& inputs, const AimPoseResult& canonical,
+        bool stockHeadValid) noexcept
+    {
+        frame.presentedAimValid = false;
+        frame.presentedAimForward = TelemetryVec3{0.0f, 0.0f, 0.0f};
+        // The getter's own gate: without a right pose there is no presented
+        // output (and the two-hand activity indicator is preserved there).
+        if (!canonical.updateTwoHandActivity)
+            return;
+        XrQuaternionf presented{0.0f, 0.0f, 0.0f, 1.0f};
+        if (!ComposePresentedAimForFrameThread(canonical.pose.orientation,
+                frame.preparedSerial, stockHeadValid,
+                inputs.supportEndpointUsedGrip, inputs.twoHandLabGeneration,
+                inputs.virtualStockEnabled, presented))
+            return;
+        const virtual_stock::Point3 direction =
+            virtual_stock::RotatePoint(
+                virtual_stock::Quat4{presented.x, presented.y, presented.z,
+                    presented.w},
+                {0.0f, 0.0f, -1.0f});
+        if (!virtual_stock::Finite(direction))
+            return;
+        // The getter's final success gate, mirrored exactly
+        // (VR_GetAimPoseWithSupportProvenance: `if (!aim.valid) return false;`).
+        // A solve whose orientation failed finishAimPose's normalisation is not
+        // a provenance-valid ray, so the initialised zero payload above stands;
+        // never a fabricated presented ray the family's own rule forbids.
+        if (!canonical.valid)
+            return;
+        frame.presentedAimForward =
+            TelemetryVec3{direction.x, direction.y, direction.z};
+        frame.presentedAimValid = true;
+    }
+
+    void FillPresentedReticleTelemetry(TelemetryFrame& frame) noexcept
+    {
+        frame.reticlePresentedValid = false;
+        frame.reticlePresentedSerial = 0;
+        frame.reticlePresentedSampleMs = 0;
+        frame.reticlePresentedSupportEpoch = 0;
+        frame.reticlePresentedSupportTrusted = false;
+        frame.reticlePresentedOrientation =
+            TelemetryQuat{0.0f, 0.0f, 0.0f, 0.0f};
+        frame.reticlePresentedPosition =
+            TelemetryVec3{0.0f, 0.0f, 0.0f};
+        float orientation[4]{};
+        float position[3]{};
+        uint64_t sampleMs = 0, supportEpoch = 0, solveSerial = 0;
+        bool supportTrusted = false;
+        // The exact consumer-visible reticle pose: a bounded lock-free
+        // 2-attempt read (no g_headCs, no LOG, no sampling). Capture runs
+        // BEFORE the reticle block publishes in the same frame, so this is
+        // normally the PREVIOUS serial's pose; its own serial travels in the
+        // field and the validator accepts the lag.
+        if (!VR_GetPresentedReticleAimPoseWithSupportProvenance(orientation,
+                position, sampleMs, supportEpoch, supportTrusted, solveSerial))
+            return;
+        if (!TelemetryFinite3(orientation + 1) ||
+            !std::isfinite(orientation[0]) ||
+            !TelemetryFinite3(position))
+            return;
+        frame.reticlePresentedValid = true;
+        frame.reticlePresentedSerial = solveSerial;
+        frame.reticlePresentedSampleMs = sampleMs;
+        frame.reticlePresentedSupportEpoch = supportEpoch;
+        frame.reticlePresentedSupportTrusted = supportTrusted;
+        frame.reticlePresentedOrientation = TelemetryQuat{orientation[0],
+            orientation[1], orientation[2], orientation[3]};
+        frame.reticlePresentedPosition =
+            TelemetryVec3{position[0], position[1], position[2]};
+    }
+
+    void FillEngineAimAndCameraTelemetry(TelemetryFrame& frame) noexcept
+    {
+        // Invalid-payload convention for the new families: validity flags are
+        // authoritative, serials/epochs read 0 when none, and invalid vectors
+        // read zero (never stale, never non-finite, so the JSON stays finite
+        // and the validator can prove absence). Sources name the attributed
+        // publication even when its sample is absent (except titles with no
+        // publication at all, which read None).
+        frame.engineAimValid = false;
+        frame.engineAimSource = 0;
+        frame.engineAimForward = TelemetryVec3{0.0f, 0.0f, 0.0f};
+        frame.engineAimSerial = 0;
+        frame.engineAimSampleMs = 0;
+        frame.engineAimPitchValid = false;
+        frame.engineAimPitchDeg = 0.0f;
+        frame.engineCameraBaseValid = false;
+        frame.engineCameraBasePosition = TelemetryVec3{0.0f, 0.0f, 0.0f};
+        frame.engineCameraEyeValid = false;
+        frame.engineCameraEyePosition = TelemetryVec3{0.0f, 0.0f, 0.0f};
+        frame.engineCameraSource = 0;
+        frame.engineCameraSerial = 0;
+        frame.worldScaleValid = false;
+        frame.worldScale = 0.0f;
+        const GameTitle title = TitleAdapter_GetActiveTitle();
+        if (title == GameTitle::Halo3 || title == GameTitle::Halo3ODST)
+        {
+            // Shared H3/ODST singletons (C-002): title-qualify at read and
+            // label which title's camera copy wrote them. Latest-only, no
+            // serial: a concurrent writer can mix components across frames,
+            // exactly as the in-game consumers accept.
+            frame.engineAimSource = static_cast<uint8_t>(
+                title == GameTitle::Halo3
+                ? TelemetryEngineAimSource::H3Shared
+                : TelemetryEngineAimSource::OdstShared);
+            frame.engineCameraSource = static_cast<uint8_t>(
+                title == GameTitle::Halo3
+                ? TelemetryEngineCameraSource::H3
+                : TelemetryEngineCameraSource::Odst);
+            if (TitleAdapter_GetGeneration(title) == 0)
+                return;
+            float aimForward[3]{};
+            if (Game_TelemetryReadSharedAim(aimForward) &&
+                TelemetryDirectionUsable(aimForward))
+            {
+                frame.engineAimValid = true;
+                frame.engineAimForward = TelemetryVec3{aimForward[0],
+                    aimForward[1], aimForward[2]};
+            }
+            bool baseValid = false, eyeValid = false;
+            float base[3]{}, eye[3]{};
+            if (Game_TelemetryReadSharedCamera(baseValid, base, eyeValid, eye))
+            {
+                frame.engineCameraBaseValid =
+                    baseValid && TelemetryFinite3(base);
+                if (frame.engineCameraBaseValid)
+                    frame.engineCameraBasePosition =
+                        TelemetryVec3{base[0], base[1], base[2]};
+                frame.engineCameraEyeValid =
+                    eyeValid && TelemetryFinite3(eye);
+                if (frame.engineCameraEyeValid)
+                    frame.engineCameraEyePosition =
+                        TelemetryVec3{eye[0], eye[1], eye[2]};
+            }
+            float scale = 0.0f;
+            if (title == GameTitle::Halo3)
+            {
+                if (Game_TelemetryReadWorldScale(scale))
+                {
+                    frame.worldScaleValid = true;
+                    frame.worldScale = scale;
+                }
+            }
+            else
+            {
+                // ODST scale authority is the fixed constant (game.cpp writes
+                // no live world scale for ODST); 1/3.048 matches
+                // kOdstWorldUnitsPerMeter (game.cpp).
+                frame.worldScaleValid = true;
+                frame.worldScale = 1.0f / 3.048f;
+            }
+        }
+        else if (title == GameTitle::HaloReach)
+        {
+            frame.engineAimSource = static_cast<uint8_t>(
+                TelemetryEngineAimSource::ReachOnFootCompactFallback);
+            frame.engineCameraSource = static_cast<uint8_t>(
+                TelemetryEngineCameraSource::Reach);
+            // Seated native truth first (source enum + generation + sampleMs
+            // travel); the shared compact fallback below is labelled as such.
+            // Never a blind xyz: an unadmitted read records invalid with the
+            // fallback source, never a guessed vector.
+            float seated[3]{};
+            uint8_t seatedSource = 0;
+            uint32_t seatedGeneration = 0;
+            uint64_t seatedSampleMs = 0;
+            if (Game_TelemetryReadReachSeatedAim(seated, seatedSource,
+                    seatedGeneration, seatedSampleMs) &&
+                TelemetryDirectionUsable(seated) &&
+                (seatedSource == static_cast<uint8_t>(
+                     ReachAimFeedbackSource::SeatedUnitAim) ||
+                 seatedSource == static_cast<uint8_t>(
+                     ReachAimFeedbackSource::SeatedCompactFallback)))
+            {
+                frame.engineAimValid = true;
+                frame.engineAimSource = static_cast<uint8_t>(
+                    seatedSource == static_cast<uint8_t>(
+                        ReachAimFeedbackSource::SeatedUnitAim)
+                    ? TelemetryEngineAimSource::ReachSeatedUnitAim
+                    : TelemetryEngineAimSource::ReachSeatedCompactFallback);
+                frame.engineAimForward =
+                    TelemetryVec3{seated[0], seated[1], seated[2]};
+                frame.engineAimSampleMs = seatedSampleMs;
+            }
+            else if (TitleAdapter_GetGeneration(GameTitle::HaloReach) != 0)
+            {
+                float compact[3]{};
+                if (Game_TelemetryReadSharedAim(compact) &&
+                    TelemetryDirectionUsable(compact))
+                {
+                    frame.engineAimValid = true;
+                    frame.engineAimForward = TelemetryVec3{compact[0],
+                        compact[1], compact[2]};
+                }
+            }
+            float eye[3]{};
+            uint64_t eyeSerial = 0;
+            if (Game_TelemetryReadReachCompletedEye(eye, eyeSerial))
+            {
+                frame.engineCameraEyeValid = true;
+                frame.engineCameraEyePosition =
+                    TelemetryVec3{eye[0], eye[1], eye[2]};
+                frame.engineCameraSerial = eyeSerial;
+            }
+            // Reach scale authority is the fixed constant (game.cpp writes no
+            // live world scale for Reach); 1/3.048 matches kOdstWorldUnitsPer-
+            // Meter (game.cpp) and kReachWorldUnitsPerMeter
+            // (reach_render_logic.h).
+            frame.worldScaleValid = true;
+            frame.worldScale = kReachWorldUnitsPerMeter;
+        }
+        else if (title == GameTitle::Halo4)
+        {
+            frame.engineAimSource = static_cast<uint8_t>(
+                TelemetryEngineAimSource::H4Observer);
+            // T-3: the stereo transaction publishes its pristine observer
+            // position with its own serial. A successful read labels the
+            // source H4Observer and fills the eye; otherwise the source stays
+            // the explicit absent label (before the first owned frame, after
+            // teardown) and the eye stays invalid/zero, never a stale
+            // position.
+            frame.engineCameraSource = static_cast<uint8_t>(
+                TelemetryEngineCameraSource::H4Absent);
+            float aimForward[3]{};
+            bool pitchValid = false;
+            float pitchRadians = 0.0f;
+            uint64_t pitchSerial = 0;
+            if (Game_TelemetryReadHalo4EngineAim(aimForward, pitchValid,
+                    pitchRadians, pitchSerial) &&
+                TelemetryDirectionUsable(aimForward))
+            {
+                // The publication carries radians (asinf of the observer
+                // forward Z); the wire format is degrees.
+                const float pitchDeg = pitchRadians * 57.29578f;
+                if (std::isfinite(pitchDeg))
+                {
+                    frame.engineAimValid = true;
+                    frame.engineAimForward = TelemetryVec3{aimForward[0],
+                        aimForward[1], aimForward[2]};
+                    frame.engineAimSerial = pitchSerial;
+                    frame.engineAimPitchValid = true;
+                    frame.engineAimPitchDeg = pitchDeg;
+                }
+            }
+            // T-3 camera: the stereo transaction's pristine observer position.
+            // Base stays the engine's pre-lean base only where a title
+            // publishes one; Halo 4 publishes the observer eye alone.
+            float stockEye[3]{};
+            uint64_t stockEyeSerial = 0;
+            if (Game_TelemetryReadHalo4Camera(stockEye, stockEyeSerial))
+            {
+                frame.engineCameraSource = static_cast<uint8_t>(
+                    TelemetryEngineCameraSource::H4Observer);
+                frame.engineCameraEyeValid = true;
+                frame.engineCameraEyePosition =
+                    TelemetryVec3{stockEye[0], stockEye[1], stockEye[2]};
+                frame.engineCameraSerial = stockEyeSerial;
+            }
+            float scale = 0.0f;
+            if (Game_TelemetryReadWorldScale(scale))
+            {
+                frame.worldScaleValid = true;
+                frame.worldScale = scale;
+            }
+        }
+        else if (title == GameTitle::Halo2)
+        {
+            // No g_aimFwd writer exists for Halo 2: the observer publication
+            // (stock = the engine's own camera, tracked = VR-composed) is the
+            // feedback. Unreadable here means absent, never a guessed vector.
+            // The underlying Halo2Observer6Dof_ReadPublishedPose is version-
+            // bracketed and counts an unstable read in its g_publicationTornReads
+            // diagnostic (a counter with no consumers today); a torn read is an
+            // accepted side observation and fails open here as absent.
+            frame.engineAimSource = static_cast<uint8_t>(
+                TelemetryEngineAimSource::H2Absent);
+            frame.engineCameraSource = static_cast<uint8_t>(
+                TelemetryEngineCameraSource::H2);
+            const uint32_t generation =
+                TitleAdapter_GetGeneration(GameTitle::Halo2);
+            Halo2ObserverPosePublication publication{};
+            if (generation != 0 &&
+                Halo2Observer6Dof_ReadPublishedPose(publication) &&
+                publication.generation == generation &&
+                publication.serial != 0 &&
+                TelemetryDirectionUsable(publication.stock.forward))
+            {
+                frame.engineAimSource = static_cast<uint8_t>(
+                    TelemetryEngineAimSource::H2Observer);
+                frame.engineAimValid = true;
+                frame.engineAimForward = TelemetryVec3{
+                    publication.stock.forward[0],
+                    publication.stock.forward[1],
+                    publication.stock.forward[2]};
+                frame.engineAimSerial = publication.serial;
+                if (TelemetryFinite3(publication.stock.position))
+                {
+                    frame.engineCameraEyeValid = true;
+                    frame.engineCameraEyePosition = TelemetryVec3{
+                        publication.stock.position[0],
+                        publication.stock.position[1],
+                        publication.stock.position[2]};
+                    frame.engineCameraSerial = publication.serial;
+                }
+            }
+            frame.worldScaleValid = true;
+            frame.worldScale = kHalo2WorldUnitsPerMeter;
+        }
+        // Halo CE and any other title: no publication, sources stay None.
+    }
+
     void CapturePreparedFrameTelemetry(
         const XrFrameState& frameState, bool upcomingPadFresh,
         bool upcomingViewsValid, bool upcomingHeadValid) noexcept
@@ -9947,8 +12075,10 @@ float4 ps_scope_linearize(VSOut i):SV_Target { return paint(i.uv,true); }
             g_contactSpaceEpoch.load(std::memory_order_acquire);
         frame.contactSpaceChangeAtNs =
             g_contactSpaceChangeAtNs.load(std::memory_order_acquire);
-        frame.activeTitle = static_cast<uint8_t>(
-            TitleAdapter_GetActiveTitle());
+        // One title read for this frame: the frame identity and the PG
+        // applicability gate below must name the same active title.
+        const GameTitle activeTitle = TitleAdapter_GetActiveTitle();
+        frame.activeTitle = static_cast<uint8_t>(activeTitle);
         frame.sessionState = static_cast<int32_t>(g_sessionState);
         frame.shouldRender = frameState.shouldRender == XR_TRUE;
         frame.upcomingViewsValid = upcomingViewsValid;
@@ -9970,15 +12100,34 @@ float4 ps_scope_linearize(VSOut i):SV_Target { return paint(i.uv,true); }
             primaryFresh, g_rightAimPose,
             supportFresh, g_leftAimPose,
             stockHeadValid, g_headPose.position, g_headPose.orientation,
-            supportGripFresh, g_supportGripPosePosition);
+            supportGripFresh, g_supportGripPosePosition,
+            primaryFresh && g_primaryGripPoseValid,
+            g_primaryGripPosePosition);
+        ApplyPreparedTwoHandInputSmoothing(inputs, frame.preparedSerial);
         const AimPoseResult canonical = ComputeAimPose(inputs, &frame.aimTrace);
 
         frame.testProfileId = static_cast<uint8_t>(inputs.testProfileUsed);
         frame.testProfileCustom =
             inputs.testProfileUsed == VirtualStockTestProfile::Custom;
         frame.effectiveSettings = ToTelemetrySettings(inputs);
+        // Free two-hand (VS-OFF) product offhand directional authority for this
+        // frame, sourced from the same frame-local assembly the canonical solve
+        // consumed (`inputs`, stamped once by CurrentStockAimPoseInputs from
+        // `two_hand_offhand_influence`), never a live re-read of the config
+        // slider at capture. Recorded as the solver consumes it: non-finite
+        // reads 0, otherwise clamp(0,1). Virtual Stock solves never read the
+        // product value and a Lab-active solve uses its own Lab authority.
+        frame.twoHandOffhandInfluence =
+            std::isfinite(inputs.twoHandOffhandInfluence)
+            ? std::clamp(inputs.twoHandOffhandInfluence, 0.0f, 1.0f) : 0.0f;
         frame.canonicalAim = ToTelemetryAimResult(canonical);
         FillAimContinuityTelemetry(frame);
+        FillTwoHandLabTelemetry(frame, inputs);
+        FillPersistentSupportGripTelemetry(frame, inputs, activeTitle);
+        FillPresentedAimTelemetry(frame, inputs, canonical, stockHeadValid);
+        FillPresentedReticleTelemetry(frame);
+        FillEngineAimAndCameraTelemetry(frame);
+        frame.dualActive = SecondaryWeaponPresentationActive();
 
         const auto solveControl = [&](VirtualStockTestProfile profile,
                                       TelemetryControlResult& output) {
@@ -10090,6 +12239,9 @@ float4 ps_scope_linearize(VSOut i):SV_Target { return paint(i.uv,true); }
             frame.pad.dpadX = g_padState.dpadX;
             frame.pad.dpadY = g_padState.dpadY;
             frame.pad.exclusiveInput = g_padState.exclusiveInput;
+            frame.pad.weaponButtons = g_padState.weaponButtons;
+            frame.pad.weaponPulseUntilMs = g_padState.weaponPulseUntilMs;
+            frame.pad.weaponGeneration = g_padState.weaponGeneration;
         }
 
         Telemetry_PublishFrame(frame);
@@ -10233,6 +12385,810 @@ float4 ps_scope_linearize(VSOut i):SV_Target { return paint(i.uv,true); }
             break;
         }
     }
+    // -----------------------------------------------------------------------
+    // Persistent support grip (`persistent_support_grip`, default on)
+    //
+    // One durable owner-bound relationship with a single writer: the captured-
+    // frame input path below. Every durable transition (bind / invalidate /
+    // release) happens here; title hooks only publish owner evidence and read
+    // the relationship, and the existing UpdateTwoHandHold() still owns the
+    // spatial admission and logical retention of the physical grip.
+    //
+    // Port repairs carried by this wiring (A017 red-team A001):
+    //   F02 lifecycle identity (title / generation / mode) terminates and arms;
+    //   F08 a fresh acquisition may bind only evidence published strictly after
+    //       the revision the acquisition intent recorded;
+    //   F11 a weapon gesture that consumes a held Grip arms requiresRelease
+    //       before the owner is cleared;
+    //   F12 a toggle click survives the physical button-up until it is proven;
+    //   F13 one publication slot per title with a real writer acquisition;
+    //   F16 the handedness/role teardown runs through this writer.
+    //   Switch policy (2026-09-28 user request, PG ON only):
+    //     a proven owner replacement drops the relationship WITHOUT arming
+    //     release-before-reacquire, so a held Grip re-acquires the new weapon
+    //     through ordinary spatial admission (F08 floor intact). The optional
+    //     `two_hand_switch_inherit` rebinds a complete current-generation
+    //     replacement owner in place instead, so the switched weapon is
+    //     two-handed immediately with no re-orientation. Proven absence and
+    //     every generation/lifecycle/role/gesture teardown keep arming.
+    // -----------------------------------------------------------------------
+
+    // One title's evidence slot. `busy` is the writer acquisition: only the
+    // thread that wins it may move the odd/even sequence, so two producers can
+    // never interleave a record and a reader can never accept a torn one. The
+    // per-title slot is what stops a foreign or retiring title's publication
+    // from overwriting the title that currently owns the frame.
+    struct SupportGripEvidenceSlot
+    {
+        std::atomic<bool> busy{false};
+        std::atomic<uint32_t> sequence{0};
+        std::atomic<uint8_t> title{static_cast<uint8_t>(GameTitle::None)};
+        std::atomic<uint32_t> generation{0};
+        std::atomic<uint8_t> ownerTitle{static_cast<uint8_t>(GameTitle::None)};
+        std::atomic<uint32_t> ownerGeneration{0};
+        std::atomic<uint32_t> ownerUnit{0xFFFFFFFFu};
+        std::atomic<uint32_t> ownerWeapon{0xFFFFFFFFu};
+        std::atomic<uint8_t> evidence{
+            static_cast<uint8_t>(support_grip::OwnerEvidence::Unknown)};
+        std::atomic<uint64_t> revision{0};
+    };
+    SupportGripEvidenceSlot g_supportGripEvidenceSlots[kTitleRuntimeSlotCount];
+
+    // F13 writer side. A lost acquisition or a title without a slot drops the
+    // publication instead of tearing a record; the next producer update
+    // republishes. The body stays lock-free, allocation-free and log-free (CAS
+    // writer acquisition plus relaxed stores) because it runs on title-side
+    // publisher threads: the FP/prepare/interpolate observation seams (CE
+    // prepare, H2 level-live poll, H3/ODST/Reach FP interpolate, H4
+    // model-skinning). It must never be called from a D3D palette-compose or
+    // other hot compose hook.
+    bool PublishSupportGripOwnerEvidenceInternal(GameTitle title,
+        uint32_t generation, const support_grip::OwnerTuple& owner,
+        support_grip::OwnerEvidence evidence) noexcept
+    {
+        const size_t slot = TitleRuntimeSlotIndex(title);
+        if (slot >= kTitleRuntimeSlotCount)
+            return false;
+        SupportGripEvidenceSlot& target = g_supportGripEvidenceSlots[slot];
+        bool expected = false;
+        if (!target.busy.compare_exchange_strong(expected, true,
+                std::memory_order_acq_rel, std::memory_order_acquire))
+            return false; // another producer owns this slot right now
+        const uint32_t sequence =
+            target.sequence.load(std::memory_order_relaxed) + 1u;
+        target.sequence.store(sequence, std::memory_order_release);
+        target.title.store(
+            static_cast<uint8_t>(title), std::memory_order_relaxed);
+        target.generation.store(generation, std::memory_order_relaxed);
+        target.ownerTitle.store(
+            static_cast<uint8_t>(owner.title), std::memory_order_relaxed);
+        target.ownerGeneration.store(
+            owner.generation, std::memory_order_relaxed);
+        target.ownerUnit.store(owner.unit, std::memory_order_relaxed);
+        target.ownerWeapon.store(owner.weapon, std::memory_order_relaxed);
+        target.evidence.store(
+            static_cast<uint8_t>(evidence), std::memory_order_relaxed);
+        // Monotonic per slot: a strictly newer publication is exactly what a
+        // pending acquisition intent is allowed to bind from.
+        target.revision.fetch_add(1, std::memory_order_relaxed);
+        target.sequence.store(sequence + 1u, std::memory_order_release);
+        target.busy.store(false, std::memory_order_release);
+        return true;
+    }
+
+    // Coherent reader for the durable writer. False means "no evidence this
+    // writer may act on": a never-published slot, a torn read, or a record for
+    // another title/generation. A present claim that does not identify THIS
+    // title's complete owner is reported as Unknown, because it is not proof of
+    // a different owner either (F01/F08: only a proven claim may bind or
+    // release).
+    bool ReadSupportGripOwnerEvidenceInternal(GameTitle title,
+        uint32_t expectedGeneration, support_grip::OwnerTuple& owner,
+        support_grip::OwnerEvidence& evidence, uint64_t& revision) noexcept
+    {
+        owner = support_grip::OwnerTuple{};
+        evidence = support_grip::OwnerEvidence::Unknown;
+        revision = 0;
+        const size_t slot = TitleRuntimeSlotIndex(title);
+        if (slot >= kTitleRuntimeSlotCount || expectedGeneration == 0)
+            return false;
+        const SupportGripEvidenceSlot& source =
+            g_supportGripEvidenceSlots[slot];
+        for (int attempt = 0; attempt < 2; ++attempt)
+        {
+            const uint32_t before =
+                source.sequence.load(std::memory_order_acquire);
+            if (!before || (before & 1u))
+                continue;
+            const GameTitle recordedTitle = static_cast<GameTitle>(
+                source.title.load(std::memory_order_relaxed));
+            const uint32_t recordedGeneration =
+                source.generation.load(std::memory_order_relaxed);
+            support_grip::OwnerTuple candidate{};
+            candidate.title = static_cast<GameTitle>(
+                source.ownerTitle.load(std::memory_order_relaxed));
+            candidate.generation =
+                source.ownerGeneration.load(std::memory_order_relaxed);
+            candidate.unit = source.ownerUnit.load(std::memory_order_relaxed);
+            candidate.weapon =
+                source.ownerWeapon.load(std::memory_order_relaxed);
+            const support_grip::OwnerEvidence candidateEvidence =
+                static_cast<support_grip::OwnerEvidence>(
+                    source.evidence.load(std::memory_order_relaxed));
+            const uint64_t candidateRevision =
+                source.revision.load(std::memory_order_relaxed);
+            if (source.sequence.load(std::memory_order_acquire) != before)
+                continue; // torn: retry once, then report unavailable
+            if (recordedTitle != title ||
+                recordedGeneration != expectedGeneration)
+                return false; // another lifecycle's record
+            if (candidateEvidence == support_grip::OwnerEvidence::KnownPresent &&
+                (!support_grip::OwnerComplete(candidate) ||
+                 candidate.title != title))
+                return true; // Unknown: not a proven owner of this title
+            owner = candidate;
+            evidence = candidateEvidence;
+            revision = candidateRevision;
+            return true;
+        }
+        return false;
+    }
+
+    // The durable relationship publication. Single writer by construction, so
+    // a plain odd/even seqlock is sufficient here (unlike the per-title
+    // evidence slots, which are written by title callbacks).
+    struct SupportGripRelationshipState
+    {
+        std::atomic<uint32_t> sequence{0};
+        std::atomic<uint8_t> title{static_cast<uint8_t>(GameTitle::None)};
+        std::atomic<uint32_t> generation{0};
+        std::atomic<uint32_t> unit{0xFFFFFFFFu};
+        std::atomic<uint32_t> weapon{0xFFFFFFFFu};
+        std::atomic<uint64_t> epoch{0};
+        std::atomic<uint8_t> engaged{0};
+    };
+    SupportGripRelationshipState g_supportGripRelationshipState;
+
+    // Published BEFORE g_twoHandLatched moves, so the confirmed F14 bind race
+    // (latch already engaged while the publication still reads disengaged)
+    // cannot happen: in that window a reader sees an engaged publication with
+    // the old latch, which every owner-qualified consumer refuses instead of
+    // accepting a support-derived ray as an ordinary one-hand ray.
+    void PublishSupportGripRelationship(
+        const support_grip::DurableWriterState& writer) noexcept
+    {
+        auto& published = g_supportGripRelationshipState;
+        const GameTitle title =
+            writer.engaged ? writer.owner.title : GameTitle::None;
+        const uint32_t generation =
+            writer.engaged ? writer.owner.generation : 0;
+        const uint32_t unit =
+            writer.engaged ? writer.owner.unit : 0xFFFFFFFFu;
+        const uint32_t weapon =
+            writer.engaged ? writer.owner.weapon : 0xFFFFFFFFu;
+        published.sequence.fetch_add(1, std::memory_order_acq_rel);
+        published.title.store(
+            static_cast<uint8_t>(title), std::memory_order_relaxed);
+        published.generation.store(generation, std::memory_order_relaxed);
+        published.unit.store(unit, std::memory_order_relaxed);
+        published.weapon.store(weapon, std::memory_order_relaxed);
+        published.epoch.store(writer.epoch, std::memory_order_relaxed);
+        published.engaged.store(
+            writer.engaged ? 1u : 0u, std::memory_order_relaxed);
+        published.sequence.fetch_add(1, std::memory_order_release);
+    }
+
+    bool ReadSupportGripRelationshipInternal(
+        SupportGripRelationshipSnapshot& snapshot) noexcept
+    {
+        snapshot = SupportGripRelationshipSnapshot{};
+        const SupportGripRelationshipState& published =
+            g_supportGripRelationshipState;
+        for (int attempt = 0; attempt < 2; ++attempt)
+        {
+            const uint32_t before =
+                published.sequence.load(std::memory_order_acquire);
+            if (!before || (before & 1u))
+                continue;
+            SupportGripRelationshipSnapshot candidate{};
+            candidate.title = static_cast<GameTitle>(
+                published.title.load(std::memory_order_relaxed));
+            candidate.generation =
+                published.generation.load(std::memory_order_relaxed);
+            candidate.unit = published.unit.load(std::memory_order_relaxed);
+            candidate.weapon =
+                published.weapon.load(std::memory_order_relaxed);
+            candidate.epoch = published.epoch.load(std::memory_order_relaxed);
+            candidate.engaged =
+                published.engaged.load(std::memory_order_relaxed) != 0;
+            if (published.sequence.load(std::memory_order_acquire) != before)
+                continue; // torn: retry once, then report unavailable
+            snapshot = candidate;
+            return true;
+        }
+        return false;
+    }
+
+    // Title-native invocation receipt (F06/F07). Single writer: the title's FP
+    // interpolate hook on the game render thread. A plain odd/even seqlock is
+    // sufficient for the same reason as the relationship publication, and no
+    // lock, allocation or logging happens on this path. The receipt is only
+    // ever published for a wired title while the feature is on; with the
+    // feature off nothing is written and no consumer consults it (PG-off
+    // parity).
+    struct SupportInvocationReceiptState
+    {
+        std::atomic<uint32_t> sequence{0};
+        std::atomic<uint8_t> title{static_cast<uint8_t>(GameTitle::None)};
+        std::atomic<uint32_t> generation{0};
+        std::atomic<uint64_t> serial{0};
+        std::atomic<uint8_t> evidence{0};
+        std::atomic<uint8_t> producerAgreement{0};
+        std::atomic<uint32_t> ownerTitle{
+            static_cast<uint32_t>(GameTitle::None)};
+        std::atomic<uint32_t> ownerGeneration{0};
+        std::atomic<uint32_t> ownerUnit{0xFFFFFFFFu};
+        std::atomic<uint32_t> ownerWeapon{0xFFFFFFFFu};
+        std::atomic<uint8_t> relationshipReadable{0};
+        std::atomic<uint8_t> relationshipEngaged{0};
+        std::atomic<uint64_t> relationshipEpoch{0};
+    };
+    SupportInvocationReceiptState g_supportInvocationReceiptState;
+
+    void PublishSupportInvocationReceiptInternal(
+        const support_grip::SupportInvocationReceipt& receipt) noexcept
+    {
+        auto& published = g_supportInvocationReceiptState;
+        published.sequence.fetch_add(1, std::memory_order_acq_rel);
+        published.title.store(
+            static_cast<uint8_t>(receipt.title), std::memory_order_relaxed);
+        published.generation.store(receipt.generation, std::memory_order_relaxed);
+        published.serial.store(receipt.serial, std::memory_order_relaxed);
+        published.evidence.store(
+            static_cast<uint8_t>(receipt.evidence), std::memory_order_relaxed);
+        published.producerAgreement.store(
+            receipt.producerAgreement ? 1u : 0u, std::memory_order_relaxed);
+        published.ownerTitle.store(
+            static_cast<uint32_t>(receipt.owner.title),
+            std::memory_order_relaxed);
+        published.ownerGeneration.store(
+            receipt.owner.generation, std::memory_order_relaxed);
+        published.ownerUnit.store(receipt.owner.unit, std::memory_order_relaxed);
+        published.ownerWeapon.store(
+            receipt.owner.weapon, std::memory_order_relaxed);
+        published.relationshipReadable.store(
+            receipt.relationshipReadable ? 1u : 0u, std::memory_order_relaxed);
+        published.relationshipEngaged.store(
+            receipt.relationshipEngaged ? 1u : 0u, std::memory_order_relaxed);
+        published.relationshipEpoch.store(
+            receipt.relationshipEpoch, std::memory_order_relaxed);
+        published.sequence.fetch_add(1, std::memory_order_release);
+    }
+
+    bool ReadSupportInvocationReceiptInternal(GameTitle title,
+        support_grip::SupportInvocationReceipt& receipt) noexcept
+    {
+        receipt = support_grip::SupportInvocationReceipt{};
+        const SupportInvocationReceiptState& published =
+            g_supportInvocationReceiptState;
+        for (int attempt = 0; attempt < 2; ++attempt)
+        {
+            const uint32_t before =
+                published.sequence.load(std::memory_order_acquire);
+            if (!before || (before & 1u))
+                continue;
+            support_grip::SupportInvocationReceipt candidate{};
+            candidate.title = static_cast<GameTitle>(
+                published.title.load(std::memory_order_relaxed));
+            candidate.generation =
+                published.generation.load(std::memory_order_relaxed);
+            candidate.serial = published.serial.load(std::memory_order_relaxed);
+            candidate.evidence = static_cast<support_grip::OwnerEvidence>(
+                published.evidence.load(std::memory_order_relaxed));
+            candidate.producerAgreement =
+                published.producerAgreement.load(std::memory_order_relaxed) != 0;
+            candidate.owner.title = static_cast<GameTitle>(
+                published.ownerTitle.load(std::memory_order_relaxed));
+            candidate.owner.generation =
+                published.ownerGeneration.load(std::memory_order_relaxed);
+            candidate.owner.unit =
+                published.ownerUnit.load(std::memory_order_relaxed);
+            candidate.owner.weapon =
+                published.ownerWeapon.load(std::memory_order_relaxed);
+            candidate.relationshipReadable =
+                published.relationshipReadable.load(
+                    std::memory_order_relaxed) != 0;
+            candidate.relationshipEngaged =
+                published.relationshipEngaged.load(
+                    std::memory_order_relaxed) != 0;
+            candidate.relationshipEpoch =
+                published.relationshipEpoch.load(std::memory_order_relaxed);
+            if (published.sequence.load(std::memory_order_acquire) != before)
+                continue; // torn: retry once, then report unavailable
+            if (candidate.title != title || candidate.generation == 0)
+                return false; // another lifecycle's record
+            candidate.resolved = true;
+            receipt = candidate;
+            return true;
+        }
+        return false;
+    }
+
+    // The physical support-grip acquisition volume, shared by the original
+    // latch path and the persistent-grip writer. Grab-zone side nudge: the
+    // visible barrel can sit beside the raw aim ray (headset report: the AR's
+    // barrel was right of the zone), so the zone axis shifts along the
+    // controller's +X by the F1-tuned amount. Palm depth moves where a support
+    // grip counts: the grab zone meets the visible palm, not the wrist bone the
+    // hand target anchors. Aim rays, shots, and contact/melee geometry stay on
+    // the raw point.
+    //
+    // This is the BASE (PG-off / unwired-title) helper and its geometry is the
+    // pre-fix rule verbatim, including the palm-depth shift along the SUPPORT
+    // controller's own forward vector. The persistent-grip writer does not call
+    // it: `PersistentSupportGrabZoneHit` below carries the A003 acquisition
+    // rule the archive wired, so a support-wrist rotation cannot orbit the
+    // acquisition sample across the lateral boundary while the feature is on.
+    bool TwoHandGrabZoneHit(const XrPosef& rpose,
+        const XrPosef& lpose) noexcept
+    {
+        const XrVector3f rfwd = Rotate(rpose.orientation, {0,0,-1});
+        const float zr = std::clamp(g_config.two_hand_zone_right_m, -0.10f, 0.10f);
+        const XrVector3f rright = Rotate(rpose.orientation, {1,0,0});
+        const XrVector3f origin{rpose.position.x+rright.x*zr,
+                                rpose.position.y+rright.y*zr,
+                                rpose.position.z+rright.z*zr};
+        auto inZoneAt = [&](const XrVector3f& p) -> bool {
+            const XrVector3f v{p.x-origin.x, p.y-origin.y, p.z-origin.z};
+            const float along = v.x*rfwd.x + v.y*rfwd.y + v.z*rfwd.z;
+            const XrVector3f perp{v.x-along*rfwd.x, v.y-along*rfwd.y, v.z-along*rfwd.z};
+            const float lateral = sqrtf(perp.x*perp.x+perp.y*perp.y+perp.z*perp.z);
+            return along>0.08f && along<0.80f && lateral<0.09f;
+        };
+        const XrVector3f supportForward = Rotate(lpose.orientation, {0,0,-1});
+        const virtual_stock::Point3 grabPoint =
+            virtual_stock::SupportGrabPoint(
+                virtual_stock::Point3{
+                    lpose.position.x, lpose.position.y, lpose.position.z},
+                virtual_stock::Point3{
+                    supportForward.x, supportForward.y, supportForward.z},
+                g_config.left_grip_forward_m);
+        const XrVector3f grabSample{grabPoint.x, grabPoint.y, grabPoint.z};
+        return inZoneAt(grabSample);
+    }
+
+    // PG ON acquisition (archived A003 rule), used only by the durable writer
+    // below, which runs only while VR_SupportGripWiredForTitle() is true. The
+    // palm-depth shift is expressed along the stable primary acquisition axis
+    // instead of the support controller's own forward vector, so the support
+    // wrist orientation is deliberately not an input: rotating the wrist alone
+    // can no longer orbit the acquisition sample across the lateral boundary,
+    // while moving the hand still moves it naturally. Thresholds, the zone-right
+    // nudge and its clamp, and the fail-closed non-finite behaviour are the
+    // shared support_grab::EvaluateSupportGrabZone contract. The base helper
+    // above keeps the pre-fix geometry verbatim for PG off / unwired titles.
+    bool PersistentSupportGrabZoneHit(const XrPosef& rpose,
+        const XrPosef& lpose) noexcept
+    {
+        const XrVector3f rfwd = Rotate(rpose.orientation, {0,0,-1});
+        const XrVector3f rright = Rotate(rpose.orientation, {1,0,0});
+        const support_grab::SupportGrabZone zone =
+            support_grab::EvaluateSupportGrabZone(
+                virtual_stock::Point3{
+                    rpose.position.x, rpose.position.y, rpose.position.z},
+                virtual_stock::Point3{rfwd.x, rfwd.y, rfwd.z},
+                virtual_stock::Point3{rright.x, rright.y, rright.z},
+                g_config.two_hand_zone_right_m,
+                virtual_stock::Point3{
+                    lpose.position.x, lpose.position.y, lpose.position.z},
+                g_config.left_grip_forward_m);
+        return zone.inZone;
+    }
+
+    // The durable writer's own state. Single writer: UpdatePersistentSupportGrip
+    // below, called once per captured frame from the input path. File scope (not
+    // function statics) so a feature disable can retire it immediately instead
+    // of leaving a relationship that a later re-enable would revive.
+    struct PersistentSupportGripState
+    {
+        support_grip::DurableWriterState writer;
+        support_grip::PendingAcquisitionIntent pending;
+        bool published = false; // a coherent snapshot exists
+        // The published (engaged, epoch, identity) marker: the snapshot moves
+        // only on a real transition, never per frame.
+        bool markerValid = false;
+        bool markerEngaged = false;
+        uint64_t markerEpoch = 0;
+        GameTitle markerTitle = GameTitle::None;
+        uint32_t markerGeneration = 0;
+        bool blockLogged = false;
+        bool dropLogged = false;
+        bool live = false; // the feature owned the previous frame
+        // 2026-09-28 headset follow-up, default weapon-switch re-grip UX. Set
+        // by the no-inherit proven-replacement drop only
+        // (support_grip::DefaultSwitchReplacementDrop): the relationship ended
+        // without arming, and through a weapon swap the support hand is usually
+        // still inside the NEW weapon's grab zone, so the level-triggered
+        // hold-mode acquisition edge would re-bind the replacement on the next
+        // frame and the switched weapon would arrive pre-held. While set, that
+        // edge may fire only after the zone has been observed FALSE at least
+        // once - the grab point leaves the zone and comes back, a fresh
+        // crossing with no Grip release/press cycle
+        // (support_grip::StepSwitchZoneReentry). Cleared by that observation,
+        // by an explicit release, by a role/gesture/lifecycle teardown, by a
+        // feature retire, and on the inherit path, which never sets it. Toggle
+        // mode deliberately does not consult it: a fresh press is already a
+        // deliberate acquisition.
+        bool awaitZoneReentry = false;
+    };
+    PersistentSupportGripState g_persistentSupportGrip;
+
+    // The feature was switched off (or is off): retire the durable state so
+    // the ordinary latch path below is the only owner. The physical release
+    // edge and the latch itself stay with the base path, exactly like PG never
+    // having been on.
+    void RetirePersistentSupportGripState() noexcept
+    {
+        if (!g_persistentSupportGrip.live)
+            return;
+        g_persistentSupportGrip.live = false;
+        // The default-switch crossing requirement never outlives the feature: a
+        // later re-enable must start from ordinary admission.
+        g_persistentSupportGrip.awaitZoneReentry = false;
+        if (g_persistentSupportGrip.writer.engaged)
+        {
+            (void)support_grip::DurableWriterRelease(
+                g_persistentSupportGrip.writer);
+            LOG("Persistent support grip: disabled; durable relationship "
+                "released");
+        }
+        g_persistentSupportGrip.pending =
+            support_grip::PendingAcquisitionIntent{};
+        g_persistentSupportGrip.markerValid = false;
+        if (g_persistentSupportGrip.published)
+            PublishSupportGripRelationship(g_persistentSupportGrip.writer);
+    }
+
+    // One update of the durable relationship. Called from the captured-frame
+    // input path only, after the physical Grip edge and the existing admission
+    // were observed. `admission` keeps owning the physical release edge; the
+    // writer owns every decision that clears a bound owner.
+    void UpdatePersistentSupportGrip(SupportGripAdmission& admission,
+        bool rightValid, const XrPosef& rpose, bool leftValid,
+        const XrPosef& lpose, bool gripHeld, bool rising, bool grabAllowed,
+        bool rolesChanged, bool weaponGesture)
+    {
+        support_grip::DurableWriterState& writer = g_persistentSupportGrip.writer;
+        support_grip::PendingAcquisitionIntent& pending =
+            g_persistentSupportGrip.pending;
+        g_persistentSupportGrip.live = true;
+
+        const GameTitle activeTitle = TitleAdapter_GetActiveTitle();
+        const uint32_t activeGeneration =
+            TitleAdapter_GetGeneration(activeTitle);
+        const RuntimeMode mode = TitleAdapter_GetRuntimeMode();
+        const bool lifecycleValid =
+            support_grip::DurableLifecycleIdentifiesOwner(
+                activeTitle, activeGeneration, mode);
+        const bool identityLost = writer.engaged &&
+            support_grip::DurableRelationshipIdentityLost(
+                activeTitle, activeGeneration, mode, writer.owner);
+
+        // Owner evidence for exactly this title lifecycle. Any incoherence
+        // reads as Unknown: an unreadable or foreign record can never bind and
+        // can never be used as proof of an owner break.
+        support_grip::OwnerTuple evidenceOwner{};
+        support_grip::OwnerEvidence evidence =
+            support_grip::OwnerEvidence::Unknown;
+        uint64_t evidenceRevision = 0;
+        const bool evidenceCoherent = ReadSupportGripOwnerEvidenceInternal(
+            activeTitle, activeGeneration, evidenceOwner, evidence,
+            evidenceRevision);
+
+        // A coherent disengaged snapshot exists from the first feature-on
+        // update, so a consumer can never mistake "never published" for the
+        // permanent state of the relationship.
+        if (!g_persistentSupportGrip.published)
+        {
+            g_persistentSupportGrip.published = true;
+            PublishSupportGripRelationship(writer);
+        }
+
+        const bool trackingValid = rightValid && leftValid;
+        const bool configured = g_config.two_handed_aim;
+        const bool toggleMode = g_config.two_hand_toggle;
+        // User option: a proven switch inherits the two-hand hold immediately
+        // (see support_grip::DurableWriterStep). PG-ON only by construction:
+        // this function runs only behind the wired-title gate.
+        const bool switchInherit = g_config.two_hand_switch_inherit;
+        // Explicit release needs no poses: it is pure physical edge state.
+        const bool explicitRelease = writer.engaged &&
+            (toggleMode ? rising : !gripHeld);
+        // Teardowns that must run even through a pose outage, and that must arm
+        // release-before-reacquire BEFORE the writer clears the owner
+        // (F02 title/generation/mode, F11 interaction gesture, F16 roles).
+        const bool forcedTeardown =
+            rolesChanged || weaponGesture || identityLost;
+        if (writer.engaged && forcedTeardown)
+            admission.Arm();
+        // A role/gesture/lifecycle teardown (or a lifecycle replacement) is a
+        // deliberate discontinuity: the default-switch crossing requirement
+        // never survives it.
+        if (forcedTeardown)
+            g_persistentSupportGrip.awaitZoneReentry = false;
+        writer.requiresRelease = admission.requiresRelease;
+
+        if (!trackingValid && !forcedTeardown && !explicitRelease)
+        {
+            // B2 step 1, F11-analog: a pose outage suspends the relationship
+            // instead of erasing it. Nothing binds and nothing is abandoned, so
+            // there is no window in which a recovered held Grip could silently
+            // re-bind whatever owner the engine reached while the poses were
+            // gone.
+            g_twoHandActive.store(false, std::memory_order_release);
+            g_twoHandLatched.store(writer.engaged, std::memory_order_release);
+            return;
+        }
+
+        const bool engagedBefore = writer.engaged;
+        const support_grip::OwnerTuple previousOwner = writer.owner;
+        const uint64_t previousEpoch = writer.epoch;
+        support_grip::DurableWriterAction action =
+            support_grip::DurableWriterAction::None;
+
+        if (explicitRelease)
+        {
+            // B2 step 4: ordinary explicit release (hold-mode Grip release or
+            // the toggle-mode off press). No arming and no owner-break
+            // invalidation: the player released the relationship.
+            pending = support_grip::PendingAcquisitionIntent{};
+            // The player's own release is as deliberate as a fresh crossing:
+            // the default-switch crossing requirement ends with it.
+            g_persistentSupportGrip.awaitZoneReentry = false;
+            action = support_grip::DurableWriterRelease(writer);
+        }
+        else
+        {
+            // PG ON acquisition geometry: the archive's A003 predicate, not the
+            // base helper. Both this call site and the base `TwoHandGrabZoneHit`
+            // are behind the applicability gate (this function only runs while
+            // VR_SupportGripWiredForTitle() is true), so PG off / unwired titles
+            // keep the pre-fix geometry verbatim.
+            const bool inZone = trackingValid &&
+                PersistentSupportGrabZoneHit(rpose, lpose);
+            // 2026-09-28 headset follow-up: one update of the default-switch
+            // crossing requirement (see the state member above and
+            // support_grip::StepSwitchZoneReentry). A FALSE zone reading is the
+            // fresh crossing the requirement waits for, and the hold-mode
+            // acquisition edge may fire only with the requirement already
+            // clear, so a still-held Grip that never left the replacement's
+            // grab zone cannot re-bind it. Toggle mode keeps its own rising
+            // edge: a fresh press is already deliberate.
+            const support_grip::SwitchZoneReentryStep zoneReentry =
+                support_grip::StepSwitchZoneReentry(
+                    g_persistentSupportGrip.awaitZoneReentry, gripHeld, inZone);
+            g_persistentSupportGrip.awaitZoneReentry =
+                zoneReentry.awaitZoneReentry;
+            const bool acquisitionEdge = toggleMode
+                ? (rising && inZone && !writer.engaged)
+                : zoneReentry.holdAcquisitionEdge;
+            // F08: an acquisition intent may begin only from a provable
+            // evidence revision, because its floor is what stops a cached
+            // previous-owner publication from creating the relation. Dropping
+            // the click (throttled, logged) is the fail-closed choice.
+            const bool intentEdge = acquisitionEdge && evidenceCoherent;
+            if (acquisitionEdge && !evidenceCoherent)
+            {
+                // Once per acquisition episode, not per frame: the same click
+                // stays unserviceable until the producer publishes.
+                if (!g_persistentSupportGrip.dropLogged)
+                {
+                    g_persistentSupportGrip.dropLogged = true;
+                    LOG("Persistent support grip: acquisition ignored with no "
+                        "coherent owner evidence revision to floor it");
+                }
+            }
+            else if (!acquisitionEdge)
+                g_persistentSupportGrip.dropLogged = false;
+            support_grip::PendingAcquisitionInputs inputs{};
+            inputs.engaged = writer.engaged;
+            inputs.acquisitionEdge = intentEdge;
+            // F12: a second toggle press cancels a pending intent; an intent
+            // that already exists is never silently absorbed by the next click.
+            inputs.cancelRequested = toggleMode && rising &&
+                (writer.engaged || pending.pending);
+            // F12 cancel policy: a title/generation/lifecycle/role/secondary/
+            // gesture invalidation ends the intent. A pose outage never reaches
+            // this code, so it neither cancels nor advances the intent.
+            inputs.lifecycleValid = lifecycleValid && configured &&
+                grabAllowed && !weaponGesture;
+            inputs.holdMode = !toggleMode;
+            inputs.gripHeld = gripHeld;
+            inputs.title = activeTitle;
+            inputs.generation = activeGeneration;
+            inputs.publicationRevision =
+                evidenceCoherent ? evidenceRevision : 0;
+            (void)support_grip::PendingAcquisitionStep(pending, inputs);
+            // The pending intent IS the acquisition request: spatial admission
+            // already succeeded for it, and the fresh-owner proof gates it, so
+            // a bind can never come from stale prior-owner evidence.
+            const bool request = trackingValid &&
+                support_grip::PendingAcquisitionRequest(pending, activeTitle,
+                    activeGeneration, evidence, evidenceRevision);
+            const bool hardGate = configured && grabAllowed && !weaponGesture &&
+                !rolesChanged && lifecycleValid && !identityLost;
+            action = support_grip::DurableWriterStep(writer,
+                hardGate && trackingValid, request, evidence, evidenceOwner,
+                activeGeneration, switchInherit);
+        }
+
+        // 2026-09-28 headset follow-up: the no-inherit stage-2 owner break is
+        // the transition that must not pre-hold the replacement weapon, so it
+        // arms the crossing requirement for the very next update. It is the
+        // only transition that reaches this site: the inherit option rebinds in
+        // place (Bind), a proven absence and a generation replacement arm
+        // release-before-reacquire inside the writer, and any role/gesture/
+        // lifecycle teardown answers at the lifecycle gate first.
+        if (support_grip::DefaultSwitchReplacementDrop(engagedBefore, action,
+                evidence == support_grip::OwnerEvidence::KnownPresent &&
+                    !support_grip::SameOwner(evidenceOwner, previousOwner),
+                identityLost, switchInherit))
+            g_persistentSupportGrip.awaitZoneReentry = true;
+
+        // One arming state, two views: the writer's owner-break and generation
+        // decisions are mirrored into the admission the physical release edge
+        // clears.
+        if (writer.requiresRelease && !admission.requiresRelease)
+            admission.Arm();
+
+        // N1/N2: an owner break and a lifecycle (generation) replacement must
+        // not leave Lab damping or input-filter history from the previous
+        // owner. For VS-OFF product continuity, a durable owner break that
+        // releases an already-presented latch is itself the latch-release edge:
+        // preserve that one release bridge to raw one-hand aim. Other owner
+        // breaks keep the prior invalidation behavior. The prepared seam still
+        // independently invalidates title/generation changes. An inherited
+        // switch is not a break at all and leaves both layers alone.
+        if (action == support_grip::DurableWriterAction::Invalidated ||
+            identityLost)
+        {
+            const bool productReleasePending =
+                !CurrentResolvedVirtualStockAimSettings()
+                    .settings.virtualStockEnabled &&
+                TwoHandTransitionContinuityEnabled() && !writer.engaged &&
+                !identityLost &&
+                ((g_aimContinuityLayer.transition.initialized &&
+                     g_aimContinuityLayer.transition.previousLatched) ||
+                    (g_aimContinuityLayer.transition.active &&
+                     g_aimContinuityLayer.transition.phase ==
+                         virtual_stock::AimContinuityPhase::Release));
+            if (productReleasePending)
+                InvalidateTwoHandInputSmoothingLayer();
+            else
+                InvalidateAimContinuityLayer();
+            InvalidateTwoHandLabTemporal();
+        }
+
+        if (engagedBefore && !writer.engaged)
+        {
+            // T13 diagnostics repair: an explicit player release (hold-mode
+            // Grip release or the toggle-mode off press) is reported as
+            // itself FIRST. In the old ladder "explicit release" was only the
+            // unreachable-by-another-rung default, so a plain release that
+            // happened while a same-owner KnownPresent record was published
+            // printed "proven owner replacement" (confirmed in the installed
+            // CE logs: 10/10 releases). The evidence rungs below now describe
+            // only transitions the writer itself decided, and the detail
+            // lines stay scoped to those (transition-only logging is
+            // unchanged).
+            const char* reason =
+                "lifecycle identity unavailable (no owner proof)";
+            if (explicitRelease) reason = "explicit release";
+            else if (rolesChanged) reason = "handedness/role change";
+            else if (weaponGesture) reason = "weapon interaction gesture";
+            else if (identityLost) reason =
+                "title/generation/mode lifecycle replacement";
+            else if (!configured) reason = "two-handed aim disabled";
+            else if (!grabAllowed) reason = admission.requiresRelease
+                ? "release-before-reacquire armed" : "support grab denied";
+            else if (evidence == support_grip::OwnerEvidence::KnownAbsent)
+                reason = "proven weapon absence";
+            else if (evidence == support_grip::OwnerEvidence::KnownPresent)
+                reason = "proven owner replacement";
+            LOG("Persistent support grip: relationship released (epoch %llu -> "
+                "%llu): %s; old owner title=%u generation=%u unit=0x%08X "
+                "weapon=0x%08X",
+                static_cast<unsigned long long>(previousEpoch),
+                static_cast<unsigned long long>(writer.epoch), reason,
+                static_cast<unsigned>(previousOwner.title),
+                previousOwner.generation, static_cast<unsigned>(previousOwner.unit),
+                static_cast<unsigned>(previousOwner.weapon));
+            // The evidence detail belongs to the writer-decided transitions
+            // (owner break / lifecycle replacement), not to a player release
+            // that merely happened while some record was published.
+            if (!explicitRelease &&
+                evidence == support_grip::OwnerEvidence::KnownPresent &&
+                !support_grip::SameOwner(evidenceOwner, previousOwner))
+                LOG("Persistent support grip: replacement owner evidence "
+                    "title=%u generation=%u unit=0x%08X weapon=0x%08X "
+                    "revision=%llu",
+                    static_cast<unsigned>(evidenceOwner.title),
+                    evidenceOwner.generation,
+                    static_cast<unsigned>(evidenceOwner.unit),
+                    static_cast<unsigned>(evidenceOwner.weapon),
+                    static_cast<unsigned long long>(evidenceRevision));
+            else if (!explicitRelease &&
+                evidence == support_grip::OwnerEvidence::KnownAbsent)
+                LOG("Persistent support grip: proven weapon absence "
+                    "revision=%llu",
+                    static_cast<unsigned long long>(evidenceRevision));
+        }
+        if (action == support_grip::DurableWriterAction::Bind)
+        {
+            if (engagedBefore &&
+                !support_grip::SameOwner(previousOwner, writer.owner))
+            {
+                // two_hand_switch_inherit: a proven replacement was rebound in
+                // place (epoch advanced, still engaged, no arming and no N1/N2
+                // reset), so the switched weapon is two-handed immediately.
+                // The crossing requirement belongs to the default drop and this
+                // option never arms it; clearing it here keeps the option's
+                // semantics exactly as shipped.
+                g_persistentSupportGrip.awaitZoneReentry = false;
+                LOG("Persistent support grip: switched-weapon inheritance "
+                    "rebound owner (epoch %llu) title=%u generation=%u "
+                    "unit=0x%08X weapon=0x%08X evidence revision=%llu",
+                    static_cast<unsigned long long>(writer.epoch),
+                    static_cast<unsigned>(writer.owner.title),
+                    writer.owner.generation,
+                    static_cast<unsigned>(writer.owner.unit),
+                    static_cast<unsigned>(writer.owner.weapon),
+                    static_cast<unsigned long long>(evidenceRevision));
+            }
+            else
+            {
+                LOG("Persistent support grip: bound owner (epoch %llu) title=%u "
+                    "generation=%u unit=0x%08X weapon=0x%08X evidence revision=%llu",
+                    static_cast<unsigned long long>(writer.epoch),
+                    static_cast<unsigned>(writer.owner.title),
+                    writer.owner.generation,
+                    static_cast<unsigned>(writer.owner.unit),
+                    static_cast<unsigned>(writer.owner.weapon),
+                    static_cast<unsigned long long>(evidenceRevision));
+            }
+        }
+        if (!writer.engaged && !grabAllowed && (gripHeld || pending.pending) &&
+            admission.requiresRelease && !g_persistentSupportGrip.blockLogged)
+        {
+            g_persistentSupportGrip.blockLogged = true;
+            LOG("Persistent support grip: acquisition blocked until the Grip "
+                "is released (release-before-reacquire armed)");
+        }
+        if (!admission.requiresRelease)
+            g_persistentSupportGrip.blockLogged = false;
+
+        const GameTitle publishedTitle =
+            writer.engaged ? writer.owner.title : GameTitle::None;
+        const uint32_t publishedGeneration =
+            writer.engaged ? writer.owner.generation : 0;
+        if (!g_persistentSupportGrip.markerValid ||
+            g_persistentSupportGrip.markerEngaged != writer.engaged ||
+            g_persistentSupportGrip.markerEpoch != writer.epoch ||
+            g_persistentSupportGrip.markerTitle != publishedTitle ||
+            g_persistentSupportGrip.markerGeneration != publishedGeneration)
+        {
+            g_persistentSupportGrip.markerValid = true;
+            g_persistentSupportGrip.markerEngaged = writer.engaged;
+            g_persistentSupportGrip.markerEpoch = writer.epoch;
+            g_persistentSupportGrip.markerTitle = publishedTitle;
+            g_persistentSupportGrip.markerGeneration = publishedGeneration;
+            PublishSupportGripRelationship(writer);
+        }
+        g_twoHandLatched.store(writer.engaged, std::memory_order_release);
+        if (!writer.engaged)
+            g_twoHandActive.store(false, std::memory_order_release);
+    }
+
     void UpdateTwoHandLatch(bool rightValid, const XrPosef& rpose,
                             bool leftValid, const XrPosef& lpose, float gripL,
                             bool rolesChanged, bool weaponGesture = false)
@@ -10246,41 +13202,31 @@ float4 ps_scope_linearize(VSOut i):SV_Target { return paint(i.uv,true); }
         static SupportGripAdmission admission;
         const bool grabAllowed = admission.Observe(
             gripHeld, SecondaryWeaponPresentationActive(), rolesChanged);
+        // A0 transitional applicability gate: the durable writer only owns a
+        // wired title. An unwired title (ODST/Reach/H4 until their own
+        // tranche) runs the EXACT base latch path below even with the config
+        // on, and retires any dormant durable state so a later wired title
+        // cannot inherit it.
+        if (VR_SupportGripWiredForTitle(TitleAdapter_GetActiveTitle()))
+        {
+            // The durable writer replaces the latch decision.
+            UpdatePersistentSupportGrip(admission, rightValid, rpose, leftValid,
+                lpose, gripHeld, rising, grabAllowed, rolesChanged,
+                weaponGesture);
+            return;
+        }
+        // The feature is off or this title is not wired yet: retire any durable
+        // state a previous frame owned, so re-enabling it (or switching to a
+        // wired title) cannot revive a relationship the player never
+        // re-acquired. The base path below then owns the frame unchanged.
+        RetirePersistentSupportGripState();
         if (!grabAllowed || !g_config.two_handed_aim || !rightValid || !leftValid || weaponGesture)
         {
             g_twoHandLatched.store(false);
             g_twoHandActive.store(false);
             return;
         }
-        const XrVector3f rfwd = Rotate(rpose.orientation, {0,0,-1});
-        // Grab-zone side nudge: the visible barrel can sit beside the raw aim
-        // ray (headset report: the AR's barrel was right of the zone), so the
-        // zone axis shifts along the controller's +X by the F1-tuned amount.
-        const float zr = std::clamp(g_config.two_hand_zone_right_m, -0.10f, 0.10f);
-        const XrVector3f rright = Rotate(rpose.orientation, {1,0,0});
-        const XrVector3f origin{rpose.position.x+rright.x*zr,
-                                rpose.position.y+rright.y*zr,
-                                rpose.position.z+rright.z*zr};
-        auto inZoneAt = [&](const XrVector3f& p) -> bool {
-            const XrVector3f v{p.x-origin.x, p.y-origin.y, p.z-origin.z};
-            const float along = v.x*rfwd.x + v.y*rfwd.y + v.z*rfwd.z;
-            const XrVector3f perp{v.x-along*rfwd.x, v.y-along*rfwd.y, v.z-along*rfwd.z};
-            const float lateral = sqrtf(perp.x*perp.x+perp.y*perp.y+perp.z*perp.z);
-            return along>0.08f && along<0.80f && lateral<0.09f;
-        };
-        // Palm depth moves where a support grip counts: the grab zone meets
-        // the visible palm, not the wrist bone the hand target anchors.
-        // Aim rays, shots, and contact/melee geometry stay on the raw point.
-        const XrVector3f supportForward = Rotate(lpose.orientation, {0,0,-1});
-        const virtual_stock::Point3 grabPoint =
-            virtual_stock::SupportGrabPoint(
-                virtual_stock::Point3{
-                    lpose.position.x, lpose.position.y, lpose.position.z},
-                virtual_stock::Point3{
-                    supportForward.x, supportForward.y, supportForward.z},
-                g_config.left_grip_forward_m);
-        const XrVector3f grabSample{grabPoint.x, grabPoint.y, grabPoint.z};
-        const bool inZone = inZoneAt(grabSample);
+        const bool inZone = TwoHandGrabZoneHit(rpose, lpose);
 
         if (g_config.two_hand_toggle)
         {
@@ -10443,11 +13389,19 @@ float4 ps_scope_linearize(VSOut i):SV_Target { return paint(i.uv,true); }
         LeaveCriticalSection(&g_headCs);
     }
 
-    bool TryLocateSupportGripPosition(bool enabled, XrPath handPath,
+    // Position-only grip sample for one hand. Admission is purely the OpenXR
+    // action/space availability plus this frame's tracking validity: there is
+    // deliberately NO feature/config gate. The grip positions are the
+    // positional pivots of the free two-hand production geometry (Grip -> Grip)
+    // and of the optional support endpoint, so they must exist regardless of
+    // any Virtual Stock or "Reduce Support-Hand Rotation" selection. Failure
+    // closes the sample for that hand only; the callers keep their previous
+    // fail-open behaviour.
+    bool TryLocateSupportGripPosition(XrPath handPath,
                                       XrSpace gripSpace, XrTime time,
                                       XrVector3f& outPosition)
     {
-        if (!enabled || g_supportGripPoseAction == XR_NULL_HANDLE ||
+        if (g_supportGripPoseAction == XR_NULL_HANDLE ||
             gripSpace == XR_NULL_HANDLE)
             return false;
         XrActionStateGetInfo gripGet{XR_TYPE_ACTION_STATE_GET_INFO};
@@ -10527,19 +13481,20 @@ float4 ps_scope_linearize(VSOut i):SV_Target { return paint(i.uv,true); }
             }
         }
 
+        // Both hand grip positions are sampled on every capture, independent of
+        // any Virtual Stock or "Reduce Support-Hand Rotation" selection: the
+        // free two-hand production geometry consumes the primary -> support
+        // Grip pair directly, and the support endpoint selector consumes the
+        // same sample. These reuse the existing OpenXR grip action/spaces and
+        // the frame's single xrSyncActions sample - no extra runtime sampling.
         XrVector3f physicalGripPosition[2]{};
         bool physicalGripValid[2]{};
-        if (g_config.two_hand_support_grip_pose)
-        {
-            physicalGripValid[0] = TryLocateSupportGripPosition(
-                g_config.two_hand_support_grip_pose, g_leftHandPath,
-                g_leftGripPoseSpace, time,
-                physicalGripPosition[0]);
-            physicalGripValid[1] = TryLocateSupportGripPosition(
-                g_config.two_hand_support_grip_pose, g_rightHandPath,
-                g_rightGripPoseSpace, time,
-                physicalGripPosition[1]);
-        }
+        physicalGripValid[0] = TryLocateSupportGripPosition(
+            g_leftHandPath, g_leftGripPoseSpace, time,
+            physicalGripPosition[0]);
+        physicalGripValid[1] = TryLocateSupportGripPosition(
+            g_rightHandPath, g_rightGripPoseSpace, time,
+            physicalGripPosition[1]);
 
         auto selectVelocity = [&](int hand, bool poseValid,
                                   const XrPosef& pose,
@@ -10605,12 +13560,23 @@ float4 ps_scope_linearize(VSOut i):SV_Target { return paint(i.uv,true); }
             LOG("Weapon handedness: physical %s hand is primary; physical %s hand is support/secondary",
                 leftHanded ? "left" : "right", leftHanded ? "right" : "left");
             g_contactSpaceEpoch.fetch_add(1, std::memory_order_acq_rel);
-            g_twoHandLatched.store(false, std::memory_order_release);
+            // F16: with the persistent grip wired for the active title, this
+            // teardown must run through the canonical writer below (the same
+            // edge reaches it as `rolesChanged`) so the durable relationship's
+            // owner, epoch and publication move together instead of clearing
+            // the latch out of band and leaving a stale owner behind. PG off
+            // *and every unwired title* keep the original direct clear (A0
+            // applicability gate: base behaviour on unwired titles).
+            if (!VR_SupportGripWiredForTitle(TitleAdapter_GetActiveTitle()))
+                g_twoHandLatched.store(false, std::memory_order_release);
             g_contactHaptics[0].store(0.0f, std::memory_order_release);
             g_contactHaptics[1].store(0.0f, std::memory_order_release);
             // Handedness swaps the semantic primary/support roles, so a stored
             // transition anchor would be replayed against the wrong hand.
             InvalidateAimContinuityLayer();
+            // A stored Lab temporal correction/seed belongs to the old
+            // semantic roles for the same reason.
+            InvalidateTwoHandLabTemporal();
         }
         EnterCriticalSection(&g_headCs);
         g_physicalControllerPose[0] = leftLocation.pose;
@@ -11478,16 +14444,21 @@ float4 ps_scope_linearize(VSOut i):SV_Target { return paint(i.uv,true); }
             memcpy(next.rawPrimaryOrientation,orientation,sizeof(orientation));
             memcpy(next.rawPrimaryPosition,position,sizeof(position));
         }
-        const AimPoseResult aim=ComputeAimPose(CurrentFrameStockAimPoseInputs(
-            rightFresh,g_rightAimPose,leftFresh,g_leftAimPose));
-        next.twoHandAimActive=aim.valid && aim.twoHandActive;
-        next.leftHanded=g_capturedLeftHanded.load(std::memory_order_acquire);
+        const AimPoseInputs contactAimInputs = CurrentFrameStockAimPoseInputs(
+            rightFresh, g_rightAimPose, leftFresh, g_leftAimPose);
+        const AimPoseResult aim = ComputeAimPose(contactAimInputs);
+        next.twoHandAimActive = aim.valid && aim.twoHandActive;
+        next.leftHanded = g_capturedLeftHanded.load(std::memory_order_acquire);
         next.handAlignment = next.leftHanded && g_config.experimental_hand_alignment;
-        next.primaryAimValid=aim.valid;
+        next.primaryAimValid = aim.valid;
         if (aim.valid)
         {
-            const XrQuaternionf presented =
-                PresentAimContinuity(aim.pose.orientation, serial);
+            XrQuaternionf presented = PresentAimContinuity(
+                aim.pose.orientation, serial);
+            // Two-Hand Lab temporal (VS-off only): runs after the VS
+            // presentation; at most one correction is ever active.
+            presented = PresentTwoHandLabTemporal(presented, serial,
+                contactAimInputs.twoHandLabGeneration);
             const float q[]{presented.x, presented.y, presented.z,
                             presented.w};
             memcpy(next.primaryAimOrientation, q, sizeof(q));
@@ -11564,9 +14535,10 @@ float4 ps_scope_linearize(VSOut i):SV_Target { return paint(i.uv,true); }
         // prepared Reach serial: this snapshot is an exact-frame contract.
         const bool rightPoseFresh = padFresh && g_rightAimPoseValid;
         const bool leftPoseFresh = padFresh && g_leftAimPoseValid;
-        const AimPoseResult aim = ComputeAimPose(CurrentFrameStockAimPoseInputs(
+        const AimPoseInputs labAimInputs = CurrentFrameStockAimPoseInputs(
             rightPoseFresh, g_rightAimPose,
-            leftPoseFresh, g_leftAimPose));
+            leftPoseFresh, g_leftAimPose);
+        const AimPoseResult aim = ComputeAimPose(labAimInputs);
         next.rightAimValid = aim.valid;
         next.twoHandAimActive = aim.valid && aim.twoHandActive;
         if (aim.valid)
@@ -11574,9 +14546,11 @@ float4 ps_scope_linearize(VSOut i):SV_Target { return paint(i.uv,true); }
             // Orientation only: the presentation surfaces consume the aim that
             // includes any active grab/release transition correction; the
             // position and the raw two-hand activity flag stay exactly as the
-            // solver returned them.
-            const XrPosef presentedAim = PresentedAimContinuityPose(
-                aim.pose, preparedSerial);
+            // solver returned them. The Lab temporal presentation (VS-off
+            // only) runs after the VS one; at most one is ever active.
+            const XrPosef presentedAim = PresentedTwoHandLabTemporalPose(
+                PresentedAimContinuityPose(aim.pose, preparedSerial),
+                preparedSerial, labAimInputs.twoHandLabGeneration);
             next.rightAimOrientation[0] = presentedAim.orientation.x;
             next.rightAimOrientation[1] = presentedAim.orientation.y;
             next.rightAimOrientation[2] = presentedAim.orientation.z;
@@ -11698,9 +14672,10 @@ float4 ps_scope_linearize(VSOut i):SV_Target { return paint(i.uv,true); }
         // Halo 2 prepared serial.
         const bool rightPoseFresh = padFresh && g_rightAimPoseValid;
         const bool leftPoseFresh = padFresh && g_leftAimPoseValid;
-        const AimPoseResult aim = ComputeAimPose(CurrentFrameStockAimPoseInputs(
+        const AimPoseInputs labAimInputs = CurrentFrameStockAimPoseInputs(
             rightPoseFresh, g_rightAimPose,
-            leftPoseFresh, g_leftAimPose));
+            leftPoseFresh, g_leftAimPose);
+        const AimPoseResult aim = ComputeAimPose(labAimInputs);
         next.rightAimValid = aim.valid;
         next.twoHandAimActive = aim.valid && aim.twoHandActive;
         if (aim.valid)
@@ -11708,9 +14683,11 @@ float4 ps_scope_linearize(VSOut i):SV_Target { return paint(i.uv,true); }
             // Orientation only: the presentation surfaces consume the aim that
             // includes any active grab/release transition correction; the
             // position and the raw two-hand activity flag stay exactly as the
-            // solver returned them.
-            const XrPosef presentedAim = PresentedAimContinuityPose(
-                aim.pose, preparedSerial);
+            // solver returned them. The Lab temporal presentation (VS-off
+            // only) runs after the VS one; at most one is ever active.
+            const XrPosef presentedAim = PresentedTwoHandLabTemporalPose(
+                PresentedAimContinuityPose(aim.pose, preparedSerial),
+                preparedSerial, labAimInputs.twoHandLabGeneration);
             next.rightAimOrientation[0] = presentedAim.orientation.x;
             next.rightAimOrientation[1] = presentedAim.orientation.y;
             next.rightAimOrientation[2] = presentedAim.orientation.z;
@@ -11821,9 +14798,10 @@ float4 ps_scope_linearize(VSOut i):SV_Target { return paint(i.uv,true); }
         // from two prepared serials.
         const bool rightPoseFresh = padFresh && g_rightAimPoseValid;
         const bool leftPoseFresh = padFresh && g_leftAimPoseValid;
-        const AimPoseResult aim = ComputeAimPose(CurrentFrameStockAimPoseInputs(
+        const AimPoseInputs labAimInputs = CurrentFrameStockAimPoseInputs(
             rightPoseFresh, g_rightAimPose,
-            leftPoseFresh, g_leftAimPose));
+            leftPoseFresh, g_leftAimPose);
+        const AimPoseResult aim = ComputeAimPose(labAimInputs);
         next.rightAimValid = aim.valid;
         next.twoHandAimActive = aim.valid && aim.twoHandActive;
         if (aim.valid)
@@ -11831,9 +14809,11 @@ float4 ps_scope_linearize(VSOut i):SV_Target { return paint(i.uv,true); }
             // Orientation only: the presentation surfaces consume the aim that
             // includes any active grab/release transition correction; the
             // position and the raw two-hand activity flag stay exactly as the
-            // solver returned them.
-            const XrPosef presentedAim = PresentedAimContinuityPose(
-                aim.pose, preparedSerial);
+            // solver returned them. The Lab temporal presentation (VS-off
+            // only) runs after the VS one; at most one is ever active.
+            const XrPosef presentedAim = PresentedTwoHandLabTemporalPose(
+                PresentedAimContinuityPose(aim.pose, preparedSerial),
+                preparedSerial, labAimInputs.twoHandLabGeneration);
             next.rightAimOrientation[0] = presentedAim.orientation.x;
             next.rightAimOrientation[1] = presentedAim.orientation.y;
             next.rightAimOrientation[2] = presentedAim.orientation.z;
@@ -11841,6 +14821,31 @@ float4 ps_scope_linearize(VSOut i):SV_Target { return paint(i.uv,true); }
             next.rightAimPosition[0] = presentedAim.position.x;
             next.rightAimPosition[1] = presentedAim.position.y;
             next.rightAimPosition[2] = presentedAim.position.z;
+        }
+        // Owner-safe ordinary one-hand fallback from the SAME prepared
+        // controller sample (the solver returns through its calibrated
+        // one-hand path whenever two-hand support is disabled). Computed only
+        // while the persistent support grip is wired for Halo 4, so with the
+        // feature off this adds no solve and the field keeps its falsy
+        // default. No new solver and no new mode.
+        if (VR_SupportGripWiredForTitle(GameTitle::Halo4))
+        {
+            AimPoseInputs oneHandInputs = CurrentAimPoseInputs(
+                rightPoseFresh, g_rightAimPose, leftPoseFresh, g_leftAimPose);
+            oneHandInputs.twoHandEnabled = false;
+            const AimPoseResult oneHandAim = ComputeAimPose(oneHandInputs);
+            next.oneHandRightAimValid = oneHandAim.valid;
+            if (oneHandAim.valid)
+            {
+                next.oneHandRightAimOrientation[0] =
+                    oneHandAim.pose.orientation.x;
+                next.oneHandRightAimOrientation[1] =
+                    oneHandAim.pose.orientation.y;
+                next.oneHandRightAimOrientation[2] =
+                    oneHandAim.pose.orientation.z;
+                next.oneHandRightAimOrientation[3] =
+                    oneHandAim.pose.orientation.w;
+            }
         }
         next.leftControllerValid = leftPoseFresh;
         if (leftPoseFresh)
@@ -12480,7 +15485,12 @@ float4 ps_scope_linearize(VSOut i):SV_Target { return paint(i.uv,true); }
                 ? static_cast<float>(g_preparedFrame.predictedDisplayDelta) *
                     1.0e-9f
                 : 0.0f;
+            AdvanceTwoHandInputSmoothingForPreparedFrame(
+                g_preparedFrame.serial, upcomingPadFresh,
+                preparedDtSeconds);
             AdvanceAimContinuityForPreparedFrame(
+                upcomingPadFresh, preparedDtSeconds);
+            AdvanceTwoHandLabForPreparedFrame(
                 upcomingPadFresh, preparedDtSeconds);
         }
         CapturePreparedFrameTelemetry(
@@ -12560,10 +15570,22 @@ float4 ps_scope_linearize(VSOut i):SV_Target { return paint(i.uv,true); }
                 const auto aim=ComputeAimPose(aimInputs);
                 // CE's visible weapon/hand rig consumes the presented aim:
                 // orientation-only continuity, position untouched. The
-                // independent solve below stays raw.
-                rig.primaryAim=pose(PresentedAimContinuityPose(
-                    aim.pose,g_preparedFrame.serial),aim.valid);
+                // independent solve below stays raw. The Lab temporal
+                // presentation (VS-off only) runs after the VS one.
+                rig.primaryAim=pose(PresentedTwoHandLabTemporalPose(
+                    PresentedAimContinuityPose(
+                        aim.pose,g_preparedFrame.serial),
+                    g_preparedFrame.serial,
+                    aimInputs.twoHandLabGeneration),aim.valid);
                 rig.twoHandAimActive=rig.primaryAim.valid&&aim.twoHandActive;
+                // Persistent support grip: the frozen pose's provenance and the
+                // base presentation value. The CE first-person prepare freezes
+                // the per-invocation relationship decision into its copied
+                // context, so with the feature off (or an unwired title) these
+                // stay exactly `twoHandAimActive` and the palette is unchanged.
+                rig.primaryAimSupportDerived=support_grip::AimSupportDerived(
+                    aim.valid,aim.twoHandActive);
+                rig.supportGripAttached=rig.twoHandAimActive;
                 aimInputs.twoHandEnabled=false;
                 const auto independent=ComputeAimPose(aimInputs);
                 rig.independentPrimaryAim=pose(independent.pose,independent.valid);
@@ -13769,8 +16791,15 @@ float4 ps_scope_linearize(VSOut i):SV_Target { return paint(i.uv,true); }
                         // optionally stabilize ONLY the displayed reticle. At
                         // 0% it is the exact current bullet ray; higher values
                         // deliberately trade visual reticle response for calm.
+                        // The solve-time support receipt rides along so the
+                        // presented-ray publication is qualified from the
+                        // producing solve, never from a live durable re-read
+                        // (F07).
                         float aimQ[4], aimP[3];
-                        const bool haveAim = VR_GetAimPose(aimQ, aimP);
+                        VrAimSupportReceipt aimSupportReceipt{};
+                        const bool haveAim =
+                            VR_GetAimPoseWithSupportProvenance(aimQ, aimP,
+                                aimSupportReceipt);
                         const bool authoredReticleThisFrame =
                             g_authoredReticleReady &&
                             g_authoredReticleSerial == g_preparedFrame.serial;
@@ -14266,11 +17295,54 @@ float4 ps_scope_linearize(VSOut i):SV_Target { return paint(i.uv,true); }
                                            {aimP[0],aimP[1],aimP[2]}};
                             const float smoothing =
                                 std::clamp(g_config.aim_stabilization, 0.0f, 0.95f);
-                            g_reticleAimPose = g_reticleAimPoseValid && smoothing > 0.0f
+                            // Persistent support grip (F14/§10): the smoothing
+                            // history reseeds across an owner/trust or
+                            // relationship-epoch discontinuity, so a denied
+                            // invocation (or a changed owner epoch) can never
+                            // blend previous support geometry into the new ray.
+                            // PG off reports an all-zero receipt, which is
+                            // continuous by construction: the expression below
+                            // is then byte-identical to the base smoothing.
+                            //
+                            // F07/F10: for a title that publishes a title-native
+                            // invocation receipt (Reach), the solve-time receipt
+                            // is not permission on its own. The frame's own FP
+                            // invocation must also have proven the same owner and
+                            // relationship epoch for this prepared serial; a
+                            // missing/mismatched receipt makes the ray
+                            // support-untrusted, which reseeds the smoothing
+                            // history here and is refused by every consumer.
+                            const bool invocationReceiptOk =
+                                !g_config.persistent_support_grip ||
+                                VR_SupportInvocationReceiptTrustedForReticle(
+                                    reticleTitle, reticleGeneration,
+                                    aimSupportReceipt.solveSerial,
+                                    aimSupportReceipt.supportEpoch,
+                                    aimSupportReceipt.supportTrusted);
+                            const bool supportTrusted =
+                                aimSupportReceipt.supportTrusted &&
+                                invocationReceiptOk;
+                            const bool supportOwnerSafe =
+                                !g_config.persistent_support_grip ||
+                                !aimSupportReceipt.relationshipEngaged ||
+                                supportTrusted;
+                            const bool supportDiscontinuity =
+                                support_grip::ReticleSmoothingDiscontinuity(
+                                    supportOwnerSafe,
+                                    aimSupportReceipt.supportEpoch,
+                                    g_reticleSupportEpoch);
+                            g_reticleAimPose = g_reticleAimPoseValid &&
+                                    smoothing > 0.0f && !supportDiscontinuity
                                 ? SmoothTrackedPose(rawAim, g_reticleAimPose, smoothing)
                                 : rawAim;
                             g_reticleAimPoseValid = true;
-                            PublishPresentedReticleAimPose(&g_reticleAimPose);
+                            // The receipt travels with the smoothed result.
+                            g_reticleSupportEpoch =
+                                aimSupportReceipt.supportEpoch;
+                            PublishPresentedReticleAimPose(&g_reticleAimPose,
+                                aimSupportReceipt.supportEpoch,
+                                supportTrusted,
+                                aimSupportReceipt.solveSerial);
                             const XrVector3f aimRay = Rotate(
                                 g_reticleAimPose.orientation, {0.0f,0.0f,-1.0f});
                             float aimDir[3] = {aimRay.x,aimRay.y,aimRay.z};
@@ -14443,8 +17515,9 @@ float4 ps_scope_linearize(VSOut i):SV_Target { return paint(i.uv,true); }
                             // Never blend from a stale pose after tracking or
                             // the crosshair is restored.
                             g_reticleAimPoseValid = false;
+                            g_reticleSupportEpoch = 0;
                             g_secondaryReticlePoseValid = false;
-                            PublishPresentedReticleAimPose(nullptr);
+                            PublishPresentedReticleAimPose(nullptr, 0, false, 0);
                         }
 
                         if (reachProjectionAdmitted &&
@@ -15022,6 +18095,29 @@ void VR_SetVirtualStockTestProfile(VirtualStockTestProfile value) noexcept
 {
     g_virtualStockTestProfile.Store(value);
 }
+
+namespace two_hand_lab_runtime
+{
+void SetSettings(const two_hand_lab::Settings& settings) noexcept
+{
+    PublishTwoHandLabSettings(settings);
+}
+
+two_hand_lab::Settings GetSettings() noexcept
+{
+    return SnapshotTwoHandLabSettings();
+}
+
+void ResetSettings() noexcept
+{
+    PublishTwoHandLabSettings(two_hand_lab::DefaultSettings());
+}
+
+bool GetLastDiagnostics(two_hand_lab::Diagnostics& out) noexcept
+{
+    return ReadTwoHandLabDiagnostics(out);
+}
+} // namespace two_hand_lab_runtime
 
 VirtualStockAimSettings VR_GetEffectiveVirtualStockAimSettings() noexcept
 {
@@ -19574,6 +22670,98 @@ void VR_SetReticleEnemy(bool enemy)
     g_reticleEnemy.store(enemy, std::memory_order_relaxed);
 }
 
+void VR_PublishSupportGripOwnerEvidence(GameTitle title, uint32_t generation,
+    const support_grip::OwnerTuple& owner,
+    support_grip::OwnerEvidence evidence) noexcept
+{
+    // F13: one slot per title, one writer at a time inside it. A dropped
+    // publication is a lost update, never a torn record; the producer's next
+    // update republishes.
+    (void)PublishSupportGripOwnerEvidenceInternal(title, generation, owner,
+        evidence);
+}
+
+bool VR_SupportGripWiredForTitle(GameTitle title) noexcept
+{
+    // A0 transitional applicability gate: the feature may only touch a title
+    // whose producer/trust/fallback slice is wired. PG off is always false.
+    return g_config.persistent_support_grip &&
+        support_grip::PersistentSupportGripApplies(title);
+}
+
+bool VR_ReadSupportGripOwnerEvidence(GameTitle title,
+    uint32_t expectedGeneration, support_grip::OwnerTuple& owner,
+    support_grip::OwnerEvidence& evidence, uint64_t& revision) noexcept
+{
+    // The caller treats false as Unknown: it must never be read as a durable
+    // release, and it can never bind an acquisition.
+    return ReadSupportGripOwnerEvidenceInternal(title, expectedGeneration, owner,
+        evidence, revision);
+}
+
+bool VR_GetSupportGripRelationship(
+    SupportGripRelationshipSnapshot& snapshot) noexcept
+{
+    // False is "unavailable", not "disengaged": a caller that cannot prove the
+    // reading must fail closed for support ownership (F15).
+    return ReadSupportGripRelationshipInternal(snapshot);
+}
+
+void VR_PublishSupportInvocationReceipt(
+    const support_grip::SupportInvocationReceipt& receipt) noexcept
+{
+    // Title hook only, and only for a title that actually owns an FP
+    // interpolate seam: an unwired/foreign title must never poison the record
+    // a consumer qualifies against.
+    if (!VR_SupportGripWiredForTitle(receipt.title) ||
+        !support_grip::TitlePublishesSupportInvocationReceipt(receipt.title))
+        return;
+    PublishSupportInvocationReceiptInternal(receipt);
+}
+
+bool VR_ReadSupportInvocationReceipt(GameTitle title,
+    support_grip::SupportInvocationReceipt& receipt) noexcept
+{
+    return ReadSupportInvocationReceiptInternal(title, receipt);
+}
+
+bool VR_SupportInvocationReceiptTrustedForReticle(GameTitle title,
+    uint32_t generation, uint64_t serial, uint64_t raySupportEpoch,
+    bool raySupportTrusted) noexcept
+{
+    // Only a wired title that publishes receipts is held to this rule; every
+    // other title (and the whole feature while it is off) keeps its previous
+    // receipt semantics exactly.
+    if (!VR_SupportGripWiredForTitle(title) ||
+        !support_grip::TitlePublishesSupportInvocationReceipt(title))
+        return true;
+    support_grip::SupportInvocationReceipt invocation{};
+    SupportGripRelationshipSnapshot relationship{};
+    if (!ReadSupportInvocationReceiptInternal(title, invocation) ||
+        !ReadSupportGripRelationshipInternal(relationship))
+        return false; // fail closed: no proven invocation receipt
+    return support_grip::PresentedRayConsumableForInvocation(title, invocation,
+        generation, serial,
+        /*relationshipReadable=*/true,
+        relationship.engaged, relationship.epoch,
+        support_grip::OwnerTuple{relationship.title, relationship.generation,
+            relationship.unit, relationship.weapon},
+        raySupportEpoch, raySupportTrusted, /*raySerial=*/serial);
+}
+
+void VR_SetSupportInvocationUntrusted(bool untrusted) noexcept
+{
+    // Thread-local, fail-open: a stray set can only force the ordinary
+    // calibrated one-hand path for this invocation. Never mutates the durable
+    // relationship and never consulted while the feature is off.
+    g_supportInvocationUntrusted = untrusted;
+}
+
+bool VR_SupportInvocationUntrusted() noexcept
+{
+    return g_supportInvocationUntrusted;
+}
+
 void VR_ObserveSecondaryWeaponPresentation(GameTitle title, uint32_t generation)
 {
     const size_t slot = TitleRuntimeSlotIndex(title);
@@ -19586,6 +22774,24 @@ void VR_ObserveSecondaryWeaponPresentation(GameTitle title, uint32_t generation)
 bool VR_IsTwoHandAiming()
 {
     return g_twoHandActive.load() && !SecondaryWeaponPresentationActive();
+}
+
+VRShotFlagSnapshot VR_GetShotFlagSnapshot() noexcept
+{
+    // Three independent bounded reads of already-published state. They are not
+    // a single coherent transaction (the firing path only needs each fact as
+    // observed at publish time); no aim getter, lock, allocation or sampling.
+    VRShotFlagSnapshot snapshot{};
+    snapshot.twoHandActive = g_twoHandActive.load(std::memory_order_acquire);
+    snapshot.leftHanded =
+        g_capturedLeftHanded.load(std::memory_order_acquire);
+    snapshot.dualActive = SecondaryWeaponPresentationActive();
+    return snapshot;
+}
+
+uint64_t VR_CurrentPreparedSerial() noexcept
+{
+    return g_preparedSerialPublished.load(std::memory_order_acquire);
 }
 
 bool VR_GetContactTrackingSnapshot(VrContactTrackingSnapshot& snapshot)
@@ -19617,8 +22823,10 @@ bool VR_GetContactTrackingSnapshot(VrContactTrackingSnapshot& snapshot)
 // at the selected support endpoint; otherwise it is the primary -> support line. Downstream
 // verified barrel-origin aiming (gun_barrel_aim) may substitute the muzzle
 // origin/direction afterwards and is unaffected by this base pose.
-bool VR_GetAimPose(float outQuat[4], float outPos[3])
+bool VR_GetAimPoseWithSupportProvenance(float outQuat[4], float outPos[3],
+    VrAimSupportReceipt& outReceipt)
 {
+    outReceipt = VrAimSupportReceipt{};
     if (!g_headCsInit)
         return false;
     AimPoseInputs inputs{};
@@ -19643,10 +22851,36 @@ bool VR_GetAimPose(float outQuat[4], float outPos[3])
     const bool supportGripFresh = g_supportGripPoseValid &&
         g_supportGripPoseFresh.load(std::memory_order_acquire);
     const XrVector3f supportGrip = g_supportGripPosePosition;
+    // Same-sample primary grip under this same hold (see the Lab store proof):
+    // the success-path capture wrote it with these AIM poses, and the only
+    // concurrent writer clears toward fail-open.
+    const bool primaryGripValid = g_primaryGripPoseValid;
+    const XrVector3f primaryGrip = g_primaryGripPosePosition;
     inputs = CurrentStockAimPoseInputs(
          okR, right, okL, left, okH, head, g_headPose.orientation,
-         supportGripFresh, supportGrip);
+         supportGripFresh, supportGrip,
+         primaryGripValid, primaryGrip);
     LeaveCriticalSection(&g_headCs);
+
+    // Cross-thread consumers use only the exact prepared serial's immutable
+    // publication, including the strength/mix it was frozen with. A torn,
+    // stale, inactive or zero-strength packet leaves the solver on raw input.
+    TwoHandInputSmoothingPreparedOutput smoothing{};
+    const GameTitle smoothingTitle = TitleAdapter_GetActiveTitle();
+    const uint32_t smoothingGeneration =
+        TitleAdapter_GetGeneration(smoothingTitle);
+    const uint64_t smoothingEpoch =
+        g_contactSpaceEpoch.load(std::memory_order_acquire);
+    if (inputs.twoHandEnabled && inputs.twoHandLatched && inputs.leftValid &&
+        !inputs.virtualStockEnabled &&
+        ReadTwoHandInputSmoothing(expectedSerial, smoothingEpoch,
+            smoothingTitle, smoothingGeneration,
+            inputs.virtualStockLeftHanded,
+            inputs.supportEndpointUsedGrip, smoothing) &&
+        smoothing.strength > 0.0f)
+    {
+        ApplyTwoHandSmoothingGeometry(inputs, smoothing.mixed);
+    }
 
     const AimPoseResult aim = ComputeAimPose(inputs);
     if (!aim.updateTwoHandActivity)
@@ -19662,13 +22896,22 @@ bool VR_GetAimPose(float outQuat[4], float outPos[3])
         PresentAimContinuityFromPublication(
             aim.pose.orientation, expectedSerial, okH,
             inputs.supportEndpointUsedGrip);
+    // Two-Hand Lab temporal (VS-off only): runs after the VS presentation
+    // above through its own lock-free packet. The packet carries the serial,
+    // epoch, settings generation and stateless orientation of the solve its
+    // correction belongs to; anything else fails open to the orientation
+    // above. Both inactive is identity.
+    const XrQuaternionf labPresentedOrientation =
+        PresentTwoHandLabTemporalFromPublication(
+            presentedOrientation, expectedSerial,
+            inputs.twoHandLabGeneration);
 
     // Preserve the getter's existing output contract: once the right pose is
     // valid, publish the best pose even if final quaternion validation fails.
-    outQuat[0] = presentedOrientation.x;
-    outQuat[1] = presentedOrientation.y;
-    outQuat[2] = presentedOrientation.z;
-    outQuat[3] = presentedOrientation.w;
+    outQuat[0] = labPresentedOrientation.x;
+    outQuat[1] = labPresentedOrientation.y;
+    outQuat[2] = labPresentedOrientation.z;
+    outQuat[3] = labPresentedOrientation.w;
     outPos[0] = aim.pose.position.x;
     outPos[1] = aim.pose.position.y;
     outPos[2] = aim.pose.position.z;
@@ -19694,14 +22937,34 @@ bool VR_GetAimPose(float outQuat[4], float outPos[3])
             lastRejectLogMs = now;
         }
     }
+    // The frozen solve-time receipt travels with the returned pose. The
+    // orientation above may carry the VS/Lab presentation corrections, which
+    // are owner-invariant by construction (they compose onto the same live
+    // solve), so the receipt still describes the pose's support authority.
+    outReceipt.supportEpoch = aim.supportEpoch;
+    outReceipt.supportTrusted = aim.supportTrusted;
+    outReceipt.relationshipReadable = aim.supportRelationshipReadable;
+    outReceipt.relationshipEngaged = aim.supportRelationshipEngaged;
+    outReceipt.solveSerial = aim.supportSolveSerial;
     if (!aim.valid)
         return false;
     return true;
 }
 
-bool VR_GetPresentedReticleAimPose(
-    float outQuat[4], float outPos[3], uint64_t& outSampleMs)
+bool VR_GetAimPose(float outQuat[4], float outPos[3])
 {
+    VrAimSupportReceipt receipt{};
+    return VR_GetAimPoseWithSupportProvenance(outQuat, outPos, receipt);
+}
+
+bool VR_GetPresentedReticleAimPoseWithSupportProvenance(
+    float outQuat[4], float outPos[3], uint64_t& outSampleMs,
+    uint64_t& outSupportEpoch, bool& outSupportTrusted,
+    uint64_t& outSolveSerial)
+{
+    outSupportEpoch = 0;
+    outSupportTrusted = false;
+    outSolveSerial = 0;
     if (!outQuat || !outPos)
         return false;
     auto& published = g_presentedReticleAimPose;
@@ -19715,6 +22978,12 @@ bool VR_GetPresentedReticleAimPose(
             published.valid.load(std::memory_order_relaxed) != 0;
         const uint64_t sampleMs =
             published.sampleMs.load(std::memory_order_relaxed);
+        const uint64_t supportEpoch =
+            published.supportEpoch.load(std::memory_order_relaxed);
+        const bool supportTrusted =
+            published.supportTrusted.load(std::memory_order_relaxed) != 0;
+        const uint64_t preparedSerial =
+            published.preparedSerial.load(std::memory_order_relaxed);
         const float q[4] = {
             published.qx.load(std::memory_order_relaxed),
             published.qy.load(std::memory_order_relaxed),
@@ -19731,9 +23000,22 @@ bool VR_GetPresentedReticleAimPose(
         memcpy(outQuat, q, sizeof(q));
         memcpy(outPos, p, sizeof(p));
         outSampleMs = sampleMs;
+        outSupportEpoch = supportEpoch;
+        outSupportTrusted = supportTrusted;
+        outSolveSerial = preparedSerial;
         return true;
     }
     return false;
+}
+
+bool VR_GetPresentedReticleAimPose(
+    float outQuat[4], float outPos[3], uint64_t& outSampleMs)
+{
+    uint64_t supportEpoch = 0;
+    uint64_t solveSerial = 0;
+    bool supportTrusted = false;
+    return VR_GetPresentedReticleAimPoseWithSupportProvenance(outQuat, outPos,
+        outSampleMs, supportEpoch, supportTrusted, solveSerial);
 }
 
 bool VR_GetLeftControllerPose(float outQuat[4], float outPos[3])

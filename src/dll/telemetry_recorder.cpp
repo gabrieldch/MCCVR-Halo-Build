@@ -2,6 +2,8 @@
 
 #include "../common/log.h"
 #include "../common/virtual_stock_diagnostic.h"
+#include "../common/two_hand_input_smoothing.h"
+#include "../common/virtual_stock_settings.h"
 #include "../common/virtual_stock_test_profiles.h"
 
 #include <windows.h>
@@ -930,6 +932,32 @@ namespace
             TelemetryVec3{value.x, value.y, value.z});
     }
 
+    // Fixed T-2 shot payload vector (float[3]): identical finite guard to
+    // AppendVec3, so a non-finite component renders as JSON null instead of
+    // NaN/Infinity. Producers suppress a non-finite final ray instead of
+    // publishing it; this guard is the last-resort wire-safety net.
+    void AppendShotVec3(
+        std::string& output, bool& first, const char* key, const float value[3])
+    {
+        AppendKey(output, first, key);
+        output.push_back('[');
+        AppendFloat(output, value[0]);
+        output.push_back(',');
+        AppendFloat(output, value[1]);
+        output.push_back(',');
+        AppendFloat(output, value[2]);
+        output.push_back(']');
+    }
+
+    // Shot slot/barrel wire value: the fixed record stores
+    // kTelemetryShotIndexUnknown (0xFF) for "the firing context did not carry
+    // it"; the wire contract is -1 so consumers never see the in-memory
+    // sentinel, nor a fabricated 0/1 identity.
+    int32_t ShotIndexWireValue(uint8_t value)
+    {
+        return value == kTelemetryShotIndexUnknown ? -1 : int32_t(value);
+    }
+
     void AppendQuat(
         std::string& output, bool& first, const char* key,
         const TelemetryQuat& value)
@@ -1007,6 +1035,11 @@ namespace
         AppendBoolField(output, nested, "support_grip_pose_enabled", settings.supportGripPoseEnabled);
         AppendBoolField(output, nested, "support_endpoint_used_grip", settings.supportEndpointUsedGrip);
         AppendBoolField(output, nested, "left_handed", settings.leftHanded);
+        AppendFloatField(output, nested, "aim_stabilization", settings.aimStabilization);
+        AppendFloatField(output, nested, "crosshair_distance_m", settings.crosshairDistanceM);
+        AppendFloatField(output, nested, "crosshair_size_deg", settings.crosshairSizeDeg);
+        AppendBoolField(output, nested, "crosshair", settings.crosshair);
+        AppendBoolField(output, nested, "kill_reticle", settings.killReticle);
         output.push_back('}');
     }
 
@@ -1042,6 +1075,11 @@ namespace
         AppendFloatField(output, nested, "a_dot_b", trace.bAgreement);
         AppendBoolField(output, nested, "b_extreme_rejected", trace.bExtremeRejected);
         AppendFloatField(output, nested, "b_rejected_agreement", trace.bRejectedAgreement);
+        // T13 corrective: true when this attempt was accepted by the retained
+        // rule (engaged+trusted persistent grip, Virtual Stock off) after
+        // crossing the legacy 0.35 agreement floor; a_dot_b carries the
+        // crossed value. Additive field: existing consumers read by name.
+        AppendBoolField(output, nested, "b_steering_retained", trace.bSteeringRetained);
         AppendBoolField(output, nested, "hip_blend_attempted", trace.hipBlendAttempted);
         AppendBoolField(output, nested, "hip_blend_succeeded", trace.hipBlendSucceeded);
         AppendBoolField(output, nested, "hip_aim_valid", trace.hipAimValid);
@@ -1263,6 +1301,9 @@ namespace
         AppendFloatField(output, padFirst, "dpadX", frame.pad.dpadX);
         AppendFloatField(output, padFirst, "dpadY", frame.pad.dpadY);
         AppendBoolField(output, padFirst, "exclusiveInput", frame.pad.exclusiveInput);
+        AppendIntegerField(output, padFirst, "weapon_buttons", frame.pad.weaponButtons);
+        AppendIntegerField(output, padFirst, "weapon_pulse_until_ms", frame.pad.weaponPulseUntilMs);
+        AppendIntegerField(output, padFirst, "weapon_generation", frame.pad.weaponGeneration);
         output.push_back('}');
 
         AppendIntegerField(output, first, "test_profile_id", frame.testProfileId);
@@ -1304,6 +1345,159 @@ namespace
             frame.transitionLastPreparedSerial);
         AppendIntegerField(output, first, "transition_applied_serial",
             frame.transitionAppliedSerial);
+        AppendBoolField(output, first,
+            "two_hand_transition_smoothing_configured",
+            frame.twoHandTransitionSmoothingConfigured);
+        AppendBoolField(output, first, "two_hand_transition_active",
+            frame.twoHandTransitionActive);
+        AppendBoolField(output, first, "two_hand_smoothing_configured",
+            frame.twoHandSmoothingConfigured);
+        AppendBoolField(output, first, "two_hand_smoothing_applied",
+            frame.twoHandSmoothingApplied);
+        // The free two-hand product setting the frame's own assembly carried,
+        // recorded beside the VS-OFF smoothing family: it is the offhand
+        // directional authority the free two-hand solver consumes (never read
+        // by Virtual Stock solves), frozen for this prepared serial.
+        AppendFloatField(output, first, "two_hand_offhand_influence",
+            frame.twoHandOffhandInfluence);
+        AppendFloatField(output, first, "two_hand_smoothing_strength",
+            frame.twoHandSmoothingStrength);
+        // The wet/dry mix is a pure function of the same frozen strength, so it
+        // is emitted here rather than stored: strength 0 reads exactly 0 and
+        // strength 25 reads exactly 1.
+        AppendFloatField(output, first, "two_hand_smoothing_mix",
+            two_hand_input_smoothing::StrengthMix(
+                frame.twoHandSmoothingStrength));
+        AppendFloatField(output, first, "two_hand_smoothing_alpha",
+            frame.twoHandSmoothingAlpha);
+        AppendFloatField(output, first,
+            "two_hand_smoothing_primary_orientation_error_deg",
+            frame.twoHandSmoothingPrimaryOrientationErrorDeg);
+        AppendFloatField(output, first,
+            "two_hand_smoothing_primary_position_error_m",
+            frame.twoHandSmoothingPrimaryPositionErrorM);
+        AppendFloatField(output, first,
+            "two_hand_smoothing_support_position_error_m",
+            frame.twoHandSmoothingSupportPositionErrorM);
+        AppendBoolField(output, first, "two_hand_lab_enabled",
+            frame.twoHandLabEnabled);
+        AppendIntegerField(output, first, "two_hand_lab_anchor_requested",
+            frame.twoHandLabAnchorRequested);
+        AppendIntegerField(output, first, "two_hand_lab_anchor_resolved",
+            frame.twoHandLabAnchorResolved);
+        AppendIntegerField(output, first, "two_hand_lab_anchor_fallback",
+            frame.twoHandLabAnchorFallback);
+        AppendFloatField(output, first, "two_hand_lab_offhand_influence",
+            frame.twoHandLabOffhandInfluence);
+        AppendIntegerField(output, first, "two_hand_lab_agreement_mode",
+            frame.twoHandLabAgreementMode);
+        AppendFloatField(output, first, "two_hand_lab_agreement",
+            frame.twoHandLabAgreement);
+        AppendFloatField(output, first, "two_hand_lab_agreement_confidence",
+            frame.twoHandLabAgreementConfidence);
+        AppendFloatField(output, first, "two_hand_lab_effective_influence",
+            frame.twoHandLabEffectiveInfluence);
+        AppendIntegerField(output, first, "two_hand_lab_temporal_mode",
+            frame.twoHandLabTemporalMode);
+        AppendBoolField(output, first, "two_hand_lab_primary_pivot_valid",
+            frame.twoHandLabPrimaryPivotValid);
+        AppendVec3(output, first, "two_hand_lab_primary_pivot",
+            frame.twoHandLabPrimaryPivot);
+        AppendBoolField(output, first, "two_hand_lab_support_pivot_valid",
+            frame.twoHandLabSupportPivotValid);
+        AppendVec3(output, first, "two_hand_lab_support_pivot",
+            frame.twoHandLabSupportPivot);
+        AppendBoolField(output, first,
+            "two_hand_lab_stateless_direction_valid",
+            frame.twoHandLabStatelessDirectionValid);
+        AppendVec3(output, first, "two_hand_lab_stateless_direction",
+            frame.twoHandLabStatelessDirection);
+        AppendBoolField(output, first,
+            "two_hand_lab_presented_direction_valid",
+            frame.twoHandLabPresentedDirectionValid);
+        AppendVec3(output, first, "two_hand_lab_presented_direction",
+            frame.twoHandLabPresentedDirection);
+        AppendBoolField(output, first, "two_hand_lab_temporal_active",
+            frame.twoHandLabTemporalActive);
+        AppendFloatField(output, first, "two_hand_lab_temporal_error_deg",
+            frame.twoHandLabTemporalErrorDeg);
+        AppendBoolField(output, first, "presented_aim_valid",
+            frame.presentedAimValid);
+        AppendVec3(output, first, "presented_aim_forward",
+            frame.presentedAimForward);
+        AppendBoolField(output, first, "reticle_presented_valid",
+            frame.reticlePresentedValid);
+        AppendIntegerField(output, first, "reticle_presented_serial",
+            frame.reticlePresentedSerial);
+        AppendIntegerField(output, first, "reticle_presented_sample_ms",
+            frame.reticlePresentedSampleMs);
+        AppendIntegerField(output, first, "reticle_presented_support_epoch",
+            frame.reticlePresentedSupportEpoch);
+        AppendBoolField(output, first, "reticle_presented_support_trusted",
+            frame.reticlePresentedSupportTrusted);
+        AppendQuat(output, first, "reticle_presented_orientation",
+            frame.reticlePresentedOrientation);
+        AppendVec3(output, first, "reticle_presented_position",
+            frame.reticlePresentedPosition);
+        AppendBoolField(output, first, "engine_aim_valid",
+            frame.engineAimValid);
+        AppendIntegerField(output, first, "engine_aim_source",
+            frame.engineAimSource);
+        AppendVec3(output, first, "engine_aim_forward",
+            frame.engineAimForward);
+        AppendIntegerField(output, first, "engine_aim_serial",
+            frame.engineAimSerial);
+        AppendIntegerField(output, first, "engine_aim_sample_ms",
+            frame.engineAimSampleMs);
+        AppendBoolField(output, first, "engine_aim_pitch_valid",
+            frame.engineAimPitchValid);
+        AppendFloatField(output, first, "engine_aim_pitch_deg",
+            frame.engineAimPitchDeg);
+        AppendBoolField(output, first, "engine_camera_base_valid",
+            frame.engineCameraBaseValid);
+        AppendVec3(output, first, "engine_camera_base_position",
+            frame.engineCameraBasePosition);
+        AppendBoolField(output, first, "engine_camera_eye_valid",
+            frame.engineCameraEyeValid);
+        AppendVec3(output, first, "engine_camera_eye_position",
+            frame.engineCameraEyePosition);
+        AppendIntegerField(output, first, "engine_camera_source",
+            frame.engineCameraSource);
+        AppendIntegerField(output, first, "engine_camera_serial",
+            frame.engineCameraSerial);
+        AppendBoolField(output, first, "world_scale_valid",
+            frame.worldScaleValid);
+        AppendFloatField(output, first, "world_scale",
+            frame.worldScale);
+        AppendBoolField(output, first, "dual_active",
+            frame.dualActive);
+        // Persistent support grip (PG) frozen solve-time provenance. All eight
+        // fields are always emitted by a current recorder; a legacy recording
+        // simply lacks the keys (absence is unambiguous, never a fabricated
+        // zero). Semantics: configured/applicable are this frame's config knob
+        // and the pure title gate; readable/engaged/epoch/trusted/forceOneHand
+        // are the frame-local assembly qualification (support_solve_trusted is
+        // the PERMISSION bit, before any consumption narrowing); epoch is a
+        // plain integer so the 2^64-1 "unreadable" sentinel survives the wire;
+        // support_solve_serial is the assembly's stamped solve serial (the last
+        // published prepared serial at capture, normally prepared_serial - 1,
+        // never asserted equal to it).
+        AppendBoolField(output, first, "persistent_support_grip_configured",
+            frame.persistentSupportGripConfigured);
+        AppendBoolField(output, first, "persistent_support_grip_applicable",
+            frame.persistentSupportGripApplicable);
+        AppendBoolField(output, first, "support_relationship_readable",
+            frame.supportRelationshipReadable);
+        AppendBoolField(output, first, "support_relationship_engaged",
+            frame.supportRelationshipEngaged);
+        AppendIntegerField(output, first, "support_epoch",
+            frame.supportEpoch);
+        AppendBoolField(output, first, "support_solve_trusted",
+            frame.supportSolveTrusted);
+        AppendBoolField(output, first, "support_force_one_hand",
+            frame.supportForceOneHand);
+        AppendIntegerField(output, first, "support_solve_serial",
+            frame.supportSolveSerial);
         AppendControl(output, first, "cf_vs_off", frame.cfVsOff);
         AppendControl(output, first, "cf_fixed_head", frame.cfFixedHead);
         AppendControl(output, first, "cf_fixed_shoulder", frame.cfFixedShoulder);
@@ -1350,9 +1544,32 @@ namespace
         AppendStringField(output, first, "stereo_views",
             "xrLocateViews results in LOCAL at the same predicted display time");
         AppendStringField(output, first, "support_grip_endpoint",
-            "position-only grip-action locate, semantically routed to support");
+            "position-only grip-action locate, semantically routed to support, and the sample the support-endpoint selector may select for semantic_support_endpoint; support_endpoint_used_grip reports which source that selector chose for the Virtual Stock support endpoint (\"Reduce Support-Hand Rotation\") and for the Two-Hand Lab Production anchor pass-through. This selection is provenance for those VS/Lab paths only, never a consumption receipt for the free two-hand product geometry: with Virtual Stock off (and the Lab inactive) the two-hand solve consumes the fixed primary-Grip -> support-Grip positional pair reported by support_grip_position / semantic_primary_grip_position and does not read this selection at all");
         AppendStringField(output, first, "semantic_grip_positions",
             "position-only OpenXR grip-action locates in LOCAL at controller sample time, routed through MCC semantic primary/support handedness roles; each position is valid only when its corresponding validity flag is true");
+        AppendStringField(output, first, "frame_field_domains",
+            "presented_aim_forward, reticle_presented_orientation/position, canonical_aim and all semantic/physical/grip/head/view fields are OpenXR LOCAL metres (right-handed, +Y up, -Z forward); engine_aim_forward, engine_camera_base_position and engine_camera_eye_position are ENGINE-WORLD Blam Z-up world units, never OpenXR LOCAL");
+        AppendStringField(output, first, "engine_world_axes",
+            "Blam Z-up; an engine-world forward is (cos p cos y, cos p sin y, sin p) for pitch p and yaw y");
+        AppendStringField(output, first, "engine_world_scale_authority",
+            "world_scale is engine world units per metre under the active title's authority: Halo 3/Halo 4 read live g_worldScale; Reach/ODST/Halo 2 record their fixed 1/3.048 constants; any other title records invalid");
+        AppendStringField(output, first, "engine_aim_sources",
+            "engine_aim_source: 0 None (no publication, e.g. Halo CE), 1 Halo 3 shared g_aimFwd, 2 ODST shared g_aimFwd, 3 Reach seated native unit aim, 4 Reach seated compact fallback, 5 Reach on-foot shared compact fallback, 6 Halo 4 stereo-transaction observer, 7 Halo 2 observer stock, 8 Halo 2 absent; serial 0 means latest-only with no serial; sampleMs 0 means none; engine_aim_pitch_deg is degrees and is valid only for Halo 4; Halo 4's serial may differ from its payload by one writer iteration (treat serial +/-1), so never assert an exact engine_aim_serial-to-payload pairing for source 6");
+        AppendStringField(output, first, "engine_camera_sources",
+            "engine_camera_source: 0 None, 1 Halo 3 shared g_baseCam/g_cam, 2 ODST shared g_baseCam/g_cam, 3 Reach completed-frame eye, 4 Halo 2 observer stock, 5 Halo 4 absent (the stereo transaction published no usable camera position this frame; the read is unavailable before the first owned frame and after teardown), 6 Halo 4 stereo-transaction observer stock position; base is the pre-lean origin, eye the rendered camera; engine_camera_serial carries the publication serial where one exists (Reach preparedSerial, Halo 2 observer serial, Halo 4 stock camera serial), else 0");
+        AppendStringField(output, first, "shot_event_semantics",
+            "kind=shot sparse events carry the FINAL ray the engine consumed after the title's own aim call and after any substitution; shot_direction [0,0,0] means the producer's firing call-site carries no direction (ODST's firing-origin hook), never a fabricated one; shot_engine_aim_source uses the engine_aim_source ordinals (0 none, 1 Halo 3 shared, 2 ODST shared, 3/4 Reach seated unit/compact, 5 Reach on-foot compact, 6 Halo 4 observer, 7/8 Halo 2) and 0 (or 8, Halo 2 absent) means no engine aim snapshot was available for that shot (shot_engine_aim is then exactly zero); shot_slot/shot_barrel -1 means the firing context did not carry them, never a fabricated identity");
+        AppendStringField(output, first, "reticle_presented_lag",
+            "capture runs BEFORE the reticle block publishes in the same frame, so reticle_presented_* is normally the PREVIOUS serial's consumer-visible pose; its own serial travels in reticle_presented_serial and must never be asserted equal to prepared_serial");
+        AppendStringField(output, first, "dual_slot_semantics",
+            "dual_active is the shared SecondaryWeaponPresentationActive predicate (dual-weapon presentation eligible this frame); per-shot slot identity travels in the sparse shot event (kind=shot), never in this frame field");
+        AppendStringField(output, first, "persistent_support_grip_provenance",
+            "the persistent_support_grip_configured/applicable and support_* fields are FROZEN solve-time provenance for this frame's own canonical assembly, never a live re-read of persistent-grip state: persistent_support_grip_configured is the config knob read for the frame, persistent_support_grip_applicable is the pure title applicability gate for the active title, support_relationship_readable/engaged/support_epoch are the assembly's frozen relationship qualification (epoch 0 = coherently disengaged, all-ones 18446744073709551615 = the relationship could not be read; an unreadable relationship is NOT a disengaged one and epochs must never be compared across sessions), support_solve_trusted is the qualification PERMISSION (this invocation proved the relationship owner; whether the solve actually consumed support geometry is a separate, unrecorded narrowing), support_force_one_hand is EXPLICIT persistent-grip forcing of this invocation to the one-hand path and is distinct from an ordinary two_hand_enabled false (which conflates config-off, dual presentation and forcing), and support_solve_serial is the solve serial the assembly stamped: at capture it is the last published prepared serial, normally prepared_serial minus one, and must never be asserted equal to prepared_serial");
+        AppendStringField(output, first, "two_hand_smoothing_provenance",
+            "two_hand_smoothing_configured means the user strength for this frame was non-zero; two_hand_smoothing_applied means this prepared frame's eligible VS-OFF free two-hand path actually consumed it; two_hand_smoothing_strength is the user amount in 0..25 (0 = raw/off controller input, 25 = the full fixed Pavlov-inspired speed-25 input filter) FROZEN for this prepared serial and never a live re-read of the config slider; two_hand_smoothing_mix is strength/25 in [0,1] emitted from that same frozen strength (the applied wet/dry amount, never a filter speed); two_hand_smoothing_alpha is the filter's INTERNAL clamp(25*dt,0,1) temporal coefficient and is never the user amount; the two_hand_smoothing_*_error_* values are raw-to-FULL-filtered input differences, never solver or presented-aim errors");
+        AppendStringField(output, first,
+            "two_hand_offhand_influence_provenance",
+            "two_hand_offhand_influence is the free two-hand (Virtual-Stock-off) offhand directional authority in 0..1 FROZEN for this prepared serial from the frame-local assembly the solve consumed (non-finite reads 0, otherwise clamped to [0,1] exactly as the solver consumes it), never a live re-read of the config slider; 0 = the primary controller's own directional aim is authoritative, 1 = the accepted support direction owns presentation, and zero authority never decides whether the weapon is logically held (acceptance and two_hand_active stay the solved semantics); Virtual Stock solves never read this product value and a Lab-active solve consumes its own two_hand_lab_offhand_influence instead");
 
         AppendKey(output, first, "test_profile_enum_mapping");
         output.push_back('[');
@@ -1439,6 +1656,7 @@ namespace
         case WeaponOrderEventKind::CaptureProbeResult: return "capture_probe_result";
         case WeaponOrderEventKind::FpEntry: return "fp_entry";
         case WeaponOrderEventKind::FpWeaponCommit: return "fp_weapon_commit";
+        case WeaponOrderEventKind::Shot: return "shot";
         default: return "unknown";
         }
     }
@@ -1486,6 +1704,26 @@ namespace
             event.primaryWeapon);
         AppendIntegerField(output, first, "aux0", event.aux0);
         AppendIntegerField(output, first, "aux1", event.aux1);
+        // Fixed T-2 shot payload: emitted ONLY for kind Shot so every
+        // existing kind serializes byte-for-byte as before. Vectors use the
+        // shared finite guard (non-finite renders as null).
+        if (event.kind == static_cast<uint8_t>(WeaponOrderEventKind::Shot))
+        {
+            AppendShotVec3(output, first, "shot_origin", event.shotOrigin);
+            AppendShotVec3(output, first, "shot_direction",
+                event.shotDirection);
+            AppendShotVec3(output, first, "shot_engine_aim",
+                event.shotEngineAim);
+            AppendShotVec3(output, first, "shot_reticle_direction",
+                event.shotReticleDirection);
+            AppendIntegerField(output, first, "shot_slot",
+                ShotIndexWireValue(event.shotSlot));
+            AppendIntegerField(output, first, "shot_barrel",
+                ShotIndexWireValue(event.shotBarrel));
+            AppendIntegerField(output, first, "shot_flags", event.shotFlags);
+            AppendIntegerField(output, first, "shot_engine_aim_source",
+                event.shotEngineAimSource);
+        }
         output.push_back('}');
     }
 
@@ -2337,10 +2575,8 @@ uint64_t Telemetry_CurrentSessionToken() noexcept
     return (admission & uint64_t{1}) ? (admission >> 1) : 0;
 }
 
-uint64_t Telemetry_PublishWeaponEvent(uint8_t kind, uint8_t status,
-    uint8_t title, uint32_t titleGeneration, uint64_t preparedSerial,
-    uint32_t controlledUnit, uint32_t primaryWeapon, uint64_t aux0,
-    uint64_t aux1) noexcept
+static uint64_t PublishWeaponEventRecord(
+    const TelemetryWeaponEvent& fields) noexcept
 {
     // Hot path: one admission load while recording is off, then return with
     // zero diagnostic work performed.
@@ -2407,20 +2643,11 @@ uint64_t Telemetry_PublishWeaponEvent(uint8_t kind, uint8_t status,
             Sleep(0);
     }
 #endif
-    TelemetryWeaponEvent record{};
+    TelemetryWeaponEvent record = fields;
     record.sequence = sequence;
     record.session = admission >> 1;
     record.timestampQpc = now.QuadPart;
     record.threadId = GetCurrentThreadId();
-    record.kind = kind;
-    record.status = status;
-    record.title = title;
-    record.titleGeneration = titleGeneration;
-    record.preparedSerial = preparedSerial;
-    record.controlledUnit = controlledUnit;
-    record.primaryWeapon = primaryWeapon;
-    record.aux0 = aux0;
-    record.aux1 = aux1;
     record.tearGuard = sequence;
     WeaponEventSlot& slot = WeaponEventSlotFor(sequence);
     // Plain payload stores first; the release-store of the dedicated marker
@@ -2431,6 +2658,52 @@ uint64_t Telemetry_PublishWeaponEvent(uint8_t kind, uint8_t status,
     g_weaponEventEnqueued.fetch_add(1, std::memory_order_relaxed);
     g_weaponEventProducersInFlight.fetch_sub(1, std::memory_order_seq_cst);
     return sequence;
+}
+
+uint64_t Telemetry_PublishWeaponEvent(uint8_t kind, uint8_t status,
+    uint8_t title, uint32_t titleGeneration, uint64_t preparedSerial,
+    uint32_t controlledUnit, uint32_t primaryWeapon, uint64_t aux0,
+    uint64_t aux1) noexcept
+{
+    TelemetryWeaponEvent fields{};
+    fields.kind = kind;
+    fields.status = status;
+    fields.title = title;
+    fields.titleGeneration = titleGeneration;
+    fields.preparedSerial = preparedSerial;
+    fields.controlledUnit = controlledUnit;
+    fields.primaryWeapon = primaryWeapon;
+    fields.aux0 = aux0;
+    fields.aux1 = aux1;
+    return PublishWeaponEventRecord(fields);
+}
+
+uint64_t Telemetry_PublishShotEvent(uint8_t status, uint8_t title,
+    uint32_t titleGeneration, uint64_t preparedSerial, uint32_t controlledUnit,
+    uint32_t primaryWeapon, const TelemetryShotPayload& shot) noexcept
+{
+    TelemetryWeaponEvent fields{};
+    fields.kind = static_cast<uint8_t>(WeaponOrderEventKind::Shot);
+    fields.status = status;
+    fields.title = title;
+    fields.titleGeneration = titleGeneration;
+    fields.preparedSerial = preparedSerial;
+    fields.controlledUnit = controlledUnit;
+    fields.primaryWeapon = primaryWeapon;
+    fields.aux0 = 0;
+    fields.aux1 = 0;
+    std::memcpy(fields.shotOrigin, shot.origin, sizeof(fields.shotOrigin));
+    std::memcpy(fields.shotDirection, shot.direction,
+        sizeof(fields.shotDirection));
+    std::memcpy(fields.shotEngineAim, shot.engineAim,
+        sizeof(fields.shotEngineAim));
+    std::memcpy(fields.shotReticleDirection, shot.reticleDirection,
+        sizeof(fields.shotReticleDirection));
+    fields.shotSlot = shot.slot;
+    fields.shotBarrel = shot.barrel;
+    fields.shotFlags = shot.flags;
+    fields.shotEngineAimSource = shot.engineAimSource;
+    return PublishWeaponEventRecord(fields);
 }
 
 TelemetryWeaponEventCounters Telemetry_GetWeaponEventCounters() noexcept

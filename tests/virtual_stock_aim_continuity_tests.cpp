@@ -169,6 +169,13 @@ struct Rig
     uint64_t serial = 0;
     bool latched = false;
     bool owns = false;
+    bool stockOwnershipEdgesEnabled = true;
+    // The live caller derives the ownership edge as
+    // virtualStockEnabled && the same-frame stock solve owning presentation
+    // (src/dll/virtual_stock_aim_continuity_runtime.inl). Modelling the
+    // Virtual Stock term explicitly lets the VS-OFF product path prove that
+    // the solver's own steering verdicts cannot reach this edge source.
+    bool virtualStockEnabled = true;
     bool liveValid = true;
     Quat4 live = StockLive();
     bool oneHandValid = true;
@@ -183,7 +190,8 @@ struct Rig
         input.preparedSerial = serial;
         input.dtSeconds = dt;
         input.latched = latched;
-        input.stockSolveOwnsPresentation = owns;
+        input.stockSolveOwnsPresentation =
+            stockOwnershipEdgesEnabled && virtualStockEnabled && owns;
         input.liveOrientationValid = liveValid;
         input.liveOrientation = live;
         input.oneHandOrientationValid = oneHandValid;
@@ -552,6 +560,119 @@ void TestOwnershipEdgesWithoutLatchChange(TestContext& test)
         "ownership leaving stock is a release edge");
     test.CheckAngle(rig.Presented(), presentedBeforeRelease,
         "ownership release does not snap", 0.001f);
+}
+
+void TestLatchOnlyFreeAimIgnoresOwnershipChanges(TestContext& test)
+{
+    Rig rig;
+    rig.stockOwnershipEdgesEnabled = false;
+    rig.Advance(); // unlatched baseline
+    rig.latched = true;
+    rig.live = StockLive();
+    rig.oneHand = OneHandLive();
+    rig.Advance();
+    test.Check(rig.Diag().active &&
+            rig.Diag().edge_kind == AimContinuityEdgeKind::Grab,
+        "VS-OFF product transition starts only from the durable latch edge");
+
+    rig.Advance();
+    const float elapsedBeforeOwnershipChange = rig.state.elapsedSeconds;
+    const Quat4 originalSeed = rig.state.initialCorrection;
+    rig.owns = true;
+    rig.Advance();
+    test.Check(rig.Diag().active &&
+            rig.Diag().edge_kind == AimContinuityEdgeKind::Grab &&
+            rig.state.elapsedSeconds > elapsedBeforeOwnershipChange &&
+            SameQuat(rig.state.initialCorrection, originalSeed),
+        "VS-OFF stock/B ownership changes advance the existing ease without reseeding it");
+
+    rig.latched = false;
+    rig.live = OneHandLive();
+    rig.oneHand = rig.live;
+    rig.Advance();
+    test.Check(rig.Diag().active &&
+            rig.Diag().edge_kind == AimContinuityEdgeKind::Release &&
+            rig.Diag().phase == AimContinuityPhase::Release,
+        "VS-OFF release remains owned by the latch edge");
+}
+
+// ---------------------------------------------------------------------------
+// 5b. VS-OFF: support-agreement floor crossings and persistent-grip retained
+// steering cannot restart the running latch-edge ease.
+// ---------------------------------------------------------------------------
+void TestVsOffAgreementFloorCrossingsDoNotRestartContinuity(TestContext& test)
+{
+    // The live caller derives the ownership edge from
+    // virtualStockEnabled && the same-frame stock solve owning presentation
+    // (src/dll/virtual_stock_aim_continuity_runtime.inl). On the VS-OFF
+    // product path that term is structurally false, so the support-agreement
+    // verdict crossing the legacy 0.35 floor - accepted, rejected, accepted
+    // while persistent-grip retention keeps steering - can flip the solver's
+    // own steering without ever producing a continuity ownership edge.
+    Rig rig;
+    rig.stockOwnershipEdgesEnabled = true;
+    rig.virtualStockEnabled = false;
+    rig.Advance(); // baseline
+    rig.latched = true;
+    rig.owns = false;
+    rig.Advance(); // the durable latch edge
+    const auto seeded = rig.Diag();
+    test.Check(seeded.active && seeded.edge_kind == AimContinuityEdgeKind::Grab,
+        "the VS-OFF latch edge seeds the acquire ease");
+
+    const Quat4 seedCorrection = rig.state.initialCorrection;
+    float previousRemaining =
+        virtual_stock::Quat4AngleDegrees(rig.Presented(), rig.live);
+    test.Check(previousRemaining > 5.0f,
+        "the VS-OFF ease carries a real offset before the floor crossings");
+    for (int frame = 0; frame < 12; ++frame)
+    {
+        // Cross the floor both ways on consecutive frames: the caller-side
+        // ownership term would flip if Virtual Stock were on.
+        rig.owns = (frame % 2) == 0;
+        rig.Advance();
+        const auto diagnostics = rig.Diag();
+        const float remaining =
+            virtual_stock::Quat4AngleDegrees(rig.Presented(), rig.live);
+        test.Check(diagnostics.active &&
+                diagnostics.edge_kind == AimContinuityEdgeKind::Grab,
+            "a .35 agreement-floor crossing advances the running VS-OFF ease");
+        test.Check(SameQuat(rig.state.initialCorrection, seedCorrection),
+            "a .35 agreement-floor crossing never reseeds the running ease");
+        test.Check(rig.state.elapsedSeconds > 0.0f,
+            ".35 crossings never reset the VS-OFF ease clock");
+        test.Check(remaining <= previousRemaining + 1.0e-3f,
+            "the VS-OFF presented-to-live angle never increases across .35 crossings");
+        previousRemaining = remaining;
+    }
+    rig.owns = true; // one more retained-steering frame at the ease completion
+    rig.Advance();
+    test.Check(!rig.state.active &&
+            virtual_stock::Quat4AngleDegrees(rig.Presented(), rig.live) < 1.0e-3f,
+        "the VS-OFF latch-edge ease still reaches the live aim on schedule "
+        "across .35 crossings");
+
+    // Non-vacuity: the identical ownership flip is a real edge source when the
+    // same caller runs with Virtual Stock on - it restarts the ease from the
+    // currently presented aim (clock and seed reset), which is exactly what
+    // must not happen on the VS-OFF product path.
+    Rig stock;
+    stock.stockOwnershipEdgesEnabled = true;
+    stock.virtualStockEnabled = true;
+    stock.Advance(); // baseline
+    stock.latched = true;
+    stock.owns = false;
+    stock.Advance(); // latch edge
+    for (int frame = 0; frame < 3; ++frame)
+        stock.Advance();
+    test.Check(stock.state.elapsedSeconds > 0.0f,
+        "the VS-on fixture has advanced its ease before the ownership flip");
+    stock.owns = true; // the term the VS-OFF caller can never set
+    stock.Advance();
+    test.Check(stock.state.elapsedSeconds == 0.0f &&
+            stock.state.active &&
+            stock.state.edgeKind == AimContinuityEdgeKind::Grab,
+        "the same ownership flip reseeds the ease when Virtual Stock is on");
 }
 
 void TestReleaseWinsWhenBothEdgesCoincide(TestContext& test)
@@ -995,6 +1116,8 @@ int main()
     TestReleaseFixedEase(test);
     TestMovingLiveTargetDuringRelease(test);
     TestOwnershipEdgesWithoutLatchChange(test);
+    TestLatchOnlyFreeAimIgnoresOwnershipChanges(test);
+    TestVsOffAgreementFloorCrossingsDoNotRestartContinuity(test);
     TestReleaseWinsWhenBothEdgesCoincide(test);
     TestRapidReleaseRegrab(test);
     TestReentrantWithoutCallerAnchor(test);

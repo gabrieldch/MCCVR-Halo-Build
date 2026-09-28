@@ -27,9 +27,9 @@ $steamExeName = 'MCC-Win64-Shipping.exe'
 $storeExeName = 'MCCWinStore-Win64-Shipping.exe'
 $analyserManifestPath = 'TelemetryAnalyser/analyse_mccvr_telemetry.py'
 $analyserRelativePath = 'TelemetryAnalyser\analyse_mccvr_telemetry.py'
-$expectedAnalyserBytes = 312031
+$expectedAnalyserBytes = 395283
 $expectedAnalyserHash =
-    '73945DB9971D63B0F688EFFCBCB433B266C262800757291E8CE8ACB896B4D722'
+    '053CF61671BE281551B89A459E0611490F29D0FFD00387B43668043793BAE5B4'
 
 function Get-Sha256([string]$Path) {
     return (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.ToUpperInvariant()

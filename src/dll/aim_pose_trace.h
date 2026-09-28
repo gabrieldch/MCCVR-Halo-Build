@@ -3,6 +3,8 @@
 #include <cstdint>
 #include <type_traits>
 
+#include "../common/two_hand_lab_logic.h"
+
 enum class AimSolverPath : uint8_t
 {
     None = 0,
@@ -49,6 +51,14 @@ struct AimPoseTrace
     float bAgreement = 0.0f;
     bool bExtremeRejected = false;
     float bRejectedAgreement = 0.0f;
+    // Persistent support grip corrective (T13). True only when this exact
+    // attempt was accepted BY THE RETAINED RULE: the primary -> support
+    // agreement crossed below the legacy 0.35 floor and the engaged+trusted
+    // qualification retained the support direction anyway. `bAgreement`
+    // carries that crossed floor value; `bExtremeRejected` keeps its meaning
+    // ("this attempt was rejected by the floor") and therefore stays false
+    // whenever an attempt is accepted, retained or not.
+    bool bSteeringRetained = false;
 
     bool hipBlendAttempted = false;
     bool hipBlendSucceeded = false;
@@ -133,6 +143,13 @@ struct AimPoseTrace
     float fixedConfiguredStrength = 0.0f;
     float fixedEffectiveStrength = 0.0f;
     bool fixedDirectionValid = false;
+    // Two-Hand Lab diagnostics (tranche 2A). Filled ONLY when the Lab is
+    // active for that solve (Lab stored-enabled AND resolved Virtual Stock
+    // OFF); otherwise labValid stays false and lab keeps defaults. Never
+    // serialized to telemetry in this tranche. two_hand_lab::Diagnostics is
+    // plain POD, so the trivially-copyable contract below still holds.
+    bool labValid = false;
+    two_hand_lab::Diagnostics lab{};
 };
 
 static_assert(std::is_trivially_copyable_v<AimPoseTrace>);
