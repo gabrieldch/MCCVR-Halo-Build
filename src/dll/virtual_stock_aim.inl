@@ -481,9 +481,17 @@
         // endpoint pair. Base position stays the primary controller
         // throughout: only result.pose.orientation is reassigned below,
         // never result.pose.position.
+        //
+        // 2026-09-29 Two-Hand Smoothing scope: the prepared smoothed copies
+        // feed this solve with Virtual Stock ON or OFF (one eligibility rule,
+        // both stock modes; see vr.cpp). What stays VS-OFF only is the product
+        // Grip -> Grip geometry and the Two-Handed Lab below - their own
+        // `!inputs.virtualStockEnabled` gates are unchanged. The smoothed
+        // support copy is still selected by the RAW-derived
+        // `supportEndpointUsedGrip` correspondence, never re-derived from the
+        // smoothed copies.
         const bool filteredGeometry = inputs.twoHandSmoothingGeometryValid &&
-            !inputs.virtualStockEnabled && inputs.twoHandEnabled &&
-            inputs.twoHandLatched && inputs.leftValid;
+            inputs.twoHandEnabled && inputs.twoHandLatched && inputs.leftValid;
         const XrVector3f supportEndpoint = filteredGeometry
             ? (inputs.supportEndpointUsedGrip &&
                     inputs.twoHandSmoothedSupportGripValid

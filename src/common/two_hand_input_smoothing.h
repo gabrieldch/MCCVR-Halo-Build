@@ -1,13 +1,15 @@
 #pragma once
-// Pavlov-inspired controller-input smoothing for VS-OFF two-hand aim.
+// Pavlov-inspired controller-input smoothing for two-hand aim (Virtual Stock
+// on or off).
 // The temporal filter is FIXED: one speed-25 delta-time response, quaternion-
 // native (shortest-arc SLERP). The user-facing strength (0..25) is a wet/dry
 // mix over that unchanged full-filter output, never an interpolation speed:
 // 0 emits raw input untouched, 25 emits the full-filtered result untouched,
 // and intermediate values stay between them. Both endpoints are exact.
 // This filters copies of the directional solve geometry only: no OpenXR pose,
-// latch/acquisition sample, one-hand aim, weapon base position, or Virtual
-// Stock input is mutated.
+// latch/acquisition sample, one-hand aim, weapon base position, or raw Virtual
+// Stock input is mutated. The VS-OFF-only product geometry and Lab keep their
+// own gates; a VS-ON solve consumes the same directional copies.
 #include <algorithm>
 #include <cmath>
 #include <cstdint>

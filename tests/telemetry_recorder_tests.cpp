@@ -352,7 +352,7 @@ TelemetryFrame EvidenceFrame(uint64_t serial)
     frame.transitionLastPreparedSerial = serial;
     frame.transitionAppliedSerial = serial;
     // Free two-hand (VS-OFF) product offhand directional authority: the frozen
-    // assembly value recorded beside the VS-OFF smoothing family.
+    // assembly value recorded beside the input-smoothing family.
     frame.twoHandOffhandInfluence = 0.5f;
     // Two-Hand Lab family: an enabled GG-100 Soft-authority Constant-damping
     // frame, coherent by construction (effective == requested at full

@@ -2603,8 +2603,9 @@ void ConfigSave()
     fprintf(f, "persistent_support_grip = %d\n\n", g_config.persistent_support_grip ? 1 : 0);
     fprintf(f, "# Pavlov-inspired controller-input smoothing strength: 0 = off/raw controller\n");
     fprintf(f, "# input; 25 = the full fixed speed-25 quaternion-native filter; values between\n");
-    fprintf(f, "# wet/dry mix the filtered directional input copies over raw. VS-OFF free\n");
-    fprintf(f, "# two-hand aiming only; Virtual Stock is unaffected.\n");
+    fprintf(f, "# wet/dry mix the filtered directional input copies over raw. Two-handed aim\n");
+    fprintf(f, "# with Virtual Stock on or off; raw poses and the weapon/base position are\n");
+    fprintf(f, "# never smoothed.\n");
     fprintf(f, "# (default %.2f, range %.2f to %.2f)\n",
         d.two_hand_smoothing_strength,
         kTwoHandSmoothingStrengthMinimum,

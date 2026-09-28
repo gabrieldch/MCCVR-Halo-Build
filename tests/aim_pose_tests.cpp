@@ -763,12 +763,47 @@ void TestTwoHandInputSmoothing()
     Check(ExactAimResult(ComputeAimPose(oneHand), ComputeAimPose(rawOneHand)),
         "one-handed aiming ignores prepared smoother copies exactly");
 
-    AimPoseInputs stockOn = filteredInputs;
-    stockOn.virtualStockEnabled = true;
-    AimPoseInputs stockOnRaw = rawInputs;
-    stockOnRaw.virtualStockEnabled = true;
-    Check(ExactAimResult(ComputeAimPose(stockOn), ComputeAimPose(stockOnRaw)),
-        "Virtual Stock output is identical with smoothing input copies present or absent");
+    // (a2) Virtual Stock consumption contract (2026-09-29 Two-Hand Smoothing
+    // scope): the prepared smoothed copies now feed the VS-ON solve too. With
+    // the packet absent (`twoHandSmoothingGeometryValid` false, which is what
+    // strength 0 publishes) the VS solve must stay bit-identical to raw even
+    // with hostile copies present; with the packet present the same fixture
+    // must be a real presentation differential, with the base position (and
+    // the raw-derived support-endpoint correspondence) still raw.
+    {
+        AimPoseInputs stockRaw = rawInputs;
+        stockRaw.virtualStockEnabled = true;
+        const AimPoseResult stockRawResult = ComputeAimPose(stockRaw);
+        Check(stockRawResult.valid && stockRawResult.twoHandActive,
+            "the Virtual Stock smoothing fixture is a valid stock solve");
+        AimPoseInputs stockAbsent = stockRaw;
+        stockAbsent.twoHandSmoothingGeometryValid = false;
+        stockAbsent.twoHandSmoothedPrimaryOrientation = {
+            std::numeric_limits<float>::quiet_NaN(),
+            std::numeric_limits<float>::quiet_NaN(),
+            std::numeric_limits<float>::quiet_NaN(),
+            std::numeric_limits<float>::quiet_NaN()};
+        stockAbsent.twoHandSmoothedPrimaryAimPosition = {
+            std::numeric_limits<float>::infinity(), 0.0f, 0.0f};
+        stockAbsent.twoHandSmoothedSupportAimPosition = {
+            0.0f, -std::numeric_limits<float>::infinity(), 0.0f};
+        stockAbsent.twoHandSmoothedPrimaryGripValid = true;
+        stockAbsent.twoHandSmoothedPrimaryGripPosition = {
+            std::numeric_limits<float>::quiet_NaN(), 0.0f, 0.0f};
+        stockAbsent.twoHandSmoothedSupportGripValid = true;
+        stockAbsent.twoHandSmoothedSupportGripPosition = {
+            0.0f, 0.0f, std::numeric_limits<float>::quiet_NaN()};
+        Check(ExactAimResult(ComputeAimPose(stockAbsent), stockRawResult),
+            "Virtual Stock at smoothing strength 0 (packet absent) stays byte-identical to raw and ignores hostile copies");
+        AimPoseInputs stockOn = filteredInputs;
+        stockOn.virtualStockEnabled = true;
+        const AimPoseResult stockOnResult = ComputeAimPose(stockOn);
+        Check(stockOnResult.valid && stockOnResult.twoHandActive &&
+                !ExactAimResult(stockOnResult, stockRawResult) &&
+                SamePosition(stockOnResult.pose.position,
+                    stockRaw.right.position),
+            "Virtual Stock at smoothing strength > 0 consumes the smoothed copies as a real differential while the base position stays raw");
+    }
 
     AimPoseInputs labGG = filteredInputs;
     labGG.twoHandLabEnabled = true;
@@ -1270,10 +1305,12 @@ void TestTwoHandInputSmoothingStrength()
             "a sign-flipped (same-rotation) filtered quaternion blends without a 360-degree excursion");
     }
 
-    // --- Consumer isolation: the strength changes only the already-existing
-    // filtered directional input copies reaching the VS-OFF free two-hand
-    // solve. Virtual Stock Standard (centre) and Plus are untouched at both
-    // endpoints, and the weapon/base position stays raw.
+    // --- Consumer scope (2026-09-29): the strength changes only the
+    // already-existing filtered directional input copies reaching the two-hand
+    // solve, with Virtual Stock on or off. Virtual Stock Standard (rear
+    // reference 0) and Plus (rear reference 3) stay byte-identical at strength
+    // 0 / packet absent and are a real differential at strength 25, and the
+    // weapon/base position stays raw on both.
     {
         AimPoseInputs rawInputs = EquivalenceInputs();
         rawInputs.virtualStockEnabled = false;
@@ -1305,14 +1342,37 @@ void TestTwoHandInputSmoothingStrength()
 
         for (int rearReference : {0, 3})
         {
-            AimPoseInputs stockZero = rawInputs;
-            stockZero.virtualStockEnabled = true;
-            stockZero.virtualStockRearReference = rearReference;
+            AimPoseInputs stockRaw = rawInputs;
+            stockRaw.virtualStockEnabled = true;
+            stockRaw.virtualStockRearReference = rearReference;
+            const AimPoseResult stockRawResult = ComputeAimPose(stockRaw);
+            Check(stockRawResult.valid && stockRawResult.twoHandActive,
+                "the Virtual Stock endpoint fixture is a valid stock solve");
+            // Strength 0 / packet absent: the flag is false, so even hostile
+            // copies must be ignored exactly.
+            AimPoseInputs stockAbsent = stockRaw;
+            stockAbsent.twoHandSmoothingGeometryValid = false;
+            stockAbsent.twoHandSmoothedPrimaryOrientation =
+                {0.0f, 0.5f, 0.0f, 0.8660254f};
+            stockAbsent.twoHandSmoothedPrimaryAimPosition = {9.0f, 9.0f, 9.0f};
+            stockAbsent.twoHandSmoothedSupportAimPosition = {-9.0f, -9.0f, -9.0f};
+            stockAbsent.twoHandSmoothedPrimaryGripValid = true;
+            stockAbsent.twoHandSmoothedPrimaryGripPosition = {9.0f, 9.0f, 9.0f};
+            stockAbsent.twoHandSmoothedSupportGripValid = true;
+            stockAbsent.twoHandSmoothedSupportGripPosition = {-9.0f, -9.0f, -9.0f};
+            Check(ExactAimResult(ComputeAimPose(stockAbsent), stockRawResult),
+                "Virtual Stock Standard/Plus output is bit-identical at smoothing strength 0 (packet absent)");
+            // Strength 25 / packet present: the same copies must now move the
+            // VS presentation, with the base position still raw.
             AimPoseInputs stockFull = fullStrength;
             stockFull.virtualStockEnabled = true;
             stockFull.virtualStockRearReference = rearReference;
-            Check(ExactAimResult(ComputeAimPose(stockZero), ComputeAimPose(stockFull)),
-                "Virtual Stock output is bit-identical at smoothing strength 0 and 25");
+            const AimPoseResult stockFullResult = ComputeAimPose(stockFull);
+            Check(stockFullResult.valid && stockFullResult.twoHandActive &&
+                    !ExactAimResult(stockFullResult, stockRawResult) &&
+                    SamePosition(stockFullResult.pose.position,
+                        stockRaw.right.position),
+                "Virtual Stock Standard/Plus consumes the smoothed copies at strength 25 as a real differential while the base position stays raw");
         }
 
         AimPoseInputs oneHandZero = rawInputs;
@@ -1323,6 +1383,132 @@ void TestTwoHandInputSmoothingStrength()
                 ComputeAimPose(oneHandFull)),
             "one-handed aiming ignores the strength-mixed copies exactly");
     }
+}
+
+// 2026-09-29 Two-Hand Smoothing scope (Virtual Stock ON). The prepared smoothed
+// copies now feed the VS-ON solve; what stays VS-OFF only is the product
+// Grip -> Grip geometry and the Two-Handed Lab, and the support endpoint is
+// still selected by the RAW-derived grip-vs-aim correspondence (the flag
+// travels with the packet identity; it is never re-derived from the smoothed
+// copies). These are the solver-level terms the vr.cpp apply gates feed. The
+// vr.cpp eligibility gates themselves are not offline-compilable; this suite
+// covers the consumption contract they gate, not the gate text.
+void TestTwoHandSmoothingVirtualStockConsumption()
+{
+    AimPoseInputs base = EquivalenceInputs();
+    base.virtualStockEnabled = true;
+    // Standard head path with the preserved exact head -> support endpoint ray
+    // (strength 1.0, rear height 0), so the presented forward is the direction
+    // to whichever support endpoint this solve consumed.
+    base.virtualStockRearReference = 0;
+    base.virtualStockStrength = 1.0f;
+    base.virtualStockRearHeightM = 0.0f;
+    base.virtualStockProximityRelease = false;
+    base.headValid = true;
+    base.headPosition = {-0.18f, 0.62f, 0.11f};
+    base.headOrientation = {0.0f, 0.0f, 0.0f, 1.0f};
+    base.leftValid = true;
+    base.left.position = {0.42f, 0.08f, -0.78f};
+    base.supportPosition = base.left.position;
+    base.primaryGripValid = true;
+    base.primaryGripPosition = {0.12f, 0.08f, 0.02f};
+    base.supportGripValid = true;
+    base.supportGripPosition = {0.40f, 0.08f, -0.76f};
+    base.twoHandSmoothingGeometryValid = true;
+    base.twoHandSmoothedPrimaryOrientation = {0.0f, 0.04f, 0.0f, 0.9991997f};
+    base.twoHandSmoothedPrimaryAimPosition = {0.25f, 0.08f, 0.02f};
+    base.twoHandSmoothedSupportAimPosition = {0.36f, 0.08f, -0.78f};
+    base.twoHandSmoothedPrimaryGripValid = true;
+    base.twoHandSmoothedPrimaryGripPosition = {0.27f, 0.08f, 0.02f};
+    base.twoHandSmoothedSupportGripValid = true;
+    base.twoHandSmoothedSupportGripPosition = {0.38f, 0.08f, -0.80f};
+
+    const auto directionTo = [](const XrVector3f& from, const XrVector3f& to) {
+        const float x = to.x - from.x;
+        const float y = to.y - from.y;
+        const float z = to.z - from.z;
+        const float length = std::sqrt(x * x + y * y + z * z);
+        return XrVector3f{x / length, y / length, z / length};
+    };
+    const auto sameDirection = [&](const XrVector3f& actual,
+                                   const XrVector3f& expected) {
+        return Near(actual.x, expected.x, 1.0e-4f) &&
+            Near(actual.y, expected.y, 1.0e-4f) &&
+            Near(actual.z, expected.z, 1.0e-4f);
+    };
+
+    AimPoseInputs aimEndpoint = base;
+    aimEndpoint.supportEndpointUsedGrip = false;
+    const AimPoseResult aimEndpointResult = ComputeAimPose(aimEndpoint);
+    AimPoseInputs gripEndpoint = base;
+    gripEndpoint.supportEndpointUsedGrip = true;
+    const AimPoseResult gripEndpointResult = ComputeAimPose(gripEndpoint);
+
+    Check(aimEndpointResult.valid && gripEndpointResult.valid &&
+            aimEndpointResult.twoHandActive &&
+            gripEndpointResult.twoHandActive,
+        "the VS-ON smoothed-endpoint fixture is a valid stock solve");
+    Check(sameDirection(AimForward(aimEndpointResult),
+            directionTo(base.headPosition,
+                base.twoHandSmoothedSupportAimPosition)) &&
+            !sameDirection(AimForward(aimEndpointResult),
+                directionTo(base.headPosition, base.left.position)),
+        "the VS-ON stock ray consumes the SMOOTHED support aim copy, never the raw support position");
+    Check(sameDirection(AimForward(gripEndpointResult),
+            directionTo(base.headPosition,
+                base.twoHandSmoothedSupportGripPosition)) &&
+            !sameDirection(AimForward(gripEndpointResult),
+                directionTo(base.headPosition, base.supportGripPosition)),
+        "the raw-derived grip correspondence selects the SMOOTHED support grip copy, never the raw grip");
+    Check(!ExactAimResult(aimEndpointResult, gripEndpointResult),
+        "the raw-derived endpoint correspondence is a real VS-ON differential");
+
+    // A smoothed grip the solve cannot use falls back to the SMOOTHED aim copy
+    // (never the raw grip), exactly as the VS-OFF product pair does.
+    AimPoseInputs gripUnusable = base;
+    gripUnusable.supportEndpointUsedGrip = true;
+    gripUnusable.twoHandSmoothedSupportGripValid = false;
+    Check(ExactAimResult(ComputeAimPose(gripUnusable), aimEndpointResult),
+        "an unusable smoothed support grip falls back to the smoothed aim copy, never the raw grip");
+
+    // The smoothed primary copy steers the VS-ON solve too: with the rear
+    // reference built from the primary position (strength < 1), moving only the
+    // smoothed primary aim copy moves the presented direction.
+    AimPoseInputs rearFromPrimary = base;
+    rearFromPrimary.supportEndpointUsedGrip = false;
+    rearFromPrimary.virtualStockStrength = 0.73f;
+    rearFromPrimary.virtualStockRearHeightM = -0.12f;
+    AimPoseInputs rearMoved = rearFromPrimary;
+    rearMoved.twoHandSmoothedPrimaryAimPosition = {0.40f, 0.08f, 0.02f};
+    const AimPoseResult rearBaseResult = ComputeAimPose(rearFromPrimary);
+    const AimPoseResult rearMovedResult = ComputeAimPose(rearMoved);
+    Check(rearBaseResult.valid && rearMovedResult.valid &&
+            rearBaseResult.twoHandActive && rearMovedResult.twoHandActive &&
+            !ExactAimResult(rearBaseResult, rearMovedResult) &&
+            SamePosition(rearMovedResult.pose.position, base.right.position),
+        "the smoothed primary copy steers the VS-ON stock ray while the base position stays raw");
+
+    // The smoothed primary ORIENTATION stays the VS-ON roll baseline.
+    AimPoseInputs rollMoved = base;
+    rollMoved.supportEndpointUsedGrip = false;
+    rollMoved.twoHandSmoothedPrimaryOrientation = {0.05f, 0.04f, 0.02f, 0.9977f};
+    const AimPoseResult rollMovedResult = ComputeAimPose(rollMoved);
+    Check(rollMovedResult.valid && rollMovedResult.twoHandActive &&
+            !ExactAimResult(rollMovedResult, aimEndpointResult),
+        "the smoothed primary orientation stays a VS-ON orientation input");
+
+    // The Two-Handed Lab stays VS-OFF only: with the Lab enabled and the
+    // smoothing packet present, a VS-ON solve publishes no Lab diagnostics.
+    AimPoseInputs labOnStock = base;
+    labOnStock.twoHandLabEnabled = true;
+    labOnStock.twoHandLabAnchor = 4;
+    labOnStock.twoHandLabOffhandInfluence = 1.0f;
+    AimPoseTrace labStockTrace{};
+    const AimPoseResult labStockResult =
+        ComputeAimPose(labOnStock, &labStockTrace);
+    Check(labStockResult.valid && labStockResult.twoHandActive &&
+            !labStockTrace.labValid,
+        "the Two-Handed Lab never steers or reports a VS-ON solve even with smoothed copies present");
 }
 
 void CheckFixedStockEquivalence(
@@ -3176,6 +3362,7 @@ int main()
     TestHybridDiagnosticState();
     TestTwoHandInputSmoothing();
     TestTwoHandInputSmoothingStrength();
+    TestTwoHandSmoothingVirtualStockConsumption();
     TestHybridStockEquivalence();
     TestHybridDiagnosticOverrides();
     TestHybridDiagnosticModeIsolation();

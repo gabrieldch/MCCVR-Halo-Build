@@ -1784,10 +1784,11 @@ namespace
     };
     AimContinuityPublication g_aimContinuityPublication;
 
-    // VS-OFF two-hand controller-input smoothing is advanced by the prepared-
-    // frame owner only. Game/title consumers read its exact-serial filtered
-    // geometry through the small lock-free publication; raw capture and every
-    // grip-acquisition/retention path remain untouched.
+    // Two-hand controller-input smoothing is advanced by the prepared-frame
+    // owner only (Virtual Stock on or off; the filter sees directional input
+    // copies, never the raw captured poses). Game/title consumers read its
+    // exact-serial filtered geometry through the small lock-free publication;
+    // raw capture and every grip-acquisition/retention path remain untouched.
     struct TwoHandInputSmoothingLayerState
     {
         two_hand_input_smoothing::State filter{};
@@ -9876,9 +9877,10 @@ float4 ps_scope_linearize(VSOut i):SV_Target { return paint(i.uv,true); }
         XrVector3f primaryGripPosition{0.0f, 0.0f, 0.0f};
         bool supportGripValid = false;
         XrVector3f supportGripPosition{0.0f, 0.0f, 0.0f};
-        // Prepared-serial smoothed copies for the VS-OFF two-hand directional
-        // solve. Raw `right` remains authoritative for output/base position;
-        // these copies are consumed only by the two-hand solver branch.
+        // Prepared-serial smoothed copies for the two-hand directional solve
+        // (Virtual Stock on or off). Raw `right` remains authoritative for
+        // output/base position; these copies are consumed only by the two-hand
+        // solver branch and only when the layer proves them for this serial.
         bool twoHandSmoothingGeometryValid = false;
         XrQuaternionf twoHandSmoothedPrimaryOrientation{0.0f, 0.0f, 0.0f, 1.0f};
         XrVector3f twoHandSmoothedPrimaryAimPosition{0.0f, 0.0f, 0.0f};
@@ -10538,12 +10540,15 @@ float4 ps_scope_linearize(VSOut i):SV_Target { return paint(i.uv,true); }
             g_twoHandInputSmoothingOutput;
         // The strength is the frozen per-serial value the packet was produced
         // with, never a live config read. Strength 0 makes the packet inactive,
-        // so the raw path is taken exactly.
+        // so the raw path is taken exactly. The eligibility terms match the
+        // prepared-frame advance gate and the cross-thread apply gate (one
+        // rule, both stock modes): a VS-ON solve consumes the same smoothed
+        // copies a VS-OFF solve does.
         if (smoothing.strength > 0.0f && smoothing.active &&
             smoothing.sampleValid &&
             smoothing.serial == preparedSerial &&
             inputs.twoHandEnabled && inputs.twoHandLatched &&
-            inputs.leftValid && !inputs.virtualStockEnabled)
+            inputs.leftValid)
         {
             ApplyTwoHandSmoothingGeometry(inputs, smoothing.mixed);
         }
@@ -10591,12 +10596,19 @@ float4 ps_scope_linearize(VSOut i):SV_Target { return paint(i.uv,true); }
         // One config read per prepared serial freezes the user strength for
         // this whole packet: the filter gate, the wet/dry mix, every consumer
         // and telemetry all see the same value.
+        //
+        // 2026-09-29 scope: the filter applies to two-handed aiming with
+        // Virtual Stock ON or OFF. The captured poses and the latch sample
+        // stay raw (the filter only ever sees copies), and the packet carries
+        // no stock-mode identity: a Standard <-> Plus toggle mid-hold keeps
+        // the filter's history, which is acceptable for a smoothed input copy
+        // and is reported as such (telemetry carries the consumed truth, not
+        // the mode that produced it).
         const float strength = two_hand_input_smoothing::ClampStrength(
             g_config.two_hand_smoothing_strength);
         const bool applicable = strength > 0.0f &&
             inputs.twoHandEnabled && inputs.twoHandLatched &&
-            inputs.rightValid && inputs.leftValid &&
-            !inputs.virtualStockEnabled;
+            inputs.rightValid && inputs.leftValid;
         if (!applicable)
         {
             two_hand_input_smoothing::Reset(layer.filter);
@@ -11286,8 +11298,12 @@ float4 ps_scope_linearize(VSOut i):SV_Target { return paint(i.uv,true); }
     // Grab/release aim continuity telemetry for this prepared serial. Fills the
     // transition family from the layer state and the seam's own same-frame
     // output; raw live aim evidence (aim_trace.final_direction, canonical_aim)
-    // is untouched by this function.
-    void FillAimContinuityTelemetry(TelemetryFrame& frame) noexcept
+    // is untouched by this function. `leftValid` is the support validity of the
+    // exact assembly this frame's canonical solve consumed, so the reported
+    // input-smoothing consumption can never disagree with the geometry the
+    // solve applied (see ApplyPreparedTwoHandInputSmoothing).
+    void FillAimContinuityTelemetry(TelemetryFrame& frame,
+        bool leftValid) noexcept
     {
         const virtual_stock::AimContinuityDiagnostics diagnostics =
             ReadAimContinuityDiagnostics(g_aimContinuityLayer.transition);
@@ -11337,15 +11353,18 @@ float4 ps_scope_linearize(VSOut i):SV_Target { return paint(i.uv,true); }
         frame.twoHandSmoothingStrength =
             smoothingSerialCurrent ? smoothing.strength : 0.0f;
         // configured means the user asked for a non-zero strength. applied
-        // additionally requires this frame's eligible VS-OFF two-hand path to
-        // have consumed the strength this serial.
+        // additionally requires this frame's eligible two-hand path (Virtual
+        // Stock on or off) to have consumed the strength this serial; the
+        // terms are the same eligibility rule the frame's own apply gate used
+        // (latched two-hand assembly with a valid support controller), so
+        // applied never claims a consumption the solve did not make.
         frame.twoHandSmoothingConfigured =
             frame.twoHandSmoothingStrength > 0.0f;
         frame.twoHandSmoothingApplied = smoothingCurrent &&
             frame.twoHandSmoothingStrength > 0.0f &&
             frame.effectiveSettings.twoHandEnabled &&
             frame.effectiveSettings.twoHandLatched &&
-            !frame.effectiveSettings.virtualStockEnabled;
+            leftValid;
         if (smoothingCurrent)
         {
             frame.twoHandSmoothingAlpha = smoothing.alpha;
@@ -12121,7 +12140,7 @@ float4 ps_scope_linearize(VSOut i):SV_Target { return paint(i.uv,true); }
             std::isfinite(inputs.twoHandOffhandInfluence)
             ? std::clamp(inputs.twoHandOffhandInfluence, 0.0f, 1.0f) : 0.0f;
         frame.canonicalAim = ToTelemetryAimResult(canonical);
-        FillAimContinuityTelemetry(frame);
+        FillAimContinuityTelemetry(frame, inputs.leftValid);
         FillTwoHandLabTelemetry(frame, inputs);
         FillPersistentSupportGripTelemetry(frame, inputs, activeTitle);
         FillPresentedAimTelemetry(frame, inputs, canonical, stockHeadValid);
@@ -22865,6 +22884,10 @@ bool VR_GetAimPoseWithSupportProvenance(float outQuat[4], float outPos[3],
     // Cross-thread consumers use only the exact prepared serial's immutable
     // publication, including the strength/mix it was frozen with. A torn,
     // stale, inactive or zero-strength packet leaves the solver on raw input.
+    // The eligibility terms are exactly the frame-thread ones
+    // (ApplyPreparedTwoHandInputSmoothing) so one serial can never be consumed
+    // differently on the two threads; Virtual Stock on or off is accepted, and
+    // the read below re-checks every identity term it was published with.
     TwoHandInputSmoothingPreparedOutput smoothing{};
     const GameTitle smoothingTitle = TitleAdapter_GetActiveTitle();
     const uint32_t smoothingGeneration =
@@ -22872,7 +22895,6 @@ bool VR_GetAimPoseWithSupportProvenance(float outQuat[4], float outPos[3],
     const uint64_t smoothingEpoch =
         g_contactSpaceEpoch.load(std::memory_order_acquire);
     if (inputs.twoHandEnabled && inputs.twoHandLatched && inputs.leftValid &&
-        !inputs.virtualStockEnabled &&
         ReadTwoHandInputSmoothing(expectedSerial, smoothingEpoch,
             smoothingTitle, smoothingGeneration,
             inputs.virtualStockLeftHanded,

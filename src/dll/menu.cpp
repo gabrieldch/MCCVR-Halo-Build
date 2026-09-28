@@ -1357,7 +1357,7 @@ namespace
             ImGui::TextDisabled(
                 "Reduces small tracking jitter in free two-hand aim.\n"
                 "0 = off; higher values apply more smoothing.\n"
-                "Applies when Virtual Stock is off.");
+                "Applies to two-handed aiming, Virtual Stock on or off.");
             ImGui::Spacing();
             ImGui::Text("Grip and grab-zone calibration");
             changed |= vr_menu::SliderFloat("Left hand forward offset (m)",

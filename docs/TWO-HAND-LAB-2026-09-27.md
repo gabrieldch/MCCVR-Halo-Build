@@ -14,9 +14,10 @@ product output exists for the serial, otherwise the frame's raw stateless Lab
 orientation; on every frame the predicate engages, the product seam produced
 no matching output, so the raw stateless orientation is the live target. The
 separate optional `two_hand_smoothing_strength` setting
-(0..25) filters controller-input copies for applicable VS-OFF two-hand solves,
-as a wet/dry mix over the unchanged fixed speed-25 filter; it is not Lab damping
-and does not alter Virtual Stock output.
+(0..25) filters controller-input copies for applicable two-hand solves (Virtual
+Stock on or off), as a wet/dry mix over the unchanged fixed speed-25 filter; it
+is not Lab damping, it never steers the Lab (the Lab stays VS-OFF only) and it
+never changes the VS-OFF-only product Grip -> Grip geometry.
 
 The Lab page mirrors the two shared product controls shown with Weapon & Aim:
 `Persistent support grip` and the `Two-Hand Smoothing` slider. They write the

@@ -7,7 +7,7 @@ entirely: there is no selector, no config key and no experiment surface left.
 Nothing here changes the accepted-build pointer in `docs/CURRENT-STATE.md`;
 headset acceptance of the packaged candidate is still the gate.**
 
-## September 28 extension: VS-OFF transition and input smoothing
+## September 28 extension: VS-OFF latch transition and the shared Two-Hand Smoothing filter
 
 The VS Standard/Plus law above remains unchanged. The same fixed 200 ms
 latch-edge law applies to VS-OFF two-hand presentation as **fixed-on internal
@@ -23,27 +23,39 @@ lifecycle/title/generation/reference-space reset still fails open and cannot
 carry a transition into a new owner/session.
 
 The independent `two_hand_smoothing_strength` product control defaults to 0
-(off). For an applicable latched VS-OFF two-hand solve only, controller-input
-copies first pass through the fixed Pavlov-inspired response
+(off). For an applicable latched two-hand solve - Virtual Stock on or off -
+controller-input copies first pass through the fixed Pavlov-inspired response
 `alpha = clamp(25 * dt, 0, 1)`: orientation is shortest-arc quaternion SLERP and
 the specified position copies use linear interpolation. The user strength is
 then a wet/dry mix over that unchanged full-filter output: 0 emits raw input
 untouched, 25 emits the full-filtered result untouched, and every value between
-blends positions linearly and orientations along the shortest arc. It does not
-alter raw acquisition/latch samples, one-hand solves, the weapon/base position
-or any Virtual Stock output. It is a controller-input filter with a mix amount,
-never a user-visible interpolation speed and not a second Lab continuity mode.
-The Lab's constant/adaptive damping remains separately selectable and engages
-only on frames the product seam does not own (Lab enabled, resolved Virtual
-Stock off, `two_handed_aim` off: `TwoHandLabTemporalEngagedFor`), so it never
-stacks a second 200 ms correction. Headset acceptance of these candidate
-additions is pending.
+blends positions linearly and orientations along the shortest arc. From
+2026-09-29 it also feeds the Virtual Stock Standard/Plus solve: that solve
+consumes the same smoothed directional copies (primary orientation,
+primary/support aim positions, primary/support grip positions), so `0` is the
+pre-change raw Virtual Stock solve bit-for-bit and any higher value moves it.
+The filter never alters raw acquisition/latch samples, one-hand solves, the
+weapon/base position, the VS-OFF-only Grip -> Grip product geometry, the
+offhand-influence authority or the Two-Handed Lab. It is a controller-input
+filter with a mix amount, never a user-visible interpolation speed and not a
+second Lab continuity mode. The Lab's constant/adaptive damping remains
+separately selectable and engages only on frames the product seam does not own
+(Lab enabled, resolved Virtual Stock off, `two_handed_aim` off:
+`TwoHandLabTemporalEngagedFor`), so it never stacks a second 200 ms correction.
+Headset acceptance of these candidate additions is pending.
+
+One accepted consequence of the wider scope: the smoothing packet carries no
+stock-mode identity, so a Standard <-> Plus toggle mid-hold keeps the filter's
+history instead of reseeding. Telemetry reports the consumption it actually
+made (`two_hand_smoothing_applied`, `two_hand_smoothing_strength`), not the
+mode that produced the copies.
 
 Scope: Virtual Stock **Standard (rear reference 0/1/2) and Plus (rear reference
 3)** with `two_handed_aim` on. Ordinary non-Virtual-Stock two-hand aim is
-untouched. The solver, stock strength, the W/seat thresholds, horizontal
-release, the rear-reference construction, the head-turn sway correction
-(retired from the product 2026-09-27; see
+untouched by the 200 ms continuity law, and the Two-Hand Smoothing control spans
+both stock modes as described above. The solver, stock strength, the W/seat
+thresholds, horizontal release, the rear-reference construction, the head-turn
+sway correction (retired from the product 2026-09-27; see
 `docs/VIRTUAL-STOCK-HEAD-TURN-SWAY-REMOVAL-2026-09-27.md`), support endpoint
 selection, grab admission, controller smoothing, weapon tuning, handedness and
 per-weapon tuning are untouched by this layer.

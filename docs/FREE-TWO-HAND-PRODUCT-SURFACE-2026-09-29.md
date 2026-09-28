@@ -1,4 +1,4 @@
-# Free two-hand product surface (Virtual Stock OFF)
+# Free two-hand product surface (Virtual Stock OFF, plus the shared Two-Hand Smoothing filter)
 
 Date: 2026-09-29. Status: **candidate product surface; the user's headset result
 is still the gate, so nothing here changes the accepted-build pointer in
@@ -8,7 +8,10 @@ This is the single statement of the free two-hand (Virtual Stock off, VS OFF)
 player surface as the current candidate ships it. Field-level mechanics stay in
 the feature documents linked from section 7; if this summary and a feature
 document disagree, the feature document's mechanics win and this file must be
-corrected.
+corrected. One control in this surface is wider than VS OFF: `Two-Hand
+Smoothing` applies to two-handed aiming with Virtual Stock on as well (section
+1); every other claim in this document stays VS-OFF scope, and Offhand
+influence remains VS-OFF only.
 
 ## 1. Player surface
 
@@ -17,7 +20,7 @@ corrected.
 | Persistent support grip (`persistent_support_grip`) | **ON for new configurations** | on/off | two-handed aim, Virtual Stock on and off |
 | Reduce Support-Hand Rotation (`two_hand_support_grip_pose`) | **ON** | on/off | Virtual Stock endpoint selection only (section 3) |
 | Offhand influence (`two_hand_offhand_influence`) | **50%** | 0-100% | VS-OFF free two-hand aim only |
-| Two-Hand Smoothing (`two_hand_smoothing_strength`) | **0 (off)** | 0-25 | VS-OFF free two-hand aim only |
+| Two-Hand Smoothing (`two_hand_smoothing_strength`) | **0 (off)** | 0-25 | two-handed aim, Virtual Stock on and off |
 
 `Persistent support grip` keeps the support hand attached after a valid grab
 even when it leaves the original grab area. It ends on an explicit release, or
@@ -37,15 +40,21 @@ every influence, acceptance and `two_hand_active` stay the existing solved
 semantics, so zero authority never decides whether the weapon is logically
 held.
 
-`Two-Hand Smoothing` is the independent VS-OFF controller-input filter amount:
-0 = raw/off, 25 = the full fixed speed-25 response, and intermediate values
-wet/dry mix that response over raw input copies. It is a controller-input
-filter, never a user-visible interpolation speed, and it does not alter Virtual
-Stock output, raw acquisition/latch samples, the weapon/base position or the
-Two-Handed Lab.
+`Two-Hand Smoothing` is the independent two-hand controller-input filter
+amount: 0 = raw/off, 25 = the full fixed speed-25 response, and intermediate
+values wet/dry mix that response over raw input copies. It applies to
+two-handed aiming with Virtual Stock on or off: the VS-ON solve consumes the
+same smoothed directional copies (primary orientation, primary/support aim
+positions, primary/support grip positions) the VS-OFF free two-hand solve does,
+so Virtual Stock output does move with this slider above 0. It is a
+controller-input filter, never a user-visible interpolation speed, and it does
+not alter raw acquisition/latch samples, one-hand aim, the weapon/base position,
+the VS-OFF-only Grip -> Grip product geometry, Offhand influence or the
+Two-Handed Lab. At 0 it publishes no packet and every path is raw exactly.
 
-Both sliders are VS-OFF only: Virtual Stock keeps its own hybrid offhand
-influence and never reads these two values.
+`Offhand influence` remains VS-OFF only: Virtual Stock keeps its own hybrid
+offhand influence and never reads that value. `Two-Hand Smoothing` is the one
+control in this surface that spans both stock modes.
 
 ## 2. The VS-OFF geometry is fixed: primary Grip -> support Grip
 
@@ -62,8 +71,9 @@ grip positions are positional pivots only.
 Telemetry records the same truth for each prepared serial:
 `two_hand_offhand_influence` is the frozen authority the solve consumed (never
 a live config re-read at capture), and `two_hand_smoothing_strength` /
-`two_hand_smoothing_mix` are the frozen filter amount. See
-`docs/TELEMETRY-SYSTEM.md`.
+`two_hand_smoothing_mix` are the frozen filter amount, with
+`two_hand_smoothing_applied` reporting a real consumption on either stock mode.
+See `docs/TELEMETRY-SYSTEM.md`.
 
 ## 3. Reduce Support-Hand Rotation is a separate Virtual Stock feature
 
@@ -123,7 +133,7 @@ plus the production-selected support endpoint), not the shipped GG geometry. See
 ## 7. Where the mechanics live
 
 - `docs/VIRTUAL-STOCK-AIM-CONTINUITY-2026-09-27.md` - the 200 ms continuity
-  law, VS-OFF input smoothing, config history.
+  law, the shared Two-Hand Smoothing filter, config history.
 - `docs/TWO-HAND-LAB-2026-09-27.md` - Lab anchors, temporal modes, UI, tests.
 - `docs/PERSISTENT-GRIP-PORT-2026-09-27.md` - durable support-grip
   relationship, ownership trust, acquisition, per-title wiring.

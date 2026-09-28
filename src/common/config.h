@@ -948,8 +948,10 @@ struct Config
     // response with the quaternion-native MCC rotational implementation is
     // unchanged, and this value wet/dry mixes its output over raw directional
     // input copies. 0 = off/raw; 25 = the full fixed filter; intermediate
-    // values blend. Consumed only by the VS-OFF free two-hand directional
-    // solver. Legacy boolean key two_hand_smoothing migrates to 0 or 25.
+    // values blend. Consumed by the two-hand directional solver with Virtual
+    // Stock on or off (the VS-ON solve takes the same directional copies; the
+    // VS-OFF-only product geometry and Lab keep their own gates). Legacy
+    // boolean key two_hand_smoothing migrates to 0 or 25.
     float two_hand_smoothing_strength = kTwoHandSmoothingStrengthDefault;
     // Free two-hand (VS-OFF) support-steering authority: how much the support
     // (offhand) controller's directional aim steers the presented aim line
