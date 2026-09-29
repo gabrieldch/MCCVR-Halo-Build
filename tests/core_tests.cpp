@@ -13374,6 +13374,8 @@ int main()
         Check(fresh.dpad_hand == 0 && fresh.dpad_head_radius == 0.30f &&
                   !fresh.quest_thumbrest_dpad,
             "D-pad defaults preserve the existing 30 cm left-hand head gesture and leave Quest thumb-rest mode off");
+        Check(fresh.two_hand_coherent_aim,
+            "Coherent committed-sample aim defaults on");
     }
 
     wchar_t tempPath[MAX_PATH]{};
@@ -13399,6 +13401,51 @@ int main()
     const std::string organizedConfig = ReadTextFile(primary);
     Check(!g_config.independent_dual_aim && CountText(organizedConfig,
         "\nindependent_dual_aim = 0")==1,"independent dual aim defaults off in legacy configurations");
+    Check(g_config.two_hand_coherent_aim && CountText(organizedConfig,
+        "\ntwo_hand_coherent_aim = 1")==1,
+        "Coherent committed-sample aim defaults on and is persisted on for legacy configurations");
+    g_config.two_hand_coherent_aim=false;ConfigSave();
+    g_config.two_hand_coherent_aim=true;
+    ConfigLoad(primary.c_str());
+    Check(!g_config.two_hand_coherent_aim,
+        "Hidden coherent-aim key preserves OFF through a config round trip as a rollback/debug escape");
+    g_config.two_hand_coherent_aim=true;ConfigSave();
+    {
+        const std::filesystem::path oldAimConfig = configDir / L"coherent-aim-v5.cfg";
+        const std::filesystem::path rollbackAimConfig = configDir / L"coherent-aim-v6-rollback.cfg";
+        {
+            std::ofstream file(oldAimConfig);
+            file << "config_version = 5\n";
+            file << "two_hand_coherent_aim = 0\n";
+        }
+        ConfigLoad(oldAimConfig.c_str());
+        Check(g_config.two_hand_coherent_aim,
+            "Pre-v6 saved OFF is migrated to coherent committed-sample aim ON");
+        ConfigSave();
+        const std::string migratedAimConfig = ReadTextFile(oldAimConfig);
+        Check(g_config.config_version == 6 &&
+                  CountText(migratedAimConfig, "\nconfig_version = 6") == 1 &&
+                  CountText(migratedAimConfig, "\ntwo_hand_coherent_aim = 1") == 1,
+            "Saving the v5 coherent-aim migration persists version 6 and ON");
+        ConfigLoad(oldAimConfig.c_str());
+        Check(g_config.two_hand_coherent_aim,
+            "Reloading the saved v6 migration keeps coherent committed-sample aim ON");
+
+        {
+            std::ofstream file(rollbackAimConfig);
+            file << "config_version = 6\n";
+            file << "two_hand_coherent_aim = 0\n";
+        }
+        ConfigLoad(rollbackAimConfig.c_str());
+        Check(!g_config.two_hand_coherent_aim,
+            "A v6 config's explicit hidden OFF rollback remains honored");
+
+        // Restore the shared test config and ConfigSave destination after these
+        // isolated version-migration cases.
+        ConfigLoad(primary.c_str());
+        std::filesystem::remove(oldAimConfig);
+        std::filesystem::remove(rollbackAimConfig);
+    }
     g_config.independent_dual_aim=true;ConfigSave();g_config.independent_dual_aim=false;
     ConfigLoad(primary.c_str());
     Check(g_config.independent_dual_aim,"independent dual aim persists through a config round trip");

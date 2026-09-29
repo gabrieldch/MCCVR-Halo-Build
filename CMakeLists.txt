@@ -170,6 +170,10 @@ FetchContent_Declare(imgui
 
 FetchContent_MakeAvailable(openxr minhook imgui)
 
+# vr.h exposes the sampled OpenXR head pose in aim receipts. Keep that public
+# header usable by the DLL's focused fixtures as well as the runtime target.
+include_directories("${openxr_SOURCE_DIR}/include")
+
 # Keep upstream pinned and untouched on disk. The local translation unit adds
 # a no-write retirement path for title DLLs MCC has already unmapped.
 get_target_property(mccvr_minhook_sources minhook SOURCES)
@@ -670,6 +674,25 @@ if(BUILD_TESTING)
         "${HALOMCCVR_GENERATED_DIR}" "${openxr_SOURCE_DIR}/include" src/common)
     target_compile_definitions(halomccvr_aim_pose_tests PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
     add_test(NAME halomccvr_aim_pose_tests COMMAND halomccvr_aim_pose_tests)
+    # The XInput coherent-sample tests compile the same atomic packet,
+    # seqlock reader, identity/freshness selector and solver-input mapping that
+    # the shipping VR_GetAimPoseWithSupportProvenance path calls.
+    add_executable(halomccvr_committed_aim_sample_tests
+        tests/committed_aim_sample_tests.cpp "${HALOMCCVR_AIM_POSE_FIXTURE}")
+    target_include_directories(halomccvr_committed_aim_sample_tests PRIVATE
+        "${HALOMCCVR_GENERATED_DIR}" "${openxr_SOURCE_DIR}/include" src/common)
+    target_compile_definitions(halomccvr_committed_aim_sample_tests PRIVATE
+        NOMINMAX WIN32_LEAN_AND_MEAN)
+    add_test(NAME halomccvr_committed_aim_sample_tests
+        COMMAND halomccvr_committed_aim_sample_tests)
+    add_executable(halomccvr_aim_servo_identity_tests
+        tests/aim_servo_identity_tests.cpp)
+    target_include_directories(halomccvr_aim_servo_identity_tests PRIVATE
+        src/common)
+    target_compile_definitions(halomccvr_aim_servo_identity_tests PRIVATE
+        NOMINMAX WIN32_LEAN_AND_MEAN)
+    add_test(NAME halomccvr_aim_servo_identity_tests
+        COMMAND halomccvr_aim_servo_identity_tests)
     # Two-Handed Lab tranche 2A: live VS-off solver integration (runtime
     # settings snapshot, anchor matrix, offhand influence, soft agreement,
     # single-source D/S, diagnostics) against the same generated aim fixture.

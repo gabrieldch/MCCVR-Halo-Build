@@ -46087,11 +46087,28 @@ bool Game_ComputeAimStick(float& outRx, float& outRy)
     if (!g_aimSeen.load() && !halo2Aim)
         return blocked(3, "camera hook not running (not in a level?)");
     float q[4], p[3];
-    if (!VR_GetAimPose(q, p)) // two-hand-adjusted weapon aim (falls back to right hand)
+    VrAimSupportReceipt aimSupportReceipt{};
+    const bool coherentAim = g_config.two_hand_coherent_aim;
+    if (!VR_GetAimPoseWithSupportProvenance(q, p, aimSupportReceipt,
+            coherentAim))
         return blocked(4, "right controller not tracked");
     float hq[4], hp[3];
-    if (!VR_GetHeadPose(hq, hp))
+    if (coherentAim)
+    {
+        if (!aimSupportReceipt.headValid)
+            return blocked(5, "headset not tracked");
+        hp[0] = aimSupportReceipt.headPosition.x;
+        hp[1] = aimSupportReceipt.headPosition.y;
+        hp[2] = aimSupportReceipt.headPosition.z;
+        hq[0] = aimSupportReceipt.headOrientation.x;
+        hq[1] = aimSupportReceipt.headOrientation.y;
+        hq[2] = aimSupportReceipt.headOrientation.z;
+        hq[3] = aimSupportReceipt.headOrientation.w;
+    }
+    else if (!VR_GetHeadPose(hq, hp))
+    {
         return blocked(5, "headset not tracked");
+    }
     if (halo2Aim)
         return ComputeHalo2ControllerAimStick(q, p, hq, hp, outRx, outRy);
     lastAimBlock = 0;
@@ -46102,7 +46119,6 @@ bool Game_ComputeAimStick(float& outRx, float& outRy)
     const float localDir[3] = {0.0f, 0.0f, -1.0f};
     float f3[3];
     RotateByQuat(q, localDir, f3);
-    const float fx = f3[0], fy = f3[1], fz = f3[2];
 
     // Halo spawns first-person projectiles at the ENGINE's camera â€” on foot,
     // the head â€” and no steering can move that origin. Aiming the bullet ray
@@ -46116,11 +46132,12 @@ bool Game_ComputeAimStick(float& outRx, float& outRy)
     // two are the same point. In a first-person vehicle seat they are not â€” see
     // the seat re-origin below, which is the correction for that case.
     const float d = Clamp(g_config.crosshair_distance_m, 2.0f, 50.0f);
-    float tx = p[0] + fx * d - hp[0];
-    float ty = p[1] + fy * d - hp[1];
-    float tz = p[2] + fz * d - hp[2];
-    const float tl = sqrtf(tx * tx + ty * ty + tz * tz);
-    if (tl > 1e-3f) { tx /= tl; ty /= tl; tz /= tl; }
+    const AimServoParallaxRay parallaxRay = AimServoParallaxRayFromHead(
+        p, f3, hp, d);
+    const float tx = parallaxRay.x;
+    const float ty = parallaxRay.y;
+    const float tz = parallaxRay.z;
+    const float tl = parallaxRay.distance;
     const float cy = atan2f(tx, -tz);
     const float cp = asinf(Clamp(ty, -1.0f, 1.0f));
     float gameYawReference = 0.0f;

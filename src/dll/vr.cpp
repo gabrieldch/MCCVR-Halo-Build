@@ -7,6 +7,7 @@
 #include "../common/weapon_reload_target.h"
 #include "weapon_accessory_renderer.h"
 #include "aim_pose_trace.h"
+#include "committed_aim_sample.h"
 #include "two_hand_lab_runtime.h"
 #include "telemetry_recorder.h"
 #include "../common/title_runtime_state.h"
@@ -1784,6 +1785,11 @@ namespace
     };
     AimContinuityPublication g_aimContinuityPublication;
 
+    // Dedicated raw Aim/Grip/head sample for the asynchronous XInput aim
+    // consumer. This is intentionally separate from smoothing, continuity,
+    // Lab, reticle and engine-presentation publications.
+    committed_aim::Publication g_committedAimSample;
+
     // Two-hand controller-input smoothing is advanced by the prepared-frame
     // owner only (Virtual Stock on or off; the filter sees directional input
     // copies, never the raw captured poses). Game/title consumers read its
@@ -1945,7 +1951,8 @@ namespace
         uint64_t expectedContactSpaceEpoch, GameTitle expectedTitle,
         uint32_t expectedGeneration, bool expectedLeftHanded,
         bool expectedSupportEndpointUsedGrip,
-        TwoHandInputSmoothingPreparedOutput& out) noexcept
+        TwoHandInputSmoothingPreparedOutput& out,
+        bool sampleFrozen = false) noexcept
     {
         out = TwoHandInputSmoothingPreparedOutput{};
         if (!expectedSerial)
@@ -2047,8 +2054,11 @@ namespace
                 !std::isfinite(candidate.orientationErrorDeg) ||
                 !std::isfinite(candidate.primaryPositionErrorM) ||
                 !std::isfinite(candidate.supportPositionErrorM) ||
-                g_preparedSerialPublished.load(std::memory_order_acquire) !=
-                    expectedSerial)
+                !committed_aim::PreparedSampleSerialStillMatches(
+                    expectedSerial, sampleFrozen, []() noexcept {
+                        return g_preparedSerialPublished.load(
+                            std::memory_order_acquire);
+                    }))
                 return false;
             candidate.sampleValid = true;
             out = candidate;
@@ -2170,7 +2180,8 @@ namespace
     bool ReadAimContinuityPublishedCorrection(
         uint64_t expectedSerial, bool& outStockHeadCoherent,
         bool& outSupportEndpointUsedGrip,
-        virtual_stock::Quat4& outCorrection) noexcept
+        virtual_stock::Quat4& outCorrection,
+        bool sampleFrozen = false) noexcept
     {
         // Serial zero means no prepared frame has published yet: nothing to
         // match, and the packet must not be trusted.
@@ -2210,12 +2221,14 @@ namespace
             virtual_stock::Quat4 normalized{};
             if (!virtual_stock::TryNormalizeQuaternion(candidate, normalized))
                 return false;
-            // Re-read the published serial immediately after the packet read:
-            // if a prepare completed under this call, both the packet and the
-            // poses now describe a serial this call never solved, so the
-            // correction must not be composed with them.
-            if (g_preparedSerialPublished.load(std::memory_order_acquire) !=
-                expectedSerial)
+            // Live solves must still be current after the packet read. A
+            // committed solve instead keeps its already-validated sample
+            // identity if prepare advances during this call.
+            if (!committed_aim::PreparedSampleSerialStillMatches(
+                    expectedSerial, sampleFrozen, []() noexcept {
+                        return g_preparedSerialPublished.load(
+                            std::memory_order_acquire);
+                    }))
                 return false;
             outStockHeadCoherent = stockHeadCoherent;
             outSupportEndpointUsedGrip = supportEndpointUsedGrip;
@@ -2227,17 +2240,18 @@ namespace
 
     XrQuaternionf PresentAimContinuityFromPublication(
         XrQuaternionf orientation, uint64_t expectedSerial,
-        bool stockHeadCoherent, bool supportEndpointUsedGrip) noexcept
+        bool stockHeadCoherent, bool supportEndpointUsedGrip,
+        bool sampleFrozen = false) noexcept
     {
         bool publishedStockHeadCoherent = false;
         bool publishedSupportEndpointUsedGrip = false;
         virtual_stock::Quat4 correction{};
         if (!ReadAimContinuityPublishedCorrection(
                 expectedSerial, publishedStockHeadCoherent,
-                publishedSupportEndpointUsedGrip, correction))
+                publishedSupportEndpointUsedGrip, correction, sampleFrozen))
             return orientation;
-        // The correction is local to the live pose it was derived from. A
-        // reader whose own solve was assembled differently (no coherent head,
+        // The correction is local to the solve it was derived from. A reader
+        // whose own solve was assembled differently (no coherent head,
         // or a different support endpoint source) is a different live pose, so
         // it fails open instead of composing a mismatched correction for one
         // frame.
@@ -10975,7 +10989,8 @@ float4 ps_scope_linearize(VSOut i):SV_Target { return paint(i.uv,true); }
     // change, non-finite) fails open to identity.
     bool ReadTwoHandLabTemporalPacket(uint64_t expectedSerial,
         uint64_t expectedGeneration, virtual_stock::Quat4& outStateless,
-        virtual_stock::Quat4& outCorrection) noexcept
+        virtual_stock::Quat4& outCorrection,
+        bool sampleFrozen = false) noexcept
     {
         // Serial zero means no prepared frame has published yet: nothing to
         // match, and the packet must not be trusted.
@@ -11023,12 +11038,14 @@ float4 ps_scope_linearize(VSOut i):SV_Target { return paint(i.uv,true); }
                 !virtual_stock::TryNormalizeQuaternion(
                     correction, normalizedCorrection))
                 return false;
-            // Re-read the published serial immediately after the packet read:
-            // if a prepare completed under this call, both the packet and the
-            // poses now describe a serial this call never solved, so the
-            // correction must not be composed with them.
-            if (g_preparedSerialPublished.load(std::memory_order_acquire) !=
-                expectedSerial)
+            // Live solves must still be current after the packet read. A
+            // committed solve instead keeps its already-validated sample
+            // identity if prepare advances during this call.
+            if (!committed_aim::PreparedSampleSerialStillMatches(
+                    expectedSerial, sampleFrozen, []() noexcept {
+                        return g_preparedSerialPublished.load(
+                            std::memory_order_acquire);
+                    }))
                 return false;
             outStateless = normalizedStateless;
             outCorrection = normalizedCorrection;
@@ -11039,12 +11056,12 @@ float4 ps_scope_linearize(VSOut i):SV_Target { return paint(i.uv,true); }
 
     XrQuaternionf PresentTwoHandLabTemporalFromPublication(
         XrQuaternionf orientation, uint64_t expectedSerial,
-        uint64_t expectedGeneration) noexcept
+        uint64_t expectedGeneration, bool sampleFrozen = false) noexcept
     {
         virtual_stock::Quat4 stateless{};
         virtual_stock::Quat4 correction{};
         if (!ReadTwoHandLabTemporalPacket(expectedSerial, expectedGeneration,
-                stateless, correction))
+                stateless, correction, sampleFrozen))
             return orientation;
         // Own-solve match, as on the frame-thread path above.
         virtual_stock::Quat4 consumer{};
@@ -15687,6 +15704,50 @@ float4 ps_scope_linearize(VSOut i):SV_Target { return paint(i.uv,true); }
 #endif
         g_preparedSerialPublished.store(g_preparedFrame.serial,
                                         std::memory_order_release);
+        // Publish only after this prepared serial is visible and only after
+        // this frame successfully captured both controller actions and head.
+        // Leave the last committed sample untouched on a failed capture; its
+        // serial/identity/age gates make it unavailable rather than serving it
+        // as stale tracking. The frame thread owns these pose writes, so this
+        // fixed atomic publication needs no critical section or XR sampling.
+        if (upcomingPadFresh && upcomingHeadValid)
+        {
+            committed_aim::Sample sample{};
+            sample.preparedSerial = g_preparedFrame.serial;
+            sample.contactSpaceEpoch =
+                g_contactSpaceEpoch.load(std::memory_order_acquire);
+            sample.sessionEpoch =
+                g_framePacingSessionEpoch.load(std::memory_order_acquire);
+            sample.title = TitleAdapter_GetActiveTitle();
+            sample.titleGeneration = TitleAdapter_GetGeneration(sample.title);
+            sample.commitTimeMs = GetTickCount64();
+            sample.values.okR = g_rightAimPoseValid;
+            sample.values.okL = g_leftAimPoseValid;
+            sample.values.okH = g_headPoseValid &&
+                g_stockAimFresh.load(std::memory_order_acquire);
+            sample.values.supportGripValid = g_supportGripPoseValid &&
+                g_supportGripPoseFresh.load(std::memory_order_acquire);
+            sample.values.primaryGripValid = g_primaryGripPoseValid;
+            sample.values.rightAimPose = g_rightAimPose;
+            sample.values.leftAimPose = g_leftAimPose;
+            sample.values.headPose = g_headPose;
+            sample.values.supportGripPosition = g_supportGripPosePosition;
+            sample.values.primaryGripPosition = g_primaryGripPosePosition;
+            sample.values.capturedLeftHanded =
+                g_capturedLeftHanded.load(std::memory_order_acquire);
+            sample.values.inverseNeckNeutralValid =
+                g_inverseNeckNeutralCapture.neutralValid;
+            sample.values.inverseNeckNeutralOrientation = {
+                g_inverseNeckNeutralCapture.neutralOrientation.x,
+                g_inverseNeckNeutralCapture.neutralOrientation.y,
+                g_inverseNeckNeutralCapture.neutralOrientation.z,
+                g_inverseNeckNeutralCapture.neutralOrientation.w};
+            sample.values.inverseNeckNeutralCaptureSerial =
+                g_inverseNeckNeutralCapture.captureSerial;
+            sample.values.inverseNeckNeutralCaptureContactSpaceEpoch =
+                g_inverseNeckNeutralCapture.captureContactSpaceEpoch;
+            g_committedAimSample.Publish(sample);
+        }
         if (g_frameNo == 1)
             LOG("timing: exact OpenXR pipeline active; headset smoothing %.1f%%",
                 std::clamp(g_config.headset_smoothing, 0.0f, 0.10f) * 100.0f);
@@ -22843,7 +22904,7 @@ bool VR_GetContactTrackingSnapshot(VrContactTrackingSnapshot& snapshot)
 // verified barrel-origin aiming (gun_barrel_aim) may substitute the muzzle
 // origin/direction afterwards and is unaffected by this base pose.
 bool VR_GetAimPoseWithSupportProvenance(float outQuat[4], float outPos[3],
-    VrAimSupportReceipt& outReceipt)
+    VrAimSupportReceipt& outReceipt, bool preferCommittedSample)
 {
     outReceipt = VrAimSupportReceipt{};
     if (!g_headCsInit)
@@ -22854,32 +22915,73 @@ bool VR_GetAimPoseWithSupportProvenance(float outQuat[4], float outPos[3],
     // pose, and only for the prepared serial those poses belong to (see
     // PresentAimContinuityFromPublication).
     bool okH = false;
-    // Serial of the prepared frame whose poses this call is about to read. The
-    // reader re-checks it after reading the packet, so a prepare completing
-    // under this call can never compose a correction from another serial.
+    // Serial of the prepared frame whose poses this call is about to read. A
+    // live assembly is re-checked after reading each packet; a selected
+    // committed sample retains this exact identity if prepare advances mid-call.
     const uint64_t expectedSerial =
         g_preparedSerialPublished.load(std::memory_order_acquire);
-    EnterCriticalSection(&g_headCs);
-    const bool okR = g_rightAimPoseValid;
-    const XrPosef right = g_rightAimPose;
-    const bool okL = g_leftAimPoseValid;
-    const XrPosef left = g_leftAimPose;
-    okH = g_headPoseValid &&
-        g_stockAimFresh.load(std::memory_order_acquire);
-    const XrVector3f head = g_headPose.position;
-    const bool supportGripFresh = g_supportGripPoseValid &&
-        g_supportGripPoseFresh.load(std::memory_order_acquire);
-    const XrVector3f supportGrip = g_supportGripPosePosition;
-    // Same-sample primary grip under this same hold (see the Lab store proof):
-    // the success-path capture wrote it with these AIM poses, and the only
-    // concurrent writer clears toward fail-open.
-    const bool primaryGripValid = g_primaryGripPoseValid;
-    const XrVector3f primaryGrip = g_primaryGripPosePosition;
-    inputs = CurrentStockAimPoseInputs(
-         okR, right, okL, left, okH, head, g_headPose.orientation,
-         supportGripFresh, supportGrip,
-         primaryGripValid, primaryGrip);
-    LeaveCriticalSection(&g_headCs);
+    bool usedCommittedSample = false;
+    XrVector3f headPosition{};
+    XrQuaternionf headOrientation{};
+    if (preferCommittedSample)
+    {
+        const GameTitle title = TitleAdapter_GetActiveTitle();
+        const committed_aim::Identity current{
+            expectedSerial,
+            g_contactSpaceEpoch.load(std::memory_order_acquire),
+            g_framePacingSessionEpoch.load(std::memory_order_acquire),
+            title,
+            TitleAdapter_GetGeneration(title),
+            g_capturedLeftHanded.load(std::memory_order_acquire)};
+        committed_aim::Sample committed{};
+        if (committed_aim::TrySelectCurrent(g_committedAimSample,
+                preferCommittedSample, current, GetTickCount64(), committed))
+        {
+            const auto& values = committed.values;
+            okH = values.okH;
+            headPosition = values.headPose.position;
+            headOrientation = values.headPose.orientation;
+            inputs = CurrentStockAimPoseInputsWithNeutralCapture(
+                values.okR, values.rightAimPose, values.okL,
+                values.leftAimPose, okH, headPosition, headOrientation,
+                values.supportGripValid, values.supportGripPosition,
+                values.primaryGripValid, values.primaryGripPosition,
+                values.inverseNeckNeutralValid,
+                values.inverseNeckNeutralOrientation,
+                values.inverseNeckNeutralCaptureSerial,
+                values.inverseNeckNeutralCaptureContactSpaceEpoch);
+            committed_aim::ApplyAimValuesToSolverInputs(inputs, values);
+            inputs.supportSolveSerial = committed.preparedSerial;
+            usedCommittedSample = true;
+        }
+    }
+    if (!usedCommittedSample)
+    {
+        // Preserve the original live-globals capture path exactly for OFF and
+        // for any absent, torn, expired or identity-mismatched publication.
+        EnterCriticalSection(&g_headCs);
+        const bool okR = g_rightAimPoseValid;
+        const XrPosef right = g_rightAimPose;
+        const bool okL = g_leftAimPoseValid;
+        const XrPosef left = g_leftAimPose;
+        okH = g_headPoseValid &&
+            g_stockAimFresh.load(std::memory_order_acquire);
+        headPosition = g_headPose.position;
+        headOrientation = g_headPose.orientation;
+        const bool supportGripFresh = g_supportGripPoseValid &&
+            g_supportGripPoseFresh.load(std::memory_order_acquire);
+        const XrVector3f supportGrip = g_supportGripPosePosition;
+        // Same-sample primary grip under this same hold (see the Lab store
+        // proof): the success-path capture wrote it with these AIM poses, and
+        // the only concurrent writer clears toward fail-open.
+        const bool primaryGripValid = g_primaryGripPoseValid;
+        const XrVector3f primaryGrip = g_primaryGripPosePosition;
+        inputs = CurrentStockAimPoseInputs(
+             okR, right, okL, left, okH, headPosition, headOrientation,
+             supportGripFresh, supportGrip,
+             primaryGripValid, primaryGrip);
+        LeaveCriticalSection(&g_headCs);
+    }
 
     // Cross-thread consumers use only the exact prepared serial's immutable
     // publication, including the strength/mix it was frozen with. A torn,
@@ -22898,7 +23000,7 @@ bool VR_GetAimPoseWithSupportProvenance(float outQuat[4], float outPos[3],
         ReadTwoHandInputSmoothing(expectedSerial, smoothingEpoch,
             smoothingTitle, smoothingGeneration,
             inputs.virtualStockLeftHanded,
-            inputs.supportEndpointUsedGrip, smoothing) &&
+            inputs.supportEndpointUsedGrip, smoothing, usedCommittedSample) &&
         smoothing.strength > 0.0f)
     {
         ApplyTwoHandSmoothingGeometry(inputs, smoothing.mixed);
@@ -22917,7 +23019,7 @@ bool VR_GetAimPoseWithSupportProvenance(float outQuat[4], float outPos[3],
     const XrQuaternionf presentedOrientation =
         PresentAimContinuityFromPublication(
             aim.pose.orientation, expectedSerial, okH,
-            inputs.supportEndpointUsedGrip);
+            inputs.supportEndpointUsedGrip, usedCommittedSample);
     // Two-Hand Lab temporal (VS-off only): runs after the VS presentation
     // above through its own lock-free packet. The packet carries the serial,
     // epoch, settings generation and stateless orientation of the solve its
@@ -22926,7 +23028,7 @@ bool VR_GetAimPoseWithSupportProvenance(float outQuat[4], float outPos[3],
     const XrQuaternionf labPresentedOrientation =
         PresentTwoHandLabTemporalFromPublication(
             presentedOrientation, expectedSerial,
-            inputs.twoHandLabGeneration);
+            inputs.twoHandLabGeneration, usedCommittedSample);
 
     // Preserve the getter's existing output contract: once the right pose is
     // valid, publish the best pose even if final quaternion validation fails.
@@ -22968,6 +23070,9 @@ bool VR_GetAimPoseWithSupportProvenance(float outQuat[4], float outPos[3],
     outReceipt.relationshipReadable = aim.supportRelationshipReadable;
     outReceipt.relationshipEngaged = aim.supportRelationshipEngaged;
     outReceipt.solveSerial = aim.supportSolveSerial;
+    outReceipt.headValid = okH;
+    outReceipt.headPosition = headPosition;
+    outReceipt.headOrientation = headOrientation;
     if (!aim.valid)
         return false;
     return true;

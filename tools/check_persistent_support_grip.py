@@ -48,9 +48,13 @@ The check is deliberately narrow. With ``--root`` it asserts, for that tree:
      ``virtual_stock::SupportGrabPoint`` shift along the SUPPORT forward;
   8. the T13 retained-steering corrective is wired to one source of truth: the
      solve input ``AimPoseInputs::supportSteeringRetained`` is declared
-     default-false in ``vr.cpp`` and is written exactly once, inside the
-     assembly (``CurrentStockAimPoseInputs``), as a direct copy of the frozen
-     T5b qualification bit (``supportQualification.supportTrusted``) - which
+     default-false in ``vr.cpp`` and is written exactly once inside the
+     stock-aware aim assembly. In the original shape that is
+     ``CurrentStockAimPoseInputs``; in the explicit-input shape it is
+     ``CurrentStockAimPoseInputsWithNeutralCapture``, while the live-capture
+     ``CurrentStockAimPoseInputs`` wrapper only delegates. The write is a
+     direct copy of the frozen T5b qualification bit
+     (``supportQualification.supportTrusted``) - which
      ``QualifySolveSupport`` only ever sets after the feature-off short
      circuit and the untrusted early return, so PG off / an unwired title / a
      disengaged or unreadable relationship / an invocation the title denied
@@ -65,9 +69,10 @@ The check is deliberately narrow. With ``--root`` it asserts, for that tree:
      offhand call nor the target-aware (VS-on) selector gains the retention.
      The telemetry-only forcing carry (``AimPoseInputs::supportForceOneHand``
      plus its ``AimPoseResult`` receipt) stays data-only: both default false,
-     the assembly is its only writer, and it is a direct copy of the SAME
-     frozen qualification bit that drives the one-hand application, so
-     telemetry can never become a second source of truth for forcing. An
+     exactly one accepted assembly body is its only writer (the delegating
+     wrapper owns no writes), and it is a direct copy of the SAME frozen
+     qualification bit that drives the one-hand application, so telemetry can
+     never become a second source of truth for forcing. An
      occurrence allowlist over the token in ``vr.cpp`` and
      ``virtual_stock_aim.inl`` admits only the two declarations, the single
      writer, the receipt copy and the prepared-frame payload copy that
@@ -216,7 +221,16 @@ FORCE_CARRY_ALLOWLIST = {
     "stock": {FORCE_CARRY_ASSIGN: 1, FORCE_CARRY_RESULT: 1},
 }
 FORCE_CARRY_SOURCE_LABELS = {"vr": "vr.cpp", "stock": "virtual_stock_aim.inl"}
-ASSEMBLY_DEF = "AimPoseInputs CurrentStockAimPoseInputs("
+ASSEMBLY_DEFS = (
+    (
+        "explicit-input constructor",
+        "AimPoseInputs CurrentStockAimPoseInputsWithNeutralCapture(",
+    ),
+    (
+        "live-capture constructor",
+        "AimPoseInputs CurrentStockAimPoseInputs(",
+    ),
+)
 HELPER_PARAM = "bool retainBeyondAgreementFloor = false"
 HELPER_RETURN = "return retainBeyondAgreementFloor;"
 FLOOR_TEST = "agreement < 0.35f"
@@ -397,6 +411,34 @@ def region(text: str, marker: str) -> str:
     """The brace-matched block after marker, or the empty string when absent."""
     span = brace_span(text, marker)
     return "" if span is None else text[span[0]:span[1]]
+
+
+def accepted_assembly_bodies(text: str) -> list[tuple[str, int, str]]:
+    """Return every brace-matched body for an accepted stock-aim constructor.
+
+    The original constructor assembles the inputs directly. The explicit-input
+    architecture moves that body to ``CurrentStockAimPoseInputsWithNeutralCapture``
+    and leaves ``CurrentStockAimPoseInputs`` as a live-capture delegating
+    wrapper. Retaining all matches lets the caller prove the frozen writes are
+    owned by one body rather than accidentally accepting only the wrapper (or
+    the first of multiple definitions).
+    """
+    bodies: list[tuple[str, int, str]] = []
+    for label, marker in ASSEMBLY_DEFS:
+        search_from = 0
+        while True:
+            marker_offset = text.find(marker, search_from)
+            if marker_offset == -1:
+                break
+            span = brace_span(text[marker_offset:], marker)
+            if span is None:
+                bodies.append((label, marker_offset, ""))
+            else:
+                body_start = marker_offset + span[0]
+                body_end = marker_offset + span[1]
+                bodies.append((label, marker_offset, text[body_start:body_end]))
+            search_from = marker_offset + len(marker)
+    return bodies
 
 
 def call_arguments(text: str, open_index: int) -> list[str] | None:
@@ -827,16 +869,11 @@ def check_tree(sources: dict[str, str]) -> list[str]:
                 f"{RETENTION_ASSIGN!r} so the engaged+trusted T5b result stays "
                 "its only source"
             )
-        assembly = region(stock, ASSEMBLY_DEF)
-        if not assembly or normalize(RETENTION_ASSIGN) not in normalize(assembly):
-            violations.append(
-                "the retention input is no longer set inside "
-                "CurrentStockAimPoseInputs: the assembly must be its only writer"
-            )
     # 8b. Telemetry-only forcing carry (PG frame provenance). Data only: the
-    # frozen qualification is its single source, the assembly is its only
-    # writer, and the solve result must pass it through verbatim so consumers
-    # can name explicit forcing separately from an ordinary two-hand-off frame.
+    # frozen qualification is its single source, one accepted assembly body is
+    # the only writer, and the solve result must pass it through verbatim so
+    # consumers can name explicit forcing separately from an ordinary
+    # two-hand-off frame.
     if FORCE_CARRY_TRUE.search(vr):
         violations.append(
             "vr.cpp initialises supportForceOneHand to true: the telemetry "
@@ -864,20 +901,39 @@ def check_tree(sources: dict[str, str]) -> list[str]:
                 f"frozen qualification: it must be {FORCE_CARRY_ASSIGN!r} so "
                 "the one-hand forcing decision keeps a single source of truth"
             )
-        else:
-            force_assembly = region(stock, ASSEMBLY_DEF)
-            if (not force_assembly
-                    or normalize(FORCE_CARRY_ASSIGN)
-                    not in normalize(force_assembly)):
-                violations.append(
-                    "the telemetry forcing carry is no longer set inside "
-                    "CurrentStockAimPoseInputs: the assembly must be its only "
-                    "writer"
-                )
     if normalize(FORCE_CARRY_RESULT) not in flat_stock:
         violations.append(
             "the solve result no longer copies the frozen forcing flag into "
             "its AimPoseResult receipt"
+        )
+    # The original single-function implementation and the explicit-input split
+    # are both supported. Whichever accepted constructor owns assembly, both
+    # frozen-qualification writes must be in that same single body; the wrapper
+    # in the split architecture must not become a second writer.
+    accepted_bodies = accepted_assembly_bodies(stock)
+    retention_owners = [
+        (label, offset)
+        for label, offset, body in accepted_bodies
+        if normalize(RETENTION_ASSIGN) in normalize(body)
+    ]
+    force_owners = [
+        (label, offset)
+        for label, offset, body in accepted_bodies
+        if normalize(FORCE_CARRY_ASSIGN) in normalize(body)
+    ]
+    same_single_owner = (
+        len(retention_owners) == 1
+        and len(force_owners) == 1
+        and retention_owners[0][1] == force_owners[0][1]
+    )
+    if not same_single_owner:
+        violations.append(
+            "the frozen-qualification writes are not both present inside "
+            "exactly one accepted stock-aware aim assembly body (the original "
+            "CurrentStockAimPoseInputs or the explicit-input "
+            "CurrentStockAimPoseInputsWithNeutralCapture); found retention "
+            f"owner(s) {retention_owners!r} and forcing owner(s) "
+            f"{force_owners!r}"
         )
     # 8c. The carry must stay data-only: an occurrence allowlist for the token
     # across both files. Every line that names it must be one of the permitted
@@ -1467,7 +1523,7 @@ inline DirectionSelection SelectTwoHandAimDirectionForTarget(
 """
 
 GOOD_STOCK = """\
-// Synthetic virtual_stock_aim.inl for the persistent-support-grip guard.
+// Synthetic original single-function virtual_stock_aim.inl for the guard.
         AimPoseInputs CurrentStockAimPoseInputs(bool rightValid) noexcept
         {
             AimPoseInputs inputs{};
@@ -1501,6 +1557,24 @@ GOOD_STOCK = """\
                     rejectedExtreme, rejectedAgreement);
         }
 """
+
+# The explicit-input architecture keeps assembly writes in the variant and
+# makes the original live-capture constructor a thin delegating wrapper.
+GOOD_STOCK_SPLIT = GOOD_STOCK.replace(
+    "AimPoseInputs CurrentStockAimPoseInputs(bool rightValid) noexcept",
+    "AimPoseInputs CurrentStockAimPoseInputsWithNeutralCapture(\n"
+    "            bool rightValid, bool neutralCaptureValid) noexcept",
+    1,
+).replace(
+    "        void Solve(",
+    "        AimPoseInputs CurrentStockAimPoseInputs(bool rightValid) noexcept\n"
+    "        {\n"
+    "            return CurrentStockAimPoseInputsWithNeutralCapture(\n"
+    "                rightValid, true);\n"
+    "        }\n\n"
+    "        void Solve(",
+    1,
+)
 
 GOOD_GRAB_LOGIC = """\
 // Synthetic support_grab_logic.h for the persistent-support-grip guard.
@@ -1785,7 +1859,65 @@ def require_violation(sources: dict[str, str], needle: str, message: str) -> Non
 def run_self_test() -> None:
     good = good_texts()
     clean = check_tree(good)
-    require(clean == [], f"the clean synthetic tree was rejected: {clean!r}")
+    require(
+        clean == [],
+        f"the original single-function assembly shape was rejected: {clean!r}")
+
+    original_shape = check_tree(with_source(good, "stock", GOOD_STOCK))
+    require(
+        original_shape == [],
+        "the original CurrentStockAimPoseInputs assembly shape was rejected: "
+        f"{original_shape!r}")
+
+    split_shape = check_tree(with_source(good, "stock", GOOD_STOCK_SPLIT))
+    require(
+        split_shape == [],
+        "the explicit-input assembly plus delegating wrapper shape was "
+        f"rejected: {split_shape!r}")
+
+    outside_assembly_writes = GOOD_STOCK_SPLIT.replace(
+        RETENTION_ASSIGN, "").replace(FORCE_CARRY_ASSIGN, "")
+    outside_writer = (
+        "        void CopyFrozenQualificationOutsideAssembly("
+        "AimPoseInputs& inputs)\n"
+        "        {\n"
+        "            const support_grip::SolveSupportQualification "
+        "supportQualification{};\n"
+        f"            {RETENTION_ASSIGN}\n"
+        f"            {FORCE_CARRY_ASSIGN}\n"
+        "        }\n\n"
+    )
+    outside_assembly_writes = outside_assembly_writes.replace(
+        "        void Solve(", outside_writer + "        void Solve(", 1)
+    require_violation(
+        with_source(good, "stock", outside_assembly_writes),
+        "exactly one accepted stock-aware aim assembly body",
+        "frozen-qualification writes outside every accepted assembly must be "
+        "rejected")
+
+    duplicate_accepted_writer = GOOD_STOCK_SPLIT.replace(
+        "            return CurrentStockAimPoseInputsWithNeutralCapture(\n"
+        "                rightValid, true);\n",
+        "            const support_grip::SolveSupportQualification "
+        "supportQualification{};\n"
+        f"            {RETENTION_ASSIGN}\n"
+        f"            {FORCE_CARRY_ASSIGN}\n"
+        "            return CurrentStockAimPoseInputsWithNeutralCapture(\n"
+        "                rightValid, true);\n",
+        1,
+    )
+    require_violation(
+        with_source(good, "stock", duplicate_accepted_writer),
+        "expected exactly one write",
+        "duplicate writers in the explicit-input function and its wrapper must "
+        "be rejected")
+    duplicate_assembly_violations = check_tree(
+        with_source(good, "stock", duplicate_accepted_writer))
+    require(
+        any("exactly one accepted stock-aware aim assembly body" in violation
+            for violation in duplicate_assembly_violations),
+        "a duplicate assembly writer was not rejected by the one-owner check: "
+        f"{duplicate_assembly_violations!r}")
 
     flipped_default = GOOD_CONFIG_H.replace(
         "persistent_support_grip = true;", "persistent_support_grip = false;")

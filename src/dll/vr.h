@@ -1,6 +1,7 @@
 #pragma once
 
 #include <d3d11.h>
+#include <openxr/openxr.h>
 #include <cstdint>
 #include "../common/virtual_stock_test_profiles.h"
 // The durable persistent-support-grip relationship publication carries the
@@ -838,6 +839,12 @@ struct VrAimSupportReceipt
     bool relationshipEngaged = false;
     // Prepared serial this solve belonged to (0 before the first publish).
     uint64_t solveSerial = 0;
+    // Head pose paired with the returned solve: the accepted committed
+    // sample's own head, or the live g_headPose read used to build its inputs.
+    // headValid mirrors the validity term consumed by that solve.
+    bool headValid = false;
+    XrVector3f headPosition{};
+    XrQuaternionf headOrientation{};
 };
 
 // VR_GetAimPose plus the solve-time support receipt. The pose outputs and the
@@ -845,7 +852,7 @@ struct VrAimSupportReceipt
 // feature is off or no solve ran, and otherwise describes the solve that
 // produced the returned pose even when that pose failed final validation.
 bool VR_GetAimPoseWithSupportProvenance(float outQuat[4], float outPos[3],
-    VrAimSupportReceipt& outReceipt);
+    VrAimSupportReceipt& outReceipt, bool preferCommittedSample = false);
 
 // ---------------------------------------------------------------------------
 // Persistent support grip (`persistent_support_grip`, default on)

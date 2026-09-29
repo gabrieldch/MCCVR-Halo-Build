@@ -159,12 +159,11 @@
         return resolved;
     }
 
-    // Stock-aware primary-aim constructor. Reads the live F1/config toggle on
-    // every call, so switching virtual stock while engaged takes effect
-    // immediately without unlatching or re-grabbing. Callers pass a head pose
-    // that is coherent with this exact controller sample (same prepared frame
-    // under g_headCs, or the frame thread right after both captures).
-    AimPoseInputs CurrentStockAimPoseInputs(
+    // Stock-aware primary-aim constructor for an explicit neutral-capture
+    // sample. The committed cross-thread path supplies these values from its
+    // matching prepared-frame publication rather than reading frame-owned
+    // state live.
+    AimPoseInputs CurrentStockAimPoseInputsWithNeutralCapture(
         bool rightValid, const XrPosef& right,
         bool leftValid, const XrPosef& left,
         bool coherentHeadValid, const XrVector3f& coherentHeadPosition,
@@ -172,7 +171,11 @@
         bool supportGripPositionValid,
         const XrVector3f& supportGripPosition,
         bool primaryGripPositionValid,
-        const XrVector3f& primaryGripPosition) noexcept
+        const XrVector3f& primaryGripPosition,
+        bool inverseNeckNeutralValid,
+        const XrQuaternionf& inverseNeckNeutralOrientation,
+        uint64_t inverseNeckNeutralCaptureSerial,
+        uint64_t inverseNeckNeutralCaptureContactSpaceEpoch) noexcept
     {
         AimPoseInputs inputs = CurrentAimPoseInputs(rightValid, right, leftValid, left);
         const VirtualStockAimSettings userSettings =
@@ -185,17 +188,12 @@
         inputs.headValid = coherentHeadValid;
         inputs.headPosition = coherentHeadPosition;
         inputs.headOrientation = coherentHeadOrientation;
-        inputs.inverseNeckNeutralValid =
-            g_inverseNeckNeutralCapture.neutralValid;
-        inputs.inverseNeckNeutralOrientation = {
-            g_inverseNeckNeutralCapture.neutralOrientation.x,
-            g_inverseNeckNeutralCapture.neutralOrientation.y,
-            g_inverseNeckNeutralCapture.neutralOrientation.z,
-            g_inverseNeckNeutralCapture.neutralOrientation.w};
+        inputs.inverseNeckNeutralValid = inverseNeckNeutralValid;
+        inputs.inverseNeckNeutralOrientation = inverseNeckNeutralOrientation;
         inputs.inverseNeckNeutralCaptureSerial =
-            g_inverseNeckNeutralCapture.captureSerial;
+            inverseNeckNeutralCaptureSerial;
         inputs.inverseNeckNeutralCaptureContactSpaceEpoch =
-            g_inverseNeckNeutralCapture.captureContactSpaceEpoch;
+            inverseNeckNeutralCaptureContactSpaceEpoch;
         const auto toPoint = [](const XrVector3f& v) {
             return virtual_stock::Point3{v.x, v.y, v.z};
         };
@@ -289,6 +287,35 @@
         if (supportQualification.forceOneHand)
             inputs.twoHandEnabled = false;
         return inputs;
+    }
+
+    // Preserve the live-capture constructor and its existing callers. The
+    // frame thread owns this state; committed consumers use the explicit
+    // overload above so they never read it without g_headCs.
+    AimPoseInputs CurrentStockAimPoseInputs(
+        bool rightValid, const XrPosef& right,
+        bool leftValid, const XrPosef& left,
+        bool coherentHeadValid, const XrVector3f& coherentHeadPosition,
+        const XrQuaternionf& coherentHeadOrientation,
+        bool supportGripPositionValid,
+        const XrVector3f& supportGripPosition,
+        bool primaryGripPositionValid,
+        const XrVector3f& primaryGripPosition) noexcept
+    {
+        const XrQuaternionf inverseNeckNeutralOrientation{
+            g_inverseNeckNeutralCapture.neutralOrientation.x,
+            g_inverseNeckNeutralCapture.neutralOrientation.y,
+            g_inverseNeckNeutralCapture.neutralOrientation.z,
+            g_inverseNeckNeutralCapture.neutralOrientation.w};
+        return CurrentStockAimPoseInputsWithNeutralCapture(
+            rightValid, right, leftValid, left,
+            coherentHeadValid, coherentHeadPosition, coherentHeadOrientation,
+            supportGripPositionValid, supportGripPosition,
+            primaryGripPositionValid, primaryGripPosition,
+            g_inverseNeckNeutralCapture.neutralValid,
+            inverseNeckNeutralOrientation,
+            g_inverseNeckNeutralCapture.captureSerial,
+            g_inverseNeckNeutralCapture.captureContactSpaceEpoch);
     }
 
     template <bool CaptureTrace>

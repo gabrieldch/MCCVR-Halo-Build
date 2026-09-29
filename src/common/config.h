@@ -372,7 +372,7 @@ struct Config
     // configuration.
     Config();
 
-    int config_version = 5;
+    int config_version = 6;
 
     // Portable OpenXR feedback and pose stabilization. Headset smoothing is a
     // deliberately tiny previous-frame blend (0.03 shipped default, 10% hard maximum)
@@ -888,6 +888,11 @@ struct Config
     // flips engaged on/off per grip click, Hold mode engages only while the
     // grip is held. The primary grip still cycles grenades.
     bool two_handed_aim = true;
+    // Coherent committed-sample aim (A+B, runtime-validated) is the default.
+    // Configs saved before v6 with this key off are migrated on once. In a v6
+    // config, set two_hand_coherent_aim = 0 for the hidden legacy rollback/debug
+    // escape; the F1 control is retired.
+    bool two_hand_coherent_aim = true;
     // Virtual stock: with two-hand engaged, the base aim orientation follows
     // the configured rear-reference blend toward the raw support controller.
     // OFF preserves the released behavior. Changes only the base engaged

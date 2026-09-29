@@ -309,7 +309,7 @@ static bool FileExists(const wchar_t* path)
 
 static void Clamp()
 {
-    g_config.config_version = 5;
+    g_config.config_version = 6;
     g_config.haptic_intensity = std::clamp(g_config.haptic_intensity, 0.0f, 1.0f);
     g_config.dpad_head_radius = std::clamp(g_config.dpad_head_radius, 0.10f, 0.50f);
     g_config.headset_smoothing = std::clamp(g_config.headset_smoothing, 0.0f, 0.10f);
@@ -1229,6 +1229,7 @@ void ConfigLoad(const wchar_t* path)
         }
         if (!strcmp(key, "hide_hud")) { g_config.hide_hud=atoi(val)!=0; continue; }
         if (!strcmp(key, "independent_dual_aim")) { g_config.independent_dual_aim=atoi(val)!=0; continue; }
+        if (!strcmp(key, "two_hand_coherent_aim")) { g_config.two_hand_coherent_aim=atoi(val)!=0; continue; }
         if (!strcmp(key, "gun_barrel_aim")) { g_config.gun_barrel_aim=atoi(val)!=0; continue; }
         if (!strcmp(key, "halo4_helmet"))
         {
@@ -1340,8 +1341,8 @@ void ConfigLoad(const wchar_t* path)
             else
             {
                 loadedConfigVersion = static_cast<int>(parsed);
-                if (parsed > 5)
-                    LOG("config: version %ld is newer than supported version 5; known keys will be loaded", parsed);
+                if (parsed > 6)
+                    LOG("config: version %ld is newer than supported version 6; known keys will be loaded", parsed);
             }
         }
         else if (!strcmp(key, "haptic_intensity"))
@@ -1707,6 +1708,11 @@ void ConfigLoad(const wchar_t* path)
         // the prior relative setting but move it into the tighter 6x..24x lens.
         g_config.scope_zoom *= 1.75f;
         LOG("config: migrated scope zoom to the tighter world-only lens");
+    }
+    if (loadedConfigVersion < 6 && !g_config.two_hand_coherent_aim)
+    {
+        g_config.two_hand_coherent_aim = true;
+        LOG("config: migrated two_hand_coherent_aim to enabled for v6; set two_hand_coherent_aim = 0 to restore the legacy path");
     }
     if (loadedLegacyCurvature)
     {
@@ -2483,6 +2489,10 @@ void ConfigSave()
     fprintf(f, "# aim follows the two-hand line. 1 = on. Engage style is Toggle (grip click) or Hold (held grip).\n");
     fprintf(f, "# (default %d)\n", d.two_handed_aim ? 1 : 0);
     fprintf(f, "two_handed_aim = %d\n\n", g_config.two_handed_aim ? 1 : 0);
+    fprintf(f, "# Experimental: consume the latest committed coherent Aim/Grip/head sample in XInput aim.\n");
+    fprintf(f, "# (default %d)\n", d.two_hand_coherent_aim ? 1 : 0);
+    fprintf(f, "two_hand_coherent_aim = %d\n\n",
+        g_config.two_hand_coherent_aim ? 1 : 0);
     fprintf(f, "# Virtual stock changes only the base engaged two-hand orientation using the configured\n");
     fprintf(f, "# rear-reference blend. Base position/roll stay primary-controller owned;\n");
     fprintf(f, "# verified barrel-origin substitution (gun_barrel_aim) remains separate.\n");
